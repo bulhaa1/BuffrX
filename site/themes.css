@@ -1,0 +1,231 @@
+/* The fourteen themes, one block each, selected by data-theme on :root or on any one element (the Look workspace
+ * themes its preview alone). The same ids and colours as src/engine/themes.h, which the engine tests hold this
+ * file to: change both together.
+ * Roles: ground (behind the panes), tile (a pane), raised (a control on a pane), line (a pane's seam),
+ * fg (text), muted (secondary text), acc (the accent), on (text on the accent), ok / warn / danger
+ * (state), rec (the recording mark). */
+
+:root,
+[data-theme='clutch'] {
+  color-scheme: dark;
+  --bx-ground: #0b0c0d;
+  --bx-tile: #141517;
+  --bx-raised: #1c1e21;
+  --bx-line: #2b2e33;
+  --bx-fg: #e6e2da;
+  --bx-muted: #8f8b84;
+  --bx-acc: #ff6b2c;
+  --bx-on: #140a04;
+  --bx-ok: #9bd36b;
+  --bx-warn: #f2c14e;
+  --bx-danger: #ff4d5e;
+  --bx-rec: #ff4d5e;
+}
+
+[data-theme='overtime'] {
+  color-scheme: dark;
+  --bx-ground: #081012;
+  --bx-tile: #0f1a1d;
+  --bx-raised: #152428;
+  --bx-line: #22383d;
+  --bx-fg: #d6e7e3;
+  --bx-muted: #7f9f9a;
+  --bx-acc: #4fd6be;
+  --bx-on: #04201b;
+  --bx-ok: #4fd6be;
+  --bx-warn: #f0c674;
+  --bx-danger: #ff5f6d;
+  --bx-rec: #ff5f6d;
+}
+
+[data-theme='respawn'] {
+  color-scheme: dark;
+  --bx-ground: #110e15;
+  --bx-tile: #19151f;
+  --bx-raised: #221c2a;
+  --bx-line: #362d42;
+  --bx-fg: #ebe2f2;
+  --bx-muted: #9f94ad;
+  --bx-acc: #f5a3c7;
+  --bx-on: #2a0f1d;
+  --bx-ok: #a6e3a1;
+  --bx-warn: #f9d58b;
+  --bx-danger: #ff6b81;
+  --bx-rec: #ff6b81;
+}
+
+[data-theme='afterglow'] {
+  color-scheme: dark;
+  --bx-ground: #130e0b;
+  --bx-tile: #1c1511;
+  --bx-raised: #261d17;
+  --bx-line: #3d2e25;
+  --bx-fg: #f1e4d6;
+  --bx-muted: #ab9582;
+  --bx-acc: #f2b56b;
+  --bx-on: #2a1806;
+  --bx-ok: #b5c96a;
+  --bx-warn: #f2b56b;
+  --bx-danger: #ff6a55;
+  --bx-rec: #ff6a55;
+}
+
+[data-theme='killcam'] {
+  color-scheme: dark;
+  --bx-ground: #000000;
+  --bx-tile: #0a0a0a;
+  --bx-raised: #151515;
+  --bx-line: #262626;
+  --bx-fg: #f2f2f2;
+  --bx-muted: #8a8a8a;
+  --bx-acc: #f2f2f2;
+  --bx-on: #000000;
+  --bx-ok: #f2f2f2;
+  --bx-warn: #ffd60a;
+  --bx-danger: #ff3b30;
+  --bx-rec: #ff3b30;
+}
+
+[data-theme='lobby'] {
+  color-scheme: light;
+  --bx-ground: #d9d6cd;
+  --bx-tile: #f3f1ec;
+  --bx-raised: #e6e3dc;
+  --bx-line: #c6c2b8;
+  --bx-fg: #1d1c1a;
+  --bx-muted: #55524c;
+  --bx-acc: #2f5bea;
+  --bx-on: #ffffff;
+  --bx-ok: #2e7d50;
+  --bx-warn: #9a6512;
+  --bx-danger: #c62f2f;
+  --bx-rec: #d93636;
+}
+
+[data-theme='headshot'] {
+  color-scheme: dark;
+  --bx-ground: #0e0809;
+  --bx-tile: #170d0f;
+  --bx-raised: #221316;
+  --bx-line: #3a1d22;
+  --bx-fg: #f3e6e3;
+  --bx-muted: #b19494;
+  --bx-acc: #ff3b4e;
+  --bx-on: #1a0306;
+  --bx-ok: #e8d8b0;
+  --bx-warn: #ffb347;
+  --bx-danger: #ffb347;
+  --bx-rec: #f3e6e3;
+}
+
+[data-theme='frostbite'] {
+  color-scheme: dark;
+  --bx-ground: #080d16;
+  --bx-tile: #0e1522;
+  --bx-raised: #151e2f;
+  --bx-line: #24324a;
+  --bx-fg: #dde8f6;
+  --bx-muted: #8a9cb6;
+  --bx-acc: #8ecbff;
+  --bx-on: #04172b;
+  --bx-ok: #7ee0c3;
+  --bx-warn: #f5d27a;
+  --bx-danger: #ff6b7a;
+  --bx-rec: #ff6b7a;
+}
+
+[data-theme='toxic'] {
+  color-scheme: dark;
+  --bx-ground: #0b0d08;
+  --bx-tile: #12150d;
+  --bx-raised: #1a1e13;
+  --bx-line: #2b321f;
+  --bx-fg: #e6eed6;
+  --bx-muted: #97a184;
+  --bx-acc: #c6f432;
+  --bx-on: #141c02;
+  --bx-ok: #c6f432;
+  --bx-warn: #ffcf3d;
+  --bx-danger: #ff5a4f;
+  --bx-rec: #ff5a4f;
+}
+
+[data-theme='nightshift'] {
+  color-scheme: dark;
+  --bx-ground: #0b0a12;
+  --bx-tile: #12111c;
+  --bx-raised: #1a1828;
+  --bx-line: #2c2942;
+  --bx-fg: #e4e0fa;
+  --bx-muted: #9a95bb;
+  --bx-acc: #9d8cff;
+  --bx-on: #120a33;
+  --bx-ok: #7fd8be;
+  --bx-warn: #ffc777;
+  --bx-danger: #ff6e8a;
+  --bx-rec: #ff6e8a;
+}
+
+[data-theme='highscore'] {
+  color-scheme: dark;
+  --bx-ground: #0b0d1c;
+  --bx-tile: #111428;
+  --bx-raised: #181c36;
+  --bx-line: #2a2f55;
+  --bx-fg: #eef0ff;
+  --bx-muted: #9ea4cc;
+  --bx-acc: #ffd23f;
+  --bx-on: #1f1700;
+  --bx-ok: #5ef0c0;
+  --bx-warn: #ff9f43;
+  --bx-danger: #ff4f8b;
+  --bx-rec: #ff4f8b;
+}
+
+[data-theme='ghillie'] {
+  color-scheme: dark;
+  --bx-ground: #0d0f0b;
+  --bx-tile: #141711;
+  --bx-raised: #1c2018;
+  --bx-line: #2e3427;
+  --bx-fg: #e2e6d8;
+  --bx-muted: #9aa18c;
+  --bx-acc: #b5c58e;
+  --bx-on: #161c08;
+  --bx-ok: #b5c58e;
+  --bx-warn: #e3b55b;
+  --bx-danger: #e8604c;
+  --bx-rec: #e8604c;
+}
+
+[data-theme='sandstorm'] {
+  color-scheme: light;
+  --bx-ground: #ddd2bd;
+  --bx-tile: #f4ede0;
+  --bx-raised: #e9e0cf;
+  --bx-line: #cbbda3;
+  --bx-fg: #2b2118;
+  --bx-muted: #5c4c3a;
+  --bx-acc: #b8400f;
+  --bx-on: #fff6ee;
+  --bx-ok: #3f6b24;
+  --bx-warn: #8f5a00;
+  --bx-danger: #b01e1e;
+  --bx-rec: #c42323;
+}
+
+[data-theme='arcade'] {
+  color-scheme: dark;
+  --bx-ground: #050607;
+  --bx-tile: #0b0d0f;
+  --bx-raised: #121518;
+  --bx-line: #22272c;
+  --bx-fg: #eaf6f8;
+  --bx-muted: #8aa0a6;
+  --bx-acc: #00e1ff;
+  --bx-on: #00262c;
+  --bx-ok: #5cff9d;
+  --bx-warn: #ffd23f;
+  --bx-danger: #ff2e63;
+  --bx-rec: #ff2e63;
+}

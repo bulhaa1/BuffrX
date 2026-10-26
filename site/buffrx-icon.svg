@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="t">
+  <title id="t">BuffrX</title>
+  <defs><linearGradient id="chrome" gradientUnits="userSpaceOnUse" x1="3" y1="0" x2="321" y2="0"><stop offset="0" stop-color="#fcfcfc"/><stop offset="1" stop-color="#c3c3c3"/></linearGradient></defs>
+  <rect width="512" height="512" rx="72" fill="#0b0c0d"/>
+  <g transform="translate(256 256) scale(.95) translate(-161.85 -214.7)">
+    <path fill="url(#chrome)" d="M3.2 93L42.2 143.4L230 143.4C254.3 148.8 262 168.5 240 184.4C233.3 189.3 225.7 190.8 218 192.8L118.3 192.8L152.2 235.4L234 235.4C243.6 237.4 251.8 238.8 260 244.6C265.3 248.3 266.8 254.1 267.6 260C269.4 274.1 259.7 282.4 247 285.3L96 285.3L95.5 168L42.8 201.5L42.8 336.4L257 336.4C300.7 328.5 320.5 313.6 320.5 266C320.5 250 318.2 235.3 308 222.6C301.7 214.8 292 211.9 284.6 206C289.1 196.6 298.7 189.6 302.3 179C309.6 157.2 304.8 115.4 281 103.7C270.7 98.6 260.6 96.2 250 93L3.2 93Z"/>
+  </g>
+</svg>

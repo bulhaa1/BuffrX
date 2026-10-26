@@ -1,0 +1,121 @@
+/* The link page wears BuffrX's look: panes on a ground, 1 px seams, square corners, titles set into the top
+ * border, a bar of framed modules, one accent fill. The colours are Clutch and Lobby from ui/src/themes.css,
+ * copied here because the page is hosted on its own (test_themes does not read this file: change them together).
+ * One face, JetBrains Mono, self-hosted: the page's CSP allows no outside request. */
+
+@font-face { font-family: 'JetBrains Mono'; src: url('../fonts/jetbrains-mono-medium.woff2') format('woff2'); font-weight: 400 500; font-display: swap; }
+@font-face { font-family: 'JetBrains Mono'; src: url('../fonts/jetbrains-mono-bold.woff2') format('woff2'); font-weight: 600 900; font-display: swap; }
+
+:root {
+  color-scheme: dark;
+  --ground: #0b0c0d;
+  --tile: #141517;
+  --raised: #1c1e21;
+  --line: #2b2e33;
+  --fg: #e6e2da;
+  --muted: #8f8b84;
+  --acc: #ff6b2c;
+  --on: #140a04;
+  --ok: #9bd36b;
+  --warn: #f2c14e;
+  --danger: #ff4d5e;
+  --line-strong: color-mix(in srgb, var(--line) 68%, var(--muted));
+}
+@media (prefers-color-scheme: light) {
+  :root {
+    color-scheme: light;
+    --ground: #d9d6cd;
+    --tile: #f3f1ec;
+    --raised: #e6e3dc;
+    --line: #c6c2b8;
+    --fg: #1d1c1a;
+    --muted: #55524c;
+    --acc: #2f5bea;
+    --on: #ffffff;
+    --ok: #2e7d50;
+    --warn: #9a6512;
+    --danger: #c62f2f;
+  }
+}
+
+* { box-sizing: border-box; border-radius: 0; }
+[hidden] { display: none !important; }
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--ground);
+  color: var(--fg);
+  font-family: 'JetBrains Mono', ui-monospace, Consolas, monospace;
+  font-size: 14px;
+  font-weight: 500;
+  line-height: 1.45;
+  font-variant-numeric: tabular-nums;
+  -webkit-font-smoothing: antialiased;
+}
+/* Labels, titles and buttons keep the app's capitals; sentences on this page are read by a stranger, so they stay in sentence case. */
+.word, .module, .pane-title, h1, .row, .key, .strip { text-transform: uppercase; }
+.pane p, .muted, .status { text-transform: none; }
+::selection { background: var(--acc); color: var(--on); }
+:focus-visible { outline: 2px solid var(--acc); outline-offset: 2px; }
+
+/* The bar: the logo's place (not decided yet, so a dashed square), the wordmark, framed modules. */
+.bar { display: flex; align-items: center; gap: 8px; min-height: 36px; padding: 6px 16px; }
+.mark { width: 18px; height: 18px; border: 1px dashed color-mix(in srgb, var(--muted) 60%, transparent); }
+.word { font-weight: 800; letter-spacing: 0.04em; font-size: 14px; }
+.module {
+  display: inline-flex; align-items: center; height: 22px; padding: 0 9px;
+  border: 1px solid var(--line); background: var(--tile); font-weight: 700; font-size: 13px; white-space: nowrap;
+}
+.spacer { flex: 1; }
+
+/* The panes: 8 px apart on the ground, the first one focused (2 px accent border). */
+.tiles { width: 100%; max-width: 640px; margin: 0 auto; padding: 14px 16px 16px; display: grid; gap: 8px; flex: 1; align-content: start; }
+.pane { position: relative; background: var(--tile); border: 1px solid var(--line); padding: 22px 16px 16px; }
+.pane.focus { border: 2px solid var(--acc); padding: 21px 15px 15px; }
+.pane-title {
+  position: absolute; top: -0.7em; left: 10px; margin: 0; padding: 0 6px;
+  font-size: 13px; font-weight: 500; line-height: 1.2; color: var(--muted);
+  background: linear-gradient(var(--ground) 50%, var(--tile) 50%);
+}
+.pane.focus > .pane-title { color: var(--acc); }
+/* The light accent is 3.8:1 on the ground, short of AA for 13 px text: there the focused title keeps the ink. */
+@media (prefers-color-scheme: light) { .pane.focus > .pane-title { color: var(--fg); } }
+
+h1 { margin: 0 0 12px; font-size: 22px; font-weight: 800; line-height: 1.2; }
+p { margin: 0 0 12px; }
+.muted { color: var(--muted); }
+p.last { margin-bottom: 0; }
+
+/* The state line: a dot in the state's colour, then the sentence. */
+.status { display: flex; gap: 10px; align-items: baseline; margin-bottom: 16px; }
+.dot { flex: none; width: 8px; height: 8px; background: var(--muted); transform: translateY(-1px); }
+.status[data-tone='ok'] .dot { background: var(--ok); }
+.status[data-tone='warn'] .dot { background: var(--warn); }
+.status[data-tone='bad'] .dot { background: var(--danger); }
+.status[data-tone='bad'] { color: var(--danger); }
+
+/* Actions are rows, as in the launcher: the primary one is the only filled thing on the page. */
+.row {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px; min-height: 38px; padding: 0 10px;
+  border: 1px solid var(--line-strong); background: var(--tile); color: var(--fg);
+  font-weight: 700; text-decoration: none;
+}
+.row:hover { background: var(--raised); border-color: var(--muted); }
+.row.primary { background: var(--acc); border-color: var(--acc); color: var(--on); }
+.row.primary:hover { background: color-mix(in srgb, var(--acc) 88%, var(--fg)); }
+.row .key { font-weight: 500; font-size: 13px; opacity: 0.75; }
+
+/* The strip along the bottom: what is true of the page, in cells. */
+.strip { display: flex; flex-wrap: wrap; align-items: center; min-height: 26px; padding: 4px 16px; font-size: 13px; color: var(--muted); }
+.strip span { padding: 0 12px; border-left: 1px solid var(--line); line-height: 1.2; }
+.strip span:first-child { padding-left: 0; border-left: 0; }
+
+@media (max-width: 480px) {
+  .bar { padding: 6px 12px; }
+  .tiles { padding: 10px 12px 12px; }
+  h1 { font-size: 19px; }
+}
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; } }

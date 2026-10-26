@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <!-- This page makes no request of any kind: the link after # never leaves the browser. It only hands
+       the link to BuffrX (buffrx://), or offers BuffrX to someone who does not have it yet. The fonts and
+       styles are its own files (font-src 'self'). -->
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'none'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self'; connect-src 'none'; base-uri 'none'; form-action 'none'">
+  <meta name="referrer" content="no-referrer">
+  <meta property="og:title" content="A clip shared with BuffrX">
+  <meta property="og:description" content="Opens in BuffrX, straight from your friend's PC. Full quality, no upload.">
+  <title>A clip for you - BuffrX</title>
+  <link rel="stylesheet" href="link.css">
+</head>
+<body>
+  <header class="bar">
+    <span class="mark" aria-hidden="true"></span>
+    <span class="word">buffrx</span>
+    <span class="module">Shared clip</span>
+    <span class="spacer"></span>
+    <span id="left" class="module" hidden></span>
+  </header>
+  <main class="tiles">
+    <section class="pane focus" aria-labelledby="t-clip">
+      <h2 id="t-clip" class="pane-title">Clip</h2>
+      <h1>A friend shared a clip with you</h1>
+      <p id="status" class="status" data-tone="ok" role="status"><span class="dot" aria-hidden="true"></span><span id="status-text">Opening it in BuffrX&hellip;</span></p>
+      <a id="open" class="row primary" hidden><span>Open in BuffrX</span></a>
+    </section>
+    <section id="get" class="pane" aria-labelledby="t-get" hidden>
+      <h2 id="t-get" class="pane-title">No BuffrX?</h2>
+      <p>BuffrX is a free clip recorder for Windows. Install it, then click the link again: the clip comes
+        straight from your friend's PC, in full quality.</p>
+      <a id="download" class="row" rel="noopener noreferrer"><span>Get BuffrX (free)</span><span class="key">Windows</span></a>
+    </section>
+    <section class="pane" aria-labelledby="t-how">
+      <h2 id="t-how" class="pane-title">How it travels</h2>
+      <p class="muted last">Nothing on this page is sent anywhere: the clip goes from your friend's BuffrX to yours,
+        encrypted end to end, and only while their PC is on.</p>
+    </section>
+  </main>
+  <footer class="strip">
+    <span>Encrypted end to end</span><span>No upload</span><span>Nothing sent from this page</span>
+  </footer>
+  <script src="link.js"></script>
+</body>
+</html>

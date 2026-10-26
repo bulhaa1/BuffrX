@@ -1,0 +1,321 @@
+<!doctype html>
+<html lang="en" data-theme="clutch">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'none'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self'; media-src 'self'; connect-src 'none'; base-uri 'none'; form-action 'none'">
+  <meta name="referrer" content="no-referrer">
+  <meta name="theme-color" content="#0b0c0d">
+  <meta name="description" content="BuffrX is a free Windows app for your game clips: record them, trim them and send them to friends in one place, and it can save the moment after it happens. No accounts, no telemetry. Coming Nov 2026.">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="BuffrX - clip it, cut it, send it">
+  <meta property="og:description" content="Record, trim and send game clips to friends in one free Windows app. No accounts, no telemetry. Coming Nov 2026.">
+  <title>BuffrX - clip it, cut it, send it</title>
+  <link rel="icon" href="buffrx-icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="themes.css">
+  <link rel="stylesheet" href="games.css">
+  <link rel="stylesheet" href="appwin.css">
+  <link rel="stylesheet" href="site.css">
+  <script src="boot.js"></script>
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+  <canvas id="bg" aria-hidden="true"></canvas>
+
+  <header class="nav" id="nav">
+    <div class="nav-in">
+      <a class="brand" href="#why" aria-label="BuffrX, back to the top"><img src="buffrx-logo.svg" alt="BuffrX" width="58" height="20"></a>
+      <nav class="tabs" id="tabs" aria-label="Sections">
+        <a href="#why">Why BuffrX</a>
+        <a href="#features">Features</a>
+        <a href="#privacy">Privacy</a>
+        <a href="#compare">Compare</a>
+        <a href="#roadmap">Roadmap</a>
+        <a href="#faq">FAQ</a>
+        <a href="#pricing">Pricing</a>
+        <a href="#get">Get it</a>
+        <i class="tabs-ink" id="ink" aria-hidden="true"></i>
+      </nav>
+      <button class="themebtn" id="themebtn" type="button" aria-haspopup="dialog" aria-expanded="false" aria-controls="pop" aria-label="Theme: Clutch">
+        <span class="sw3" id="themesw" data-theme="clutch" aria-hidden="true"><i></i><i></i><i></i></span><span class="nm" id="themename">Clutch</span>
+        <svg class="chev" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square" stroke-linejoin="miter" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg>
+      </button>
+      <a class="btn small nav-ico" href="https://discord.gg/WekueJhR7" target="_blank" rel="noopener noreferrer" aria-label="Join the BuffrX Discord"><svg class="dc-ico" width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M20.317 4.3698a19.7913 19.7913 0 00-4.8851-1.5152.0741.0741 0 00-.0785.0371c-.211.3753-.4447.8648-.6083 1.2495-1.8447-.2762-3.68-.2762-5.4868 0-.1636-.3933-.4058-.8742-.6177-1.2495a.077.077 0 00-.0785-.037 19.7363 19.7363 0 00-4.8852 1.515.0699.0699 0 00-.0321.0277C.5334 9.0458-.319 13.5799.0992 18.0578a.0824.0824 0 00.0312.0561c2.0528 1.5076 4.0413 2.4228 5.9929 3.0294a.0777.0777 0 00.0842-.0276c.4616-.6304.8731-1.2952 1.226-1.9942a.076.076 0 00-.0416-.1057c-.6528-.2476-1.2743-.5495-1.8722-.8923a.077.077 0 01-.0076-.1277c.1258-.0943.2517-.1923.3718-.2914a.0743.0743 0 01.0776-.0105c3.9278 1.7933 8.18 1.7933 12.0614 0a.0739.0739 0 01.0785.0095c.1202.099.246.1981.3728.2924a.077.077 0 01-.0066.1276 12.2986 12.2986 0 01-1.873.8914.0766.0766 0 00-.0407.1067c.3604.698.7719 1.3628 1.225 1.9932a.076.076 0 00.0842.0286c1.961-.6067 3.9495-1.5219 6.0023-3.0294a.077.077 0 00.0313-.0552c.5004-5.177-.8382-9.6739-3.5485-13.6604a.061.061 0 00-.0312-.0286zM8.02 15.3312c-1.1825 0-2.1569-1.0857-2.1569-2.419 0-1.3332.9555-2.4189 2.157-2.4189 1.2108 0 2.1757 1.0952 2.1568 2.419 0 1.3332-.9555 2.4189-2.1569 2.4189zm7.9748 0c-1.1825 0-2.1569-1.0857-2.1569-2.419 0-1.3332.9554-2.4189 2.1569-2.4189 1.2108 0 2.1757 1.0952 2.1568 2.419 0 1.3332-.946 2.4189-2.1568 2.4189Z"/></svg></a>
+      <a class="btn small primary nav-ico" href="https://github.com/bulhaa1" target="_blank" rel="noopener noreferrer" aria-label="BuffrX on GitHub"><svg class="dc-ico" width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 .297c-6.63 0-12 5.373-12 12 0 5.303 3.438 9.8 8.205 11.385.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61C4.422 18.07 3.633 17.7 3.633 17.7c-1.087-.744.084-.729.084-.729 1.205.084 1.838 1.236 1.838 1.236 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.523.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.399 3-.405 1.02.006 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.606-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 22.092 24 17.592 24 12.297c0-6.627-5.373-12-12-12"/></svg></a>
+      <div class="pop" id="pop" role="dialog" aria-label="Site theme" hidden>
+        <h2>Theme</h2>
+        <div class="grid" id="siteThemes" role="radiogroup" aria-label="Theme of the whole site"></div>
+        <button class="switch" id="bgsw" type="button" role="switch" aria-checked="true"><span>Animated background</span><span class="sq" aria-hidden="true"></span></button>
+        <button class="switch" id="xhsw" type="button" role="switch" aria-checked="true"><span>Crosshair cursor</span><span class="sq" aria-hidden="true"></span></button>
+        <p class="note muted">The preview windows follow the theme, and can take their own. Your choice stays in this browser. Nothing is sent.</p>
+      </div>
+    </div>
+  </header>
+
+  <main id="main">
+    <noscript><p class="sec lede">BuffrX is a free Windows app for your game clips, coming in November 2026. This page needs JavaScript for its demonstrations.</p></noscript>
+
+    <!-- WHY -->
+    <section class="hero" id="why" aria-labelledby="h1">
+      <div class="hero-copy">
+        <h1 id="h1"><span class="st st1">Clip it.</span> <span class="st st2">Cut it.</span> <span class="st st3">Send it.</span></h1>
+        <p class="lede">Record your game, trim the best part and send it to a friend, all without leaving BuffrX. Missed the moment? One key saves the last minute.</p>
+        <div class="cta">
+          <a class="btn primary" href="https://github.com/bulhaa1" target="_blank" rel="noopener noreferrer"><span>Follow on GitHub</span>
+            <svg class="arrow" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" aria-hidden="true"><path d="M7 17 17 7M8 7h9v9"/></svg></a>
+          <a class="btn" href="https://discord.gg/WekueJhR7" target="_blank" rel="noopener noreferrer"><svg class="dc-ico" width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M20.317 4.3698a19.7913 19.7913 0 00-4.8851-1.5152.0741.0741 0 00-.0785.0371c-.211.3753-.4447.8648-.6083 1.2495-1.8447-.2762-3.68-.2762-5.4868 0-.1636-.3933-.4058-.8742-.6177-1.2495a.077.077 0 00-.0785-.037 19.7363 19.7363 0 00-4.8852 1.515.0699.0699 0 00-.0321.0277C.5334 9.0458-.319 13.5799.0992 18.0578a.0824.0824 0 00.0312.0561c2.0528 1.5076 4.0413 2.4228 5.9929 3.0294a.0777.0777 0 00.0842-.0276c.4616-.6304.8731-1.2952 1.226-1.9942a.076.076 0 00-.0416-.1057c-.6528-.2476-1.2743-.5495-1.8722-.8923a.077.077 0 01-.0076-.1277c.1258-.0943.2517-.1923.3718-.2914a.0743.0743 0 01.0776-.0105c3.9278 1.7933 8.18 1.7933 12.0614 0a.0739.0739 0 01.0785.0095c.1202.099.246.1981.3728.2924a.077.077 0 01-.0066.1276 12.2986 12.2986 0 01-1.873.8914.0766.0766 0 00-.0407.1067c.3604.698.7719 1.3628 1.225 1.9932a.076.076 0 00.0842.0286c1.961-.6067 3.9495-1.5219 6.0023-3.0294a.077.077 0 00.0313-.0552c.5004-5.177-.8382-9.6739-3.5485-13.6604a.061.061 0 00-.0312-.0286zM8.02 15.3312c-1.1825 0-2.1569-1.0857-2.1569-2.419 0-1.3332.9555-2.4189 2.157-2.4189 1.2108 0 2.1757 1.0952 2.1568 2.419 0 1.3332-.9555 2.4189-2.1569 2.4189zm7.9748 0c-1.1825 0-2.1569-1.0857-2.1569-2.419 0-1.3332.9554-2.4189 2.1569-2.4189 1.2108 0 2.1757 1.0952 2.1568 2.419 0 1.3332-.946 2.4189-2.1568 2.4189Z"/></svg><span>Join Discord</span></a>
+          <a class="btn ghost" href="#features">See how it works</a>
+        </div>
+        <p class="fine">Free and open source, for Windows. No account, no telemetry. Coming Nov 2026.</p>
+      </div>
+      <div class="hero-stage">
+        <div class="keyhint">
+          <div class="hks" role="group" aria-label="The panel's hotkeys. Click one to press it.">
+            <button class="hk" type="button" data-act="save"><span class="keys"><kbd>Alt</kbd><kbd>1</kbd></span><span class="lb">Save clip</span></button>
+            <button class="hk" type="button" data-act="shot"><span class="keys"><kbd>Alt</kbd><kbd>2</kbd></span><span class="lb">Screenshot</span></button>
+            <button class="hk" type="button" data-act="record" aria-pressed="false"><span class="keys"><kbd data-key>Alt</kbd><kbd data-key>3</kbd></span><span class="lb">Record</span></button>
+            <button class="hk" type="button" data-act="view" aria-pressed="false"><span class="keys"><kbd>Alt</kbd><kbd>4</kbd></span><span class="lb">View clip</span></button>
+          </div>
+          <button class="pause" id="pause" type="button">Pause demo</button>
+          <p class="hknote" id="hknote" aria-live="off">Click a key, or press it on your keyboard.</p>
+        </div>
+        <div class="win-fit" id="hfit"><div class="bxp" id="hwin" role="img" aria-label="The BuffrX panel: a recording is made, cut in the editor and shared with Insta Share"></div></div>
+      </div>
+    </section>
+
+    <section class="sec about" id="about" aria-labelledby="about-h">
+      <h2 class="sr" id="about-h">About BuffrX</h2>
+      <div class="about-grid" data-r="up">
+        <div><h3>What it is</h3><p>A free, open-source Windows app that records your game, saves the last minute when you press a key, and lets you trim and share the clip, all in one place.</p></div>
+        <div><h3>Who it is for</h3><p>Players who want to keep and send their best moments without a streaming setup, an account or a cloud. Any GPU works: NVIDIA, AMD or Intel.</p></div>
+        <div><h3>Why it exists</h3><p>Clip tools tend to be tied to a GPU brand, a cloud or a lot of setup. BuffrX is made to be simple, private and light: no accounts, no telemetry, and quiet when you are not recording.</p></div>
+      </div>
+    </section>
+
+    <section class="sec" id="reasons" aria-labelledby="why-h">
+      <div class="sec-head" data-r="head"><h2 id="why-h">Everything about a clip, in one place.</h2></div>
+      <ul class="claims">
+        <li class="claim" data-r="up">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><rect pathLength="1" x="3" y="4" width="18" height="16"/><path pathLength="1" d="M3 9h18M8 4v16M16 4v16M3 14h5M16 14h5"/></svg>
+          <h3>Every clip, one library.</h3>
+          <p>Recordings, saved moments and screenshots land in one place, filed by game. Play, rename or send any of them in a click.</p>
+        </li>
+        <li class="claim" data-r="up">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle pathLength="1" cx="6" cy="6.5" r="2.8"/><circle pathLength="1" cx="6" cy="17.5" r="2.8"/><path pathLength="1" d="M8.4 8.2 20 18M8.4 15.8 20 6"/></svg>
+          <h3>Editing is built in.</h3>
+          <p>Trim, split, crop and set the volume without leaving BuffrX. Where it can, a cut is a lossless copy.</p>
+        </li>
+        <li class="claim" data-r="up">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path pathLength="1" d="M12 15V3M7 8l5-5 5 5M5 13v7h14v-7"/></svg>
+          <h3>Send it with Insta Share.</h3>
+          <p>Insta Share is the link in a clip's Share sheet: it sends the clip straight to a friend, up to 4 GB with nothing uploaded first. Your friend needs BuffrX, which is free. Or post to Discord, fitted to its size limit.</p>
+        </li>
+        <li class="claim" data-r="up">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path pathLength="1" d="M4 12a8 8 0 1 0 2.4-5.7L4 8.5M4 4v4.5h4.5M12 8v4.5l3 2"/></svg>
+          <h3>It catches what you missed.</h3>
+          <p>BuffrX keeps the last minute of your game running in the background. One key turns it into a clip.</p>
+        </li>
+        <li class="claim" data-r="up">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path pathLength="1" d="M13 3 5 14h6l-1 7 8-11h-6z"/></svg>
+          <h3>A quick clip for the funny bit.</h3>
+          <p>Inside that minute sits a smaller one. A quick clip is a short save from the same buffer, 20 seconds unless you change it, so the moment you only just missed becomes its own tiny clip with one key.</p>
+        </li>
+      </ul>
+    </section>
+
+    <!-- FEATURES -->
+    <section class="sec" id="features" aria-labelledby="feat-h">
+      <div class="sec-head" data-r="head">
+        <h2 id="feat-h">Try the parts.</h2>
+        <p class="lede" data-r="up">Each card has a button you can press.</p>
+      </div>
+      <div class="bento" id="bento"></div>
+      <div class="more" id="more">
+        <h3 class="more-h" id="more-h">And more.</h3>
+        <div class="more-tabs seg" id="moreTabs" role="tablist" aria-labelledby="more-h"></div>
+        <div class="more-panel" id="morePanel"></div>
+      </div>
+    </section>
+
+    <!-- PRIVACY -->
+    <section class="sec" id="privacy" aria-labelledby="priv-h">
+      <div class="sec-head" data-r="head">
+        <h2 id="priv-h">Built with privacy as a pillar.</h2>
+        <p class="lede" data-r="up">BuffrX has no accounts, no telemetry and no server of ours. It works without the cloud, and nothing goes online until you press a button.</p>
+      </div>
+      <div class="priv">
+        <div data-r="up">
+          <h3 class="priv-h">Private</h3>
+          <ul class="nevers">
+            <li><svg class="nv" viewBox="0 0 20 20" aria-hidden="true"><path d="M4 10.5l4 4 8-9"/></svg><div><b>No account.</b><span>There is nothing to sign up for or sign in to.</span></div></li>
+            <li><svg class="nv" viewBox="0 0 20 20" aria-hidden="true"><path d="M4 10.5l4 4 8-9"/></svg><div><b>No telemetry.</b><span>No analytics code, not even behind a flag.</span></div></li>
+            <li><svg class="nv" viewBox="0 0 20 20" aria-hidden="true"><path d="M4 10.5l4 4 8-9"/></svg><div><b>Your clips stay put.</b><span>On your own disk, filed by game, with one config file beside them.</span></div></li>
+          </ul>
+        </div>
+        <div data-r="up">
+          <h3 class="priv-h">No cloud needed</h3>
+          <ul class="nevers">
+            <li><svg class="nv" viewBox="0 0 20 20" aria-hidden="true"><path d="M4 10.5l4 4 8-9"/></svg><div><b>Works offline.</b><span>Recording, editing and your library never touch the internet.</span></div></li>
+            <li><svg class="nv" viewBox="0 0 20 20" aria-hidden="true"><path d="M4 10.5l4 4 8-9"/></svg><div><b>No server of ours.</b><span>Insta Share sends a clip from your PC to your friend's, directly when it can. A relay, when it must, sees only encrypted data.</span></div></li>
+            <li><svg class="nv" viewBox="0 0 20 20" aria-hidden="true"><path d="M4 10.5l4 4 8-9"/></svg><div><b>Only when you press.</b><span>The update check, a post to your own Discord webhook and an Insta Share link are the only things that go online, and you start each one.</span></div></li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <!-- COMPARE -->
+    <section class="sec" id="compare" aria-labelledby="cmp-h">
+      <div class="sec-head" data-r="head">
+        <h2 id="cmp-h">How it compares.</h2>
+        <p class="lede" data-r="up">Pick one to put next to BuffrX.</p>
+      </div>
+      <div class="chips" id="chips" role="group" aria-label="Compare BuffrX with" data-r="up"></div>
+      <div class="race" id="race" aria-hidden="true"></div>
+      <div class="cmpwrap" data-r="scale" tabindex="0" role="region" aria-label="Comparison table, scrolls sideways on a narrow screen"><table class="cmp" id="cmp"></table></div>
+      <div class="verdict" id="verdict"></div>
+      <div class="foot">
+        <div class="legend" aria-hidden="true"><span><svg class="mk full" viewBox="0 0 20 20"><rect x="1.5" y="1.5" width="17" height="17"/><path d="M6 10.5l2.8 2.8L14 7.5"/></svg>Has it</span><span><svg class="mk half" viewBox="0 0 20 20"><rect x="1.5" y="1.5" width="17" height="17"/><path class="h" d="M1.5 1.5H10v17H1.5Z"/></svg>Partly</span><span><svg class="mk none" viewBox="0 0 20 20"><rect x="1.5" y="1.5" width="17" height="17"/><path d="M6.5 10h7"/></svg>Does not</span></div>
+      </div>
+    </section>
+
+    <!-- ROADMAP -->
+    <section class="sec" id="roadmap" aria-labelledby="road-h">
+      <div class="sec-head" data-r="head">
+        <h2 id="road-h">Where it's going.</h2>
+      </div>
+      <ol class="road">
+        <li class="stage now" data-r="scale">
+          <header><h3>At launch</h3><small>Nov 2026</small></header>
+          <ul>
+            <li><b>Record, save and screenshot</b><span>Four hotkeys, and the last minute kept for you.</span></li>
+            <li><b>One library, an editor built in</b><span>Filed by game. Trim, split, crop.</span></li>
+            <li><b>Insta Share and Discord</b><span>A link to a friend, or a post to your webhook.</span></li>
+            <li><b>Fourteen themes</b><span>For the panel, the quick panel and the editor.</span></li>
+            <li><b>Windows, any GPU</b><span>NVIDIA, AMD, Intel or CPU. No account, no telemetry.</span></li>
+          </ul>
+        </li>
+        <li class="stage next" data-r="scale">
+          <header><h3>Next</h3><small>After launch, no date</small></header>
+          <ul>
+            <li class="hot"><b>Linux<i class="chip">Planned</i></b><span>Not at launch. The interface is built so that only the window host has to change.</span></li>
+            <li><b>Cleaner mic<i class="chip">Planned</i></b><span>Noise suppression, a gate and a compressor, so a clip sounds right.</span></li>
+            <li><b>The game on its own track<i class="chip">Planned</i></b><span>Capture one app's sound apart from the rest of your PC.</span></li>
+            <li><b>More audio sources<i class="chip">Planned</i></b><span>Several sources, each with its own volume, mute and sync.</span></li>
+          </ul>
+        </li>
+        <li class="stage later" data-r="scale">
+          <header><h3>Later</h3><small>Ideas, not promises</small></header>
+          <ul>
+            <li><b>HDR and 10-bit colour<i class="chip">Idea</i></b><span>Clips that keep the colour your screen shows.</span></li>
+            <li><b>Watch an Insta Share link in a browser<i class="chip">Idea</i></b><span>See a clip before installing anything. It needs more proving first.</span></li>
+            <li><b>Full controller support<i class="chip">Idea</i></b><span>Drive the whole app from a gamepad, and save a clip without putting it down.</span></li>
+            <li><b>Markers while recording<i class="chip">Idea</i></b><span>Press a key to mark a moment, and jump back to it in the editor.</span></li>
+          </ul>
+        </li>
+      </ol>
+    </section>
+
+    <!-- FAQ -->
+    <section class="sec" id="faq" aria-labelledby="faq-h">
+      <div class="sec-head" data-r="head">
+        <h2 id="faq-h">Questions people ask.</h2>
+        <p class="lede" data-r="up">The short answers. If yours is missing, <a href="https://discord.gg/WekueJhR7" target="_blank" rel="noopener noreferrer">ask on Discord</a>.</p>
+      </div>
+      <div class="qa" id="qa" data-r="up"></div>
+    </section>
+
+    <!-- PRICING -->
+    <section class="sec" id="pricing" aria-labelledby="price-h">
+      <div class="sec-head" data-r="head">
+        <h2 id="price-h">Pricing.</h2>
+        <p class="lede" data-r="up">There are two plans, and they are the same app. Both are free and open source.</p>
+      </div>
+      <div class="billing" id="billing" role="group" aria-label="Billing period" data-r="up">
+        <button type="button" data-p="month" aria-pressed="true">Monthly</button>
+        <button type="button" data-p="year" aria-pressed="false">Yearly</button>
+        <button type="button" data-p="life" aria-pressed="false">Lifetime</button>
+      </div>
+      <div class="plans">
+        <article class="plan" data-r="scale">
+          <h3>Free</h3>
+          <p class="price"><b>$0</b><span>forever</span></p>
+          <p class="plan-d">The whole app. Nothing is held back.</p>
+          <ul class="perks">
+            <li><b>Everything in Premium.</b><span>Yes, all of it. Read the next card.</span></li>
+            <li><b>The same download.</b><span>One app, no tiers.</span></li>
+            <li><b>The same source.</b><span>GPL, published at release.</span></li>
+          </ul>
+          <a class="btn" href="https://github.com/bulhaa1" target="_blank" rel="noopener noreferrer"><span>Follow on GitHub</span></a>
+        </article>
+        <article class="plan prem" data-r="scale">
+          <span class="ribbon">Most popular, as one of two</span>
+          <h3>Premium</h3>
+          <p class="price"><s>$9.99</s><b data-k="amt">$0</b><span data-k="per">per month, billed never</span></p>
+          <p class="plan-d">Everything Premium gets you is free and open source.</p>
+          <i class="tags"><em>Free</em><em>Open source</em></i>
+          <ul class="perks">
+            <li><b>Insta Share links</b><span>A clip to a friend in a click. Up to 4 GB, nothing uploaded first.</span></li>
+            <li><b>The built-in editor</b><span>Trim, split and crop without another app.</span></li>
+            <li><b>Unlimited clips</b><span>Your disk is the limit.</span></li>
+            <li><b>All fourteen themes</b><span>The light ones too.</span></li>
+            <li><b>No watermark, no ads</b><span>There is nothing to remove.</span></li>
+            <li><b>Zero telemetry, deluxe</b><span>The same zero as Free, in a nicer box.</span></li>
+          </ul>
+          <button class="btn primary" id="upgrade" type="button">Upgrade to Premium &middot; $0</button>
+          <div class="receipt" id="receipt" aria-live="polite"></div>
+        </article>
+      </div>
+      <dl class="faq" data-r="up">
+        <div><dt>Is Premium better than Free?</dt><dd>It has a longer list and the same price. That is the whole difference.</dd></div>
+        <div><dt>What is the catch?</dt><dd>There is none. The source is published at release, so you can check.</dd></div>
+        <div><dt>Can I pay you anyway?</dt><dd>Please don't. A star on GitHub is plenty.</dd></div>
+      </dl>
+      <p class="plain" data-r="up"><span class="tag">The point</span><span>BuffrX is free and open source: every feature, for everyone. There is no paid version, no trial and no account.</span></p>
+    </section>
+
+    <!-- GET -->
+    <section class="get" id="get" aria-labelledby="get-h" data-r="get">
+      <div class="get-in">
+        <div>
+          <h2 id="get-h" data-r="up">Coming November 2026.</h2>
+          <p class="lede" data-r="up">BuffrX is free and made for Windows. Watch the repository on GitHub and you will see the release the day it lands.</p>
+          <div class="cta" data-r="up">
+            <a class="btn dark" href="https://github.com/bulhaa1" target="_blank" rel="noopener noreferrer"><span>Watch the release on GitHub</span>
+              <svg class="arrow" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" aria-hidden="true"><path d="M7 17 17 7M8 7h9v9"/></svg></a>
+            <a class="btn dark" href="https://discord.gg/WekueJhR7" target="_blank" rel="noopener noreferrer"><svg class="dc-ico" width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M20.317 4.3698a19.7913 19.7913 0 00-4.8851-1.5152.0741.0741 0 00-.0785.0371c-.211.3753-.4447.8648-.6083 1.2495-1.8447-.2762-3.68-.2762-5.4868 0-.1636-.3933-.4058-.8742-.6177-1.2495a.077.077 0 00-.0785-.037 19.7363 19.7363 0 00-4.8852 1.515.0699.0699 0 00-.0321.0277C.5334 9.0458-.319 13.5799.0992 18.0578a.0824.0824 0 00.0312.0561c2.0528 1.5076 4.0413 2.4228 5.9929 3.0294a.0777.0777 0 00.0842-.0276c.4616-.6304.8731-1.2952 1.226-1.9942a.076.076 0 00-.0416-.1057c-.6528-.2476-1.2743-.5495-1.8722-.8923a.077.077 0 01-.0076-.1277c.1258-.0943.2517-.1923.3718-.2914a.0743.0743 0 01.0776-.0105c3.9278 1.7933 8.18 1.7933 12.0614 0a.0739.0739 0 01.0785.0095c.1202.099.246.1981.3728.2924a.077.077 0 01-.0066.1276 12.2986 12.2986 0 01-1.873.8914.0766.0766 0 00-.0407.1067c.3604.698.7719 1.3628 1.225 1.9932a.076.076 0 00.0842.0286c1.961-.6067 3.9495-1.5219 6.0023-3.0294a.077.077 0 00.0313-.0552c.5004-5.177-.8382-9.6739-3.5485-13.6604a.061.061 0 00-.0312-.0286zM8.02 15.3312c-1.1825 0-2.1569-1.0857-2.1569-2.419 0-1.3332.9555-2.4189 2.157-2.4189 1.2108 0 2.1757 1.0952 2.1568 2.419 0 1.3332-.9555 2.4189-2.1569 2.4189zm7.9748 0c-1.1825 0-2.1569-1.0857-2.1569-2.419 0-1.3332.9554-2.4189 2.1569-2.4189 1.2108 0 2.1757 1.0952 2.1568 2.419 0 1.3332-.946 2.4189-2.1568 2.4189Z"/></svg><span>Join the Discord</span></a>
+            <span class="btn off" aria-disabled="true">Download for Windows &middot; Nov 2026</span>
+          </div>
+        </div>
+        <div class="reqs-box"><h3 class="reqs-h" data-r="up">System requirements</h3>
+        <dl class="reqs" data-r="up">
+          <div><dt>OS</dt><dd>Windows 10 or 11, 64-bit</dd></div>
+          <div><dt>Processor</dt><dd>Any 64-bit x86 processor</dd></div>
+          <div><dt>Memory</dt><dd>512 MB RAM</dd></div>
+          <div><dt>Graphics</dt><dd>Any GPU</dd></div>
+          <div><dt>Storage</dt><dd>About 80 MB for the app, plus room for your clips</dd></div>
+          <div><dt>Additional notes</dt><dd>WebView2 runtime for the editor, network only when you press a button (update check, Insta Share, Discord)</dd></div>
+        </dl></div>
+      </div>
+      <div class="get-mark" aria-hidden="true"><svg viewBox="-18 35 360 360"><path d="M3.2 93L42.2 143.4L230 143.4C254.3 148.8 262 168.5 240 184.4C233.3 189.3 225.7 190.8 218 192.8L118.3 192.8L152.2 235.4L234 235.4C243.6 237.4 251.8 238.8 260 244.6C265.3 248.3 266.8 254.1 267.6 260C269.4 274.1 259.7 282.4 247 285.3L96 285.3L95.5 168L42.8 201.5L42.8 336.4L257 336.4C300.7 328.5 320.5 313.6 320.5 266C320.5 250 318.2 235.3 308 222.6C301.7 214.8 292 211.9 284.6 206C289.1 196.6 298.7 189.6 302.3 179C309.6 157.2 304.8 115.4 281 103.7C270.7 98.6 260.6 96.2 250 93L3.2 93Z"/></svg></div>
+    </section>
+  </main>
+
+  <footer class="site-foot">
+    <img src="buffrx-logo.svg" alt="BuffrX" width="46" height="16">
+    <span>Coming soon, Nov 2026</span>
+    <span>Windows</span>
+    <span class="grow"></span>
+    <a class="foot-dc" href="https://discord.gg/WekueJhR7" target="_blank" rel="noopener noreferrer"><svg class="dc-ico" width="15" height="15" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M20.317 4.3698a19.7913 19.7913 0 00-4.8851-1.5152.0741.0741 0 00-.0785.0371c-.211.3753-.4447.8648-.6083 1.2495-1.8447-.2762-3.68-.2762-5.4868 0-.1636-.3933-.4058-.8742-.6177-1.2495a.077.077 0 00-.0785-.037 19.7363 19.7363 0 00-4.8852 1.515.0699.0699 0 00-.0321.0277C.5334 9.0458-.319 13.5799.0992 18.0578a.0824.0824 0 00.0312.0561c2.0528 1.5076 4.0413 2.4228 5.9929 3.0294a.0777.0777 0 00.0842-.0276c.4616-.6304.8731-1.2952 1.226-1.9942a.076.076 0 00-.0416-.1057c-.6528-.2476-1.2743-.5495-1.8722-.8923a.077.077 0 01-.0076-.1277c.1258-.0943.2517-.1923.3718-.2914a.0743.0743 0 01.0776-.0105c3.9278 1.7933 8.18 1.7933 12.0614 0a.0739.0739 0 01.0785.0095c.1202.099.246.1981.3728.2924a.077.077 0 01-.0066.1276 12.2986 12.2986 0 01-1.873.8914.0766.0766 0 00-.0407.1067c.3604.698.7719 1.3628 1.225 1.9932a.076.076 0 00.0842.0286c1.961-.6067 3.9495-1.5219 6.0023-3.0294a.077.077 0 00.0313-.0552c.5004-5.177-.8382-9.6739-3.5485-13.6604a.061.061 0 00-.0312-.0286zM8.02 15.3312c-1.1825 0-2.1569-1.0857-2.1569-2.419 0-1.3332.9555-2.4189 2.157-2.4189 1.2108 0 2.1757 1.0952 2.1568 2.419 0 1.3332-.9555 2.4189-2.1569 2.4189zm7.9748 0c-1.1825 0-2.1569-1.0857-2.1569-2.419 0-1.3332.9554-2.4189 2.1569-2.4189 1.2108 0 2.1757 1.0952 2.1568 2.419 0 1.3332-.946 2.4189-2.1568 2.4189Z"/></svg>Discord</a>
+    <a href="https://github.com/bulhaa1" target="_blank" rel="noopener noreferrer">GitHub</a>
+    <a href="#why">Back to top</a>
+  </footer>
+
+  <script src="games.js"></script>
+  <script src="appwin.js"></script>
+  <script src="recorder.js"></script>
+  <script src="cursor.js"></script>
+  <script src="site.js"></script>
+  <script src="fx.js"></script>
+</body>
+</html>
