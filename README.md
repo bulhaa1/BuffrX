@@ -14,6 +14,12 @@
 
 ---
 
+## From Rewind to BuffrX
+
+BuffrX is the next step after my earlier project, [Rewind](https://github.com/bulhaa1/Rewind). It is not an update to it. It is
+rebuilt from the ground up, with everything Rewind taught me about what a clipping tool needs, and what gets in the way, built in
+from the first line. Same idea, a level up.
+
 BuffrX keeps the last minute of your game, so the moment you almost missed is never lost. Press a key to save it, cut it in the
 built-in editor, and send it to a friend. One small app, no account, no telemetry.
 

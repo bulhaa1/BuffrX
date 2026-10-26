@@ -4,7 +4,7 @@
 'use strict';
 
 // Where "Get BuffrX" points. Set it to the BuffrX download page before publishing.
-const DOWNLOAD_URL = 'https://github.com/bulhaa1'; // the site's Get button points here until a release exists
+const DOWNLOAD_URL = 'https://github.com/bulhaa1/BuffrX'; // the site's Get button points here until a release exists
 
 const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
 const $ = (id) => document.getElementById(id);
