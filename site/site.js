@@ -552,54 +552,63 @@ FEATURES.forEach((f) => {
 })();
 
 
-// ---- pricing: two plans, one app, both free. The upgrade button runs a receipt for nothing, and a burst of zeros. ----
+// ---- pricing: two plans, one app, both free. The upgrade button refuses the money, outright. ----
 (function pricing() {
   const PER = { month: 'per month, billed never', year: 'per year, billed never. Saves 0%', life: 'once, paid never' };
   const WAS = { month: '$9.99', year: '$99.99', life: '$299' };
-  const per = $('[data-k="per"]'), amt = $('[data-k="amt"]'), was = $('#pricing s'), btn = $('#upgrade'), out = $('#receipt'), prem = $('.plan.prem'), c = ctx(); let times = 0, rolled = false;
+  const per = $('[data-k="per"]'), amt = $('[data-k="amt"]'), was = $('#pricing s'), btn = $('#upgrade'), prem = $('.plan.prem'), c = ctx(); let times = 0, rolled = false, resetT = 0;
   $$('.prem .perks li').forEach((li, i) => li.style.setProperty('--n', i));
-  // the price counts down to nothing
+  // the price counts down to nothing, then the cents give up and fall off it
   const roll = () => {
     const start = parseFloat(was.textContent.slice(1)), t0 = performance.now(), len = 900;
     if (reduce) { amt.textContent = '$0'; return; }
-    const step = () => { const q = Math.min(1, (performance.now() - t0) / len), v = start * (1 - q) * (1 - q); amt.textContent = q >= 1 ? '$0' : `$${v.toFixed(2)}`; if (q < 1) requestAnimationFrame(step); };
+    const flop = () => {
+      const cents = document.createElement('span'); cents.className = 'cents'; cents.textContent = '.00';
+      amt.textContent = '$0'; amt.append(cents);
+      cents.animate([{ transform: 'translate(0, 0) rotate(0)', opacity: 1 }, { transform: `translate(${(Math.random() - 0.5) * 44}px, 1.05em) rotate(${(Math.random() - 0.5) * 40}deg)`, opacity: 0 }], { duration: 560, easing: 'cubic-bezier(.45, 0, .8, .4)', fill: 'both' }).onfinish = () => cents.remove();
+      amt.animate([{ transform: 'scale(1)' }, { transform: 'scale(1.14)', offset: 0.4 }, { transform: 'scale(1)' }], { duration: 240, easing: 'cubic-bezier(.16, 1, .3, 1)' });
+    };
+    const step = () => { const q = Math.min(1, (performance.now() - t0) / len), v = start * (1 - q) * (1 - q); amt.textContent = q >= 1 ? '$0.00' : `$${v.toFixed(2)}`; if (q < 1) requestAnimationFrame(step); else flop(); };
     step();
   };
   new IntersectionObserver((es, o) => { if (es[0].isIntersecting && !rolled) { rolled = true; setTimeout(roll, 350); o.disconnect(); } }, { threshold: 0.5 }).observe(prem);
-  $$('#billing button').forEach((b) => b.addEventListener('click', () => { $$('#billing button').forEach((x) => x.setAttribute('aria-pressed', String(x === b))); per.textContent = PER[b.dataset.p]; was.textContent = WAS[b.dataset.p]; roll(); }));
-  // the whole screen throws a party: the page shakes, a shine wipes across, $0 and FREE rain from the top, and a stamp slams down
-  let party = null;
-  const endParty = () => { if (!party) return; party.remove(); party = null; removeEventListener('keydown', escParty); };
-  const escParty = (e) => { if (e.key === 'Escape') endParty(); };
-  const zeros = () => {
-    if (reduce || party) return;
-    const W = innerWidth, H = innerHeight, WORDS = ['$0', 'FREE', '$0.00', 'GPL', 'NO CATCH', '$0', 'OPEN SOURCE'];
-    const TAPE = 'THIS IS A JOKE &middot; IT IS ALL FREE &middot; NOTHING WAS CHARGED &middot; OPEN SOURCE, ALWAYS &middot; WE ARE JUST TROLLING YOU &middot; ';
-    party = el('div', 'party', `<i class="party-shine"></i><div class="party-tape top"><span>${TAPE.repeat(6)}</span></div><div class="party-tape bot"><span>${TAPE.repeat(6)}</span></div><div class="party-card"><b data-k="h">Upgrading you to Premium&hellip;</b><span data-k="s">Charging <em>$0.00</em> to a card that does not exist.</span><i class="party-bar"><u></u></i></div><div class="party-stamp">JUST KIDDING</div>`);
-    party.setAttribute('aria-hidden', 'true'); document.body.append(party); addEventListener('keydown', escParty);
-    const main = $('main'); main.classList.remove('shake'); void main.offsetWidth; main.classList.add('shake');
-    const chips = Array.from({ length: Math.min(90, Math.round(W / 16)) }, (_, i) => {
-      const z = el('i', 'zero rain' + (i % 5 === 0 ? ' alt' : i % 7 === 0 ? ' ink' : ''), WORDS[i % WORDS.length]); z.style.setProperty('left', `${Math.random() * W}px`); z.style.setProperty('top', '-40px'); party.append(z);
-      z.animate([{ transform: `translateY(0) rotate(${(Math.random() - 0.5) * 40}deg)`, opacity: 1 }, { transform: `translate(${(Math.random() - 0.5) * 160}px, ${H + 80}px) rotate(${(Math.random() - 0.5) * 540}deg)`, opacity: 1 }], { duration: 1500 + Math.random() * 1500, delay: 250 + Math.random() * 900, easing: 'cubic-bezier(.4, .1, .6, 1)', fill: 'both' });
-      return z;
-    });
-    const wipe = $('.party-shine', party); wipe.animate([{ transform: 'translateX(-60vw) skewX(-18deg)' }, { transform: 'translateX(170vw) skewX(-18deg)' }], { duration: 1000, delay: 150, easing: 'cubic-bezier(.5, 0, .2, 1)', fill: 'both' });
-    const card = $('.party-card', party); card.animate([{ transform: 'scale(0.3) rotate(-8deg)', opacity: 0 }, { transform: 'scale(1.08) rotate(-2deg)', opacity: 1, offset: 0.6 }, { transform: 'scale(1) rotate(-2deg)', opacity: 1 }], { duration: 520, delay: 300, easing: 'cubic-bezier(.16, 1, .3, 1)', fill: 'both' });
-    $('.party-bar u', party).animate([{ transform: 'scaleX(0)' }, { transform: 'scaleX(1)' }], { duration: 1100, delay: 700, easing: 'steps(12, end)', fill: 'both' });
-    const stamp = $('.party-stamp', party); stamp.animate([{ transform: 'translate(-50%, -50%) scale(4) rotate(-18deg)', opacity: 0 }, { transform: 'translate(-50%, -50%) scale(1) rotate(-12deg)', opacity: 1, offset: 0.7 }, { transform: 'translate(-50%, -50%) scale(1.06) rotate(-12deg)', opacity: 1 }], { duration: 380, delay: 2300, easing: 'cubic-bezier(.5, 0, 1, .6)', fill: 'both' });
-    // the card plays it straight, then turns round on you
-    c.later(() => { const h = $('[data-k="h"]', party), sp = $('[data-k="s"]', party); if (!h) return; h.textContent = 'Just kidding.'; sp.innerHTML = 'There is no Premium. <em>Everything is free and open source,</em> and always was. You were trolled.'; card.classList.add('flip'); }, 1700);
-    party.animate([{ opacity: 1 }, { opacity: 1, offset: 0.86 }, { opacity: 0 }], { duration: 5600, fill: 'forwards' }).onfinish = endParty;
-    party.style.setProperty('pointer-events', 'auto'); party.addEventListener('pointerdown', endParty);
-    return chips;
+  // swapping the billing period draws the per-line down like it was reprinted
+  const swapPer = (t) => { per.textContent = t; if (!reduce) per.animate([{ opacity: 0, transform: 'translateY(4px)' }, { opacity: 1, transform: 'none' }], { duration: 120, easing: 'ease-out' }); };
+  $$('#billing button').forEach((b) => b.addEventListener('click', () => { $$('#billing button').forEach((x) => x.setAttribute('aria-pressed', String(x === b))); swapPer(PER[b.dataset.p]); was.textContent = WAS[b.dataset.p]; roll(); }));
+  // the upgrade politely refuses the charge: the card shakes its head at your money, then nods as the line lands. No money changes hands.
+  const decline = () => {
+    if (reduce) return;
+    prem.animate([
+      { transform: 'none' },
+      { transform: 'rotate(-1.6deg) scale(0.995)', offset: 0.18 },
+      { transform: 'rotate(1.4deg) scale(0.995)', offset: 0.34 },
+      { transform: 'rotate(-1.2deg)', offset: 0.52 },
+      { transform: 'rotate(0.9deg)', offset: 0.68 },
+      { transform: 'rotate(-0.35deg)', offset: 0.85 },
+      { transform: 'none' },
+    ], { duration: 640, easing: 'ease-in-out' });
+    setTimeout(() => prem.animate([
+      { transform: 'none' },
+      { transform: 'translateY(7px) scale(0.99)', offset: 0.42 },
+      { transform: 'translateY(-1px)', offset: 0.72 },
+      { transform: 'none' },
+    ], { duration: 520, easing: 'cubic-bezier(.3, .7, .4, 1)' }), 690);
   };
+  // and the line under the plans answers back, plain text, no bubble and no quotes, a new one every press
+  const SAY = ['Bold move, trying to pay for free software.', 'You have been charged $0.00. Enjoy your purchase.', 'The only accepted payment is a GitHub star.', 'Save your money. This one is on me.', 'Put it toward a bigger drive. Your clips need it.', 'Dude, stop. It is free.', 'Oh, you really want Premium, huh?', 'Naughty. It is free.', 'Omg, stop!!'];
+  const nope = $('#nope');
   btn.addEventListener('click', () => {
     if (btn.getAttribute('aria-disabled') === 'true') return;
-    c.dispose(); btn.setAttribute('aria-disabled', 'true'); out.replaceChildren(); times++; zeros();
-    const lines = [[0, 'Contacting the billing department&hellip;'], [800, 'Card number: not needed.'], [1600, 'Total today: <b>$0.00</b>. Tax: $0.00. Tip: please don\'t.'], [2500, times > 1 ? '<b>You are Premium again.</b> Still nothing changed.' : '<b>You are Premium now.</b> You already were. Nothing changed, and that is the feature.']];
-    lines.forEach(([ms, html]) => c.later(() => out.append(el('p', '', html)), ms));
-    c.later(() => out.append(el('p', '', 'Want the real thing? <a href="https://github.com/bulhaa1" target="_blank" rel="noopener noreferrer">Follow BuffrX on GitHub</a>.')), 3300);
-    c.later(() => { btn.removeAttribute('aria-disabled'); btn.textContent = 'Upgrade again \u00b7 $0'; }, 2700);
+    btn.setAttribute('aria-disabled', 'true'); times++;
+    clearTimeout(resetT);
+    resetT = setTimeout(() => { times = 0; }, 5000);
+    nope.textContent = '';
+    decline();
+    c.later(() => {
+      const say = el('i', 'say', SAY[Math.min(times - 1, SAY.length - 1)]); nope.append(say);
+      c.later(() => say.remove(), 1700);
+    }, 690);
+    c.later(() => btn.removeAttribute('aria-disabled'), 1150);
   });
 })();
 
@@ -704,7 +713,7 @@ spy();
 
 // finer parts come in one by one as they are reached: the rows of a list, the stops of the roadmap, each question, each plan
 (function parts() {
-  $$('.nevers li, .priv-h, .stage li, #qa .q, .plan, .reqs > div, .chips, .verdict, .lib-f, .more-tabs, .site-foot').forEach((e) => {
+  $$('.nevers li, .priv-h, .stage li, #qa .q, .plan, .reqs > div, .chips, .verdict, .lib-f, .more-tabs').forEach((e) => {
     if (e.closest('[data-r]') && !e.matches('.stage li, .nevers li, #qa .q, .reqs > div')) return; // a part inside a revealed block rides in with it
     if (e.dataset.r) return;
     e.dataset.r = 'up'; reveal.observe(e); if (isPhone.matches) e.classList.add('in');

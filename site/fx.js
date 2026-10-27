@@ -37,20 +37,29 @@
     document.addEventListener('click', (e) => { if (e.target.closest('a[href^="#"]')) stop(); });
   };
 
-  // ---- buttons that lean toward the pointer and settle back ----
+  // ---- buttons that lean toward the pointer and settle back; the nearest one within reach leans before you reach it ----
   const magnet = () => {
     if (reduce || !fine) return;
-    const sel = '.cta .btn, .nav .btn, .hk, .get .btn';
+    const sel = '.cta .btn, .nav .btn, .hk, .get .btn, .plan .btn', REACH = 80;
+    let cur = null;
+    const drop = () => { if (!cur) return; cur.classList.remove('lean'); cur.style.removeProperty('--lx'); cur.style.removeProperty('--ly'); cur = null; };
+    const fit = (b) => b && !b.hasAttribute('disabled') && b.getAttribute('aria-disabled') !== 'true';
     addEventListener('pointermove', (e) => {
-      const b = e.target.closest && e.target.closest(sel);
-      if (!b || b.hasAttribute('disabled') || b.getAttribute('aria-disabled') === 'true') return;
-      const r = b.getBoundingClientRect(), dx = (e.clientX - (r.left + r.width / 2)) / r.width, dy = (e.clientY - (r.top + r.height / 2)) / r.height;
-      b.style.setProperty('--lx', `${(dx * 10).toFixed(1)}px`); b.style.setProperty('--ly', `${(dy * 8).toFixed(1)}px`); b.classList.add('lean');
-    });
-    addEventListener('pointerout', (e) => {
-      const b = e.target.closest && e.target.closest(sel);
-      if (b && !b.contains(e.relatedTarget)) { b.classList.remove('lean'); b.style.removeProperty('--lx'); b.style.removeProperty('--ly'); }
-    });
+      let b = e.target.closest && e.target.closest(sel);
+      if (!fit(b)) b = null;
+      if (!b) {
+        let best = REACH;
+        for (const x of document.querySelectorAll(sel)) {
+          if (!fit(x)) continue;
+          const r = x.getBoundingClientRect(), gap = Math.hypot(Math.max(0, Math.max(r.left - e.clientX, e.clientX - r.right)), Math.max(0, Math.max(r.top - e.clientY, e.clientY - r.bottom)));
+          if (gap < best) { best = gap; b = x; }
+        }
+      }
+      if (b !== cur) { drop(); cur = b; }
+      if (!cur) return;
+      const r = cur.getBoundingClientRect(), dx = (e.clientX - (r.left + r.width / 2)) / r.width, dy = (e.clientY - (r.top + r.height / 2)) / r.height;
+      cur.style.setProperty('--lx', `${Math.max(-5, Math.min(5, dx * 10)).toFixed(1)}px`); cur.style.setProperty('--ly', `${Math.max(-4, Math.min(4, dy * 8)).toFixed(1)}px`); cur.classList.add('lean');
+    }, { passive: true });
   };
 
   // ---- the safety net: a part that has been in view and is still hidden is shown, whatever the observer did ----
@@ -73,10 +82,8 @@
   // ---- the headline decodes: each statement turns from noise into its letters as it arrives ----
   const decode = () => {
     if (reduce) { root.classList.add('title-go'); return; }
-    // CLIP IT: a camera flash lights the page as the first line is taken
-    const flash = document.createElement('div'); flash.id = 'flash'; flash.setAttribute('aria-hidden', 'true'); document.body.append(flash); setTimeout(() => flash.remove(), 1200);
     const GLYPHS = 'ABCDEFGHJKLMNPRSTUVWXYZ0123456789#%&*+<>';
-    requestAnimationFrame(() => root.classList.add('title-go')); // the flash, the lines and the text below start together, from this frame
+    requestAnimationFrame(() => root.classList.add('title-go')); // the headline and the text below start together, from this frame
     [[100, '.st1'], [480, '.st2'], [900, '.st3']].forEach(([delay, sel]) => {
       const st = document.querySelector('#h1 ' + sel); if (!st) return;
       const text = st.textContent.trim();
@@ -98,22 +105,6 @@
       requestAnimationFrame(frame);
       setTimeout(() => { scr.remove(); ghost.style.visibility = 'visible'; }, delay + len + 1500); // a hidden tab pauses the frames: the words still arrive
     });
-    // SEND IT: once the line has landed, a copy of it is sent: it stretches, tilts and streaks away to the top right
-    setTimeout(() => {
-      const st = document.querySelector('#h1 .st3'); if (!st || !st.animate) return;
-      const copy = document.createElement('span'); copy.className = 'sent'; copy.setAttribute('aria-hidden', 'true'); copy.textContent = st.textContent.trim();
-      st.append(copy);
-      const run = copy.animate([
-        { transform: 'translate(0, 0) skewX(0) scaleX(1)', opacity: 1, offset: 0 },
-        { transform: 'translate(-14px, 4px) skewX(6deg) scaleX(0.96)', opacity: 1, offset: 0.18 },
-        { transform: 'translate(70vw, -46vh) skewX(-28deg) scaleX(2.2)', opacity: 0, offset: 1 },
-      ], { duration: 820, easing: 'cubic-bezier(0.5, 0, 0.9, 0.5)', fill: 'forwards' });
-      for (let i = 0; i < 3; i++) {
-        const line = document.createElement('i'); line.className = 'streak'; line.style.top = `${28 + i * 22}%`; st.append(line);
-        line.animate([{ transform: 'translateX(0) scaleX(0.2)', opacity: 0 }, { transform: 'translateX(18vw) scaleX(1.4)', opacity: 0.9, offset: 0.5 }, { transform: 'translateX(60vw) scaleX(0.4)', opacity: 0 }], { duration: 760, delay: 60 + i * 50, easing: 'cubic-bezier(0.5, 0, 0.9, 0.5)', fill: 'both' }).onfinish = () => line.remove();
-      }
-      run.onfinish = () => copy.remove();
-    }, 1750);
   };
 
   const go = () => { decode(); net(); inertia(); magnet(); };

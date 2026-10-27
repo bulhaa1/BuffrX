@@ -46,7 +46,7 @@ const caps = (chord) => `<span class="b-caps">${chord.split('+').map((k) => `<b>
 const act = (icon, title, detail, chord, cls = '') => `<div class="b-act ${cls}">${icon}<b>${title}</b>${detail ? `<small>&middot; ${detail}</small>` : ''}${caps(chord)}</div>`;
 const recAct = (lead) => `<div class="b-act${lead ? ' sel' : ''}" data-k="recrow"><i class="b-rsq"></i><b data-k="rectitle">Record</b><small data-k="recdetail"></small><span class="b-caps"><b>Alt</b><b>3</b></span></div>`;
 const btn = (name, size, cls = '') => `<span class="b-ib ${cls}">${ic(name, size)}</span>`;
-const toast = '<div class="b-toast" data-k="toast" aria-hidden="true"><div><span class="b-tag" data-k="ttag">done</span><b data-k="ttitle">Clip saved</b></div><small data-k="tdetail">1:00 &middot; ${G.name(FRESH.game)}</small></div>';
+const toast = `<div class="b-toast" data-k="toast" aria-hidden="true"><div><span class="b-tag" data-k="ttag">done</span><b data-k="ttitle">Clip saved</b></div><small data-k="tdetail">1:00 &middot; ${G.name(FRESH.game)}</small></div>`;
 const MENU = [['Edit', 'E'], ['Insta Share', 'S'], ['Copy', 'C'], ['Delete', 'Del']];
 const menu = '<div class="b-menu" data-k="menu">' + MENU.map(([n, k]) => `<div class="b-mi"><b>${n}</b><small>${k}</small></div>`).join('') + '</div>';
 const card = (c, isNew) => `<div class="b-card${isNew ? ' new' : ''}"><div class="b-frame">${G.shot(c.game, '', c.v || 0)}<span class="b-badge">${c.d}</span></div>

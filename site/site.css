@@ -249,16 +249,22 @@ main { overflow-x: clip; }
 .plan > .btn { margin-top: auto; }
 .plan.prem { overflow: visible; }
 .plan.prem::after { content: ''; position: absolute; inset: 0; pointer-events: none; background: linear-gradient(105deg, transparent 42%, color-mix(in srgb, var(--acc) 20%, transparent) 50%, transparent 58%) 220% 0 / 260% 100% no-repeat; animation: shine 5s ease-in-out 1.2s infinite; }
+
+/* the refusal lands under the plans, not inside the card: one plain line, no bubble and no quotes */
+.nope { width: calc(50% - 8px); min-height: 1.7em; margin: 18px 0 0 auto; color: var(--acc); font: 700 14px var(--mono); }
+@media (max-width: 980px) { .nope { width: auto; } }
+@media (max-width: 640px) { .nope { min-height: 3.4em; } }
+.nope .say { display: inline-block; animation: sayin 1600ms var(--ease) both; }
+@keyframes sayin { 0% { opacity: 0; transform: translateY(5px); } 14% { opacity: 1; transform: none; } 78% { opacity: 1; transform: none; } 100% { opacity: 0; transform: translateY(-5px); } }
+
 .ribbon { transform-origin: 0 100%; animation: wiggle 3.6s ease-in-out infinite; }
 .plan.prem.in .tags em { animation: tagpop 520ms var(--ease) backwards; animation-delay: calc(500ms + var(--n, 0) * 110ms); }
 .price b { display: inline-block; min-width: 3.2ch; }
-.zero { position: absolute; z-index: 5; padding: 2px 6px; background: var(--acc); color: var(--on); font: 800 13px var(--mono); pointer-events: none; }
+.price .cents { display: inline-block; transform-origin: 50% 0; }
 @keyframes shine { 0%, 55% { background-position: 220% 0; } 100% { background-position: -120% 0; } }
 @keyframes wiggle { 0%, 70%, 100% { transform: rotate(0); } 76% { transform: rotate(-2.4deg); } 84% { transform: rotate(2deg); } 92% { transform: rotate(-1deg); } }
 @keyframes tagpop { from { opacity: 0; transform: scale(0.5) rotate(-8deg); } 60% { transform: scale(1.12) rotate(2deg); } }
-.receipt { display: grid; gap: 4px; color: var(--muted); font: 500 13.5px/1.6 var(--mono); }
-.receipt p { animation: fadeUp 400ms var(--ease) backwards; }
-.receipt b { color: var(--fg); }
+
 .faq { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; margin-top: 28px; }
 .faq > div { padding: 16px 0; border-top: 1px solid var(--line); }
 .faq dt { margin-bottom: 4px; font: 700 15px var(--mono); }
@@ -348,12 +354,10 @@ main { overflow-x: clip; }
 
 /* ---- get ---- */
 .get { position: relative; margin-top: clamp(100px, 14vw, 200px); overflow: hidden; color: var(--on); }
-.get::before { content: ''; position: absolute; inset: 0; background: var(--acc); transition: clip-path 1300ms var(--ease); }
-.js .get::before { clip-path: inset(14% 6% 0 6%); }
-.js .get.in::before { clip-path: inset(0 0 0 0); }
+.get::before { content: ''; position: absolute; inset: 0; background: var(--acc); }
 .get :focus-visible { outline-color: var(--on); }
-.get-in { position: relative; z-index: 1; display: grid; grid-template-columns: minmax(0, 7fr) minmax(0, 5fr); gap: clamp(36px, 6vw, 100px); max-width: var(--w); margin: 0 auto; padding: clamp(80px, 11vw, 150px) 24px clamp(72px, 9vw, 120px); }
-.get h2 { font-size: clamp(2.8rem, 7.4vw, 5.8rem); line-height: 0.98; letter-spacing: -0.04em; }
+.get-in { position: relative; z-index: 1; display: grid; grid-template-columns: minmax(0, 7fr) minmax(0, 5fr); gap: clamp(36px, 6vw, 100px); max-width: var(--w); margin: 0 auto; padding: clamp(56px, 7vw, 96px) 24px clamp(48px, 6vw, 80px); }
+.get h2 { font-size: clamp(2.4rem, 5.6vw, 4.6rem); line-height: 0.98; letter-spacing: -0.04em; }
 .get .lede { color: var(--on); }
 .get .cta { justify-content: flex-start; animation: none; margin-top: 36px; }
 .btn.dark { border-color: var(--on); background: var(--on); color: var(--acc); }
@@ -370,10 +374,11 @@ main { overflow-x: clip; }
 .reqs dd { color: var(--on); }
 .get-mark { position: absolute; right: -4%; bottom: -26%; width: min(56vw, 700px); color: color-mix(in srgb, var(--on) 9%, var(--acc)); pointer-events: none; }
 .get-mark svg { width: 100%; height: auto; fill: currentColor; }
-.site-foot { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 28px; padding: 28px max(24px, calc((100% - var(--w)) / 2 + 24px)) 36px; background: var(--ground); color: var(--muted); font-size: 14px; }
+/* the footer is the banner's last strip in the same orange, so the page ends with the orange banner and not after it */
+.site-foot { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 28px; margin-top: -1px; /* overlap the section above: its orange edge can leave a hairline seam while scrolling */ padding: 10px max(24px, calc((100% - var(--w)) / 2 + 24px)) 14px; background: var(--acc); color: color-mix(in srgb, var(--on) 72%, transparent); font-size: 14px; }
 .site-foot img { height: 16px; width: auto; opacity: 0.9; }
-.site-foot a { text-decoration-color: var(--line2); text-underline-offset: 3px; }
-.site-foot a:hover { color: var(--fg); }
+.site-foot a { text-decoration-color: color-mix(in srgb, var(--on) 30%, transparent); text-underline-offset: 3px; }
+.site-foot a:hover { color: var(--on); }
 .site-foot .grow { flex: 1; }
 
 /* ---- scroll reveals: headings are drawn up from a line, copy rises, panels settle; the observer watches the box, never the clipped part ---- */
@@ -395,7 +400,7 @@ main { overflow-x: clip; }
 .hk[aria-pressed='true'], .hk.on { background: var(--acc); border-color: var(--acc); color: var(--on); }
 .hk[aria-pressed='true'] kbd, .hk.on kbd { background: transparent; border-color: color-mix(in srgb, var(--on) 50%, transparent); color: var(--on); }
 .hk[aria-pressed='true'] kbd.down, .hk.on kbd.down { background: var(--on); border-color: var(--on); color: var(--acc); }
-.hknote { flex-basis: 100%; min-height: 1.5em; margin: 6px 0 0; color: var(--muted); font-size: 14.5px; text-align: center; }
+.hknote { min-height: 1.5em; margin: 14px 0 0; color: var(--muted); font-size: 14.5px; text-align: center; }
 .btn kbd { min-width: 22px; height: 22px; padding: 0 6px; font-size: 12px; border-bottom-width: 2px; }
 .btn kbd + kbd { margin-left: -6px; }
 
@@ -451,7 +456,8 @@ main { overflow-x: clip; }
   .brand { order: 1; margin-right: auto; }
   .themebtn { order: 2; }
   .nav .btn { order: 3; }
-  .tabs { order: 4; width: 100%; margin: 0; overflow-x: auto; }
+  .tabs { order: 4; width: 100%; margin: 0; overflow-x: auto; scrollbar-width: none; }
+  .tabs::-webkit-scrollbar { display: none; }
   .tabs a { padding: 7px 12px; font-size: 13px; }
   .pop { right: 16px; }
 }
@@ -478,7 +484,6 @@ main { overflow-x: clip; }
   .w > span { transform: none; }
   .js [data-r='up'], .js [data-r='scale'] { opacity: 1; transform: none; translate: none; scale: none; filter: none; clip-path: none; animation: none; }
   .js [data-r='head'] h2 { clip-path: none; transform: none; filter: none; }
-  .js .get::before { clip-path: none; }
   .claim path, .claim rect, .claim circle { stroke-dashoffset: 0; }
 }
 
@@ -704,23 +709,6 @@ html.xh-on, html.xh-on * { cursor: none !important; }
 }
 @media (prefers-reduced-motion: reduce) { .js .fcard[data-r='scale'].in, .more-panel .fcard { transform: none !important; } .fcopy h3, .facts li::before { transition: none; } }
 
-/* Upgrade to Premium: the whole screen plays along for four seconds (site.js), and a press or Esc ends it */
-.party { position: fixed; inset: 0; z-index: 2147483200; overflow: hidden; background: color-mix(in srgb, var(--ground) 38%, transparent); cursor: pointer; }
-.party-shine { position: absolute; top: -10vh; bottom: -10vh; left: 0; width: 34vw; background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--acc) 45%, transparent), transparent); mix-blend-mode: screen; }
-.party .zero.rain { position: absolute; top: 0; padding: 4px 9px; font: 800 clamp(13px, 1.5vw, 20px) var(--mono); background: var(--acc); color: var(--on); }
-.party .zero.rain.alt { background: var(--fg); color: var(--ground); }
-.party .zero.rain.ink { background: var(--s2); color: var(--fg); outline: 1px solid var(--line2); }
-.party-card { position: absolute; left: 50%; top: 38%; translate: -50% -50%; display: grid; gap: 10px; width: min(560px, 86vw); padding: 28px 32px; background: var(--s1); border: 2px solid var(--acc); box-shadow: 0 40px 100px -20px var(--shade); text-align: center; opacity: 0; }
-.party-card b { font: 800 clamp(1.5rem, 4vw, 2.6rem)/1.05 var(--mono); letter-spacing: -0.03em; }
-.party-card span { color: var(--muted); font: 500 15px var(--mono); }
-.party-card em { color: var(--fg); font-style: normal; font-weight: 800; }
-.party-bar { display: block; height: 14px; border: 1px solid var(--line2); background: var(--ground); overflow: hidden; }
-.party-bar u { display: block; height: 100%; background: var(--acc); transform-origin: 0 50%; transform: scaleX(0); text-decoration: none; }
-.party-stamp { position: absolute; left: 50%; top: 58%; padding: 8px 26px; border: 6px solid var(--acc); color: var(--acc); background: color-mix(in srgb, var(--ground) 70%, transparent); font: 800 clamp(2.4rem, 8vw, 5.5rem)/1 var(--mono); letter-spacing: 0.04em; opacity: 0; transform: translate(-50%, -50%); }
-main.shake { animation: partyshake 620ms linear 300ms; }
-@keyframes partyshake { 0%, 100% { transform: none; } 10% { transform: translate(-7px, 3px) rotate(-0.3deg); } 20% { transform: translate(6px, -4px) rotate(0.3deg); } 30% { transform: translate(-5px, 5px); } 40% { transform: translate(5px, -2px) rotate(-0.2deg); } 50% { transform: translate(-3px, 3px); } 60% { transform: translate(3px, -3px); } 75% { transform: translate(-2px, 1px); } 90% { transform: translate(1px, 0); } }
-@media (prefers-reduced-motion: reduce) { main.shake { animation: none; } }
-
 /* a phone: the bar folds its tab row away while you read down, and "And more" is a row of cards you swipe */
 @media (max-width: 1220px) {
   .nav { transition: background 300ms var(--ease), border-color 300ms var(--ease), height 320ms var(--ease); }
@@ -753,23 +741,14 @@ main.shake { animation: partyshake 620ms linear 300ms; }
 .kb.arm { animation: kbarm 1500ms var(--ease); }
 @keyframes kbarm { 0% { outline-offset: 26px; outline-color: transparent; } 30% { outline-color: var(--acc); } 55% { outline-offset: 3px; } 70% { outline-offset: 9px; } 100% { outline-offset: 3px; } }
 
-/* Upgrade: tape across the top and the foot saying so, and the card turns round on you */
-.party-tape { position: absolute; left: 0; right: 0; height: 40px; overflow: hidden; background: var(--acc); color: var(--on); display: flex; align-items: center; border-block: 3px solid var(--ground); }
-.party-tape.top { top: 64px; transform: rotate(-1.4deg); }
-.party-tape.bot { bottom: 56px; transform: rotate(1.4deg); }
-.party-tape span { flex: none; white-space: nowrap; font: 800 15px var(--mono); letter-spacing: 0.06em; animation: tape 14s linear 1 both; }
-.party-tape.bot span { animation-direction: reverse; }
-@keyframes tape { from { transform: translateX(0); } to { transform: translateX(-50%); } }
-.party-card.flip { border-color: var(--fg); }
-.party-card.flip b { animation: fadeUp 380ms var(--ease); }
-@media (prefers-reduced-motion: reduce) { .party-tape span { animation: none; } .kb.arm { animation: none; } }
+@media (prefers-reduced-motion: reduce) { .kb.arm { animation: none; } }
 
 /* ---- phones only (640px and under; a tablet keeps the full page): lighter, shorter, nothing to wait for ---- */
 @media (max-width: 640px) {
   /* nothing animates in or blurs behind the bar while you scroll */
   .js [data-r='up'], .js [data-r='scale'] { opacity: 1; transform: none; translate: none; scale: none; filter: none; clip-path: none; animation: none; transition: none; }
   .js [data-r='head'] h2 { clip-path: none; transform: none; filter: none; transition: none; }
-  .js .road::before, .js .get::before { transition: none; transform: none; clip-path: none; }
+  .js .road::before { transition: none; transform: none; clip-path: none; }
   .nav.stuck { backdrop-filter: none; background: var(--ground); }
   #bg { display: none; }
   .hero-stage .win-fit { animation: none; }
@@ -798,6 +777,8 @@ main.shake { animation: partyshake 620ms linear 300ms; }
   .sec-head { margin-bottom: 24px; }
   .about { padding-top: 32px; }
   .get-in { padding-block: 64px; }
+  /* phone CTAs stack full width: no ragged rows of buttons */
+  .hero .cta, .get .cta { flex-direction: column; align-items: stretch; }
 }
 
 /* roadmap bullets sit beside the title however long it runs, and the phone library is two columns wide */
@@ -813,7 +794,7 @@ main.shake { animation: partyshake 620ms linear 300ms; }
   #more, .about, .keyhint, .race, .get-mark, .foot, #roadmap .stage.later, #privacy .priv > div:last-child,
   .claims .claim:nth-child(n+4), #qa .q:nth-child(n+6) { display: none !important; }
   .nav.stuck { backdrop-filter: none; background: var(--ground); }
-  .party-tape span, .kb.arm, .plan.prem::after, .ribbon { animation: none; }
+  .kb.arm, .plan.prem::after, .ribbon { animation: none; }
   /* the library demo: six clips on the page itself, so a thumb that lands on it scrolls the page, not a box inside it */
   .lib { max-height: none; overflow: visible; padding-right: 0; }
   .lib .lclip:nth-child(n+7) { display: none; }
@@ -894,8 +875,8 @@ main.shake { animation: partyshake 620ms linear 300ms; }
 @media (pointer: coarse) { .nav .btn.nav-ico { width: 40px; height: 40px; } }
 
 /* buttons that lean toward the pointer (fx.js); `translate`, so a hover's own transform is left alone */
-.cta .btn, .nav .btn, .hk, .get .btn { transition: translate 520ms cubic-bezier(0.34, 1.56, 0.64, 1); }
-.lean { translate: var(--lx, 0) var(--ly, 0); transition-duration: 140ms !important; }
+.cta .btn, .nav .btn, .hk, .get .btn, .plan .btn { transition: translate 520ms cubic-bezier(0.34, 1.56, 0.64, 1); }
+.lean { translate: var(--lx, 0) var(--ly, 0); transition: translate 340ms var(--ease) !important; }
 
 /* ---- Insta Share, the headline tile: wider, with a live pitch of its own ---- */
 .fcard.star { border: 2px solid var(--acc); padding: calc(clamp(22px, 3vw, 38px) - 1px); background: linear-gradient(180deg, var(--acc-soft), transparent 46%), var(--s1); grid-template-columns: minmax(0, 5fr) minmax(0, 7fr); }
@@ -964,14 +945,9 @@ main.shake { animation: partyshake 620ms linear 300ms; }
 @keyframes stGlitch { 0% { text-shadow: -4px 0 var(--acc), 4px 0 var(--muted); } 50% { text-shadow: 3px 0 var(--acc), -3px 0 var(--muted); } 100% { text-shadow: none; } }
 @media (prefers-reduced-motion: reduce) { .hero h1 .ghost { visibility: visible; } .hero h1 .scr { display: none; } }
 
-/* CLIP IT arrives under a camera flash; SEND IT sends a copy of itself away */
+/* CLIP IT arrives with a brightness flash on the letters themselves */
 @keyframes stClip { 0% { opacity: 0; filter: brightness(5) contrast(0.5); transform: scale(1.08); } 16% { opacity: 1; filter: brightness(4) contrast(0.6); } 100% { opacity: 1; filter: none; transform: none; } }
-.hero h1 .st1 { animation: stClip 700ms cubic-bezier(0.2, 0.7, 0.2, 1) 100ms both; }
-#flash { position: fixed; inset: 0; z-index: 90; pointer-events: none; background: radial-gradient(70% 55% at 50% 30%, var(--fg), color-mix(in srgb, var(--fg) 25%, transparent) 70%); opacity: 0; animation: flash 520ms ease-out 140ms both; }
-@keyframes flash { 0% { opacity: 0; } 10% { opacity: 0.8; } 100% { opacity: 0; } }
-.hero h1 .sent { position: absolute; inset: 0; white-space: nowrap; color: var(--acc); pointer-events: none; will-change: transform, opacity; transform-origin: left center; }
-.hero h1 .streak { position: absolute; left: 100%; width: 22vw; max-width: 320px; height: 2px; margin-left: 4px; background: linear-gradient(90deg, transparent, var(--acc)); pointer-events: none; transform-origin: left center; }
-@media (prefers-reduced-motion: reduce) { #flash, .hero h1 .sent, .hero h1 .streak { display: none; } }
+.hero h1 .st1 { position: relative; animation: stClip 700ms cubic-bezier(0.2, 0.7, 0.2, 1) 100ms both; }
 
 /* touch: the Insta Share expiry choice is a thumb tall */
 @media (pointer: coarse) { .is-exp button { height: 44px; min-width: 44px; } }
@@ -981,7 +957,7 @@ main.shake { animation: partyshake 620ms linear 300ms; }
 [data-theme='lobby'], [data-theme='sandstorm'] { --acc-t: color-mix(in srgb, var(--acc) 76%, #000); }
 .qa .q h3 > button:hover, .cmp tfoot .us, .dc-sum i, .race > div:first-child span, .race > div:first-child b, .about h3, .is-steps li.on::before { color: var(--acc-t); }
 
-/* the headline waits for fx.js to start it (class `title-go`), so the flash and the three statements begin on the same frame */
+/* the headline waits for fx.js to start it (class `title-go`), so the three statements begin on the same frame */
 .js:not(.title-go) .hero h1 .st, .js:not(.title-go) .hero .lede, .js:not(.title-go) .hero .cta, .js:not(.title-go) .hero .fine { animation: none; opacity: 0; }
 .js:not(.title-go) .hero h1 .st2::after { animation: none; transform: scaleX(0); }
 
@@ -989,8 +965,3 @@ main.shake { animation: partyshake 620ms linear 300ms; }
 :root { --ctl: color-mix(in srgb, var(--bx-muted) 72%, var(--bx-line)); }
 .btn:not(.primary):not(.dark), .themebtn, .seg, .billing, .chips button, .chips2 button, .hk, .kcap, .is-exp, .lib-f select, .is-link, .switch .sq { border-color: var(--ctl); }
 .btn:not(.primary):not(.dark):hover, .chips button:hover, .chips2 button:hover { border-color: var(--fg); }
-
-/* the flash is white on dark themes, and a soft tint on the two light ones, where a bright flash would glare */
-#flash { background: radial-gradient(70% 55% at 50% 30%, #fff, rgba(255, 255, 255, 0.25) 70%); }
-[data-theme='lobby'] #flash, [data-theme='sandstorm'] #flash { animation-name: flashSoft; background: radial-gradient(70% 55% at 50% 30%, color-mix(in srgb, var(--acc) 30%, #fff), transparent 70%); }
-@keyframes flashSoft { 0% { opacity: 0; } 12% { opacity: 0.3; } 100% { opacity: 0; } }
