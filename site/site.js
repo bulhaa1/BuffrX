@@ -65,13 +65,13 @@ links.forEach((a) => a.addEventListener('click', () => { showAt(a.getAttribute('
 document.fonts.ready.then(() => { const on = lit; lit = null; light(on || 'why'); });
 
 // ---- reveals: each element enters once, the ones that arrive together a beat apart ----
-const isPhone = matchMedia('(max-width: 640px), (pointer: coarse) and (max-height: 500px)'); // a phone, either way up; keep in step with the `@media` block marked "phone" in site.css
+const isPhone = matchMedia('(max-width: 640px), (pointer: coarse) and (max-width: 960px) and (max-height: 500px)'); // a phone, either way up; keep in step with the `@media` block marked "phone" in site.css
 const reveal = new IntersectionObserver((entries) => {
   let i = 0;
-  entries.filter((e) => e.isIntersecting).forEach((e) => { e.target.style.setProperty('--d', i++ * 90); e.target.classList.add('in'); reveal.unobserve(e.target); });
+  entries.filter((e) => e.isIntersecting).forEach((e) => { e.target.style.setProperty('--d', isPhone.matches ? Math.min(i++, 3) * 45 : i++ * 90); e.target.classList.add('in'); reveal.unobserve(e.target); });
 }, { threshold: 0.12, rootMargin: '0px 0px -6% 0px' });
 $$('[data-r]').forEach((e) => reveal.observe(e)); // armed first: a failure further down must never leave the page hidden
-if (isPhone.matches) $$('[data-r]').forEach((e) => e.classList.add('in')); // a phone gets everything at once: nothing waits to scroll into view
+// Previously a phone gets everything at once: nothing waits to scroll into view. Phones now use the observer too.
 
 // ---- the hero: one clip, recorded, cut and shared, over and over, until the visitor pauses it or presses a key of their own ----
 const hstage = $('.hero-stage'), hfit = $('#hfit'), hwin = $('#hwin'), pauseBtn = $('#pause'), hknote = $('#hknote');
@@ -506,13 +506,16 @@ const FEATURES = [
 const fine = matchMedia('(hover: hover) and (pointer: fine)').matches;
 // two columns of tiles: each card sits under the one above it, so a card that shrinks lets the next one move up
 const bcols = [el('div', 'bcol'), el('div', 'bcol')]; $('#bento').append(...bcols);
-const PHONE_CARDS = ['library', 'edit', 'link']; // a phone gets the three cards that sell the app; the rest is built only where there is room to try it
-const lite = isPhone.matches;
+// Phones keep the three main cards and offer the remaining demos in the swipeable row.
+const PHONE_FACTS = {
+  library: ['Clips and screenshots, sorted by game.'],
+  edit: ['Trim, split, crop and adjust audio.'],
+  link: ['Up to 4 GB, full quality, no upload or server of ours. Your friend needs BuffrX (free). Works while your PC is on.', 'No IP address in the link. Stop ends sharing at once. Received files are checked.'],
+};
 FEATURES.forEach((f) => {
-  if (lite && !PHONE_CARDS.includes(f.id)) return;
-  const card = el('article', 'fcard' + (f.wide ? ' wide' : '') + (f.star ? ' star' : ''), `<div class="fcopy"><h3>${f.name}</h3><p class="head">${f.head}</p><ul class="facts">${f.facts.map((x) => Array.isArray(x) ? `<li class="measured">${x[0]}</li>` : `<li>${x}</li>`).join('')}</ul></div><div class="demo"></div>`);
+  const card = el('article', 'fcard' + (f.wide ? ' wide' : '') + (f.star ? ' star' : ''), `<div class="fcopy"><h3>${f.name}</h3><p class="head">${f.head}</p><ul class="facts${PHONE_FACTS[f.id] ? ' full-facts' : ''}">${f.facts.map((x) => Array.isArray(x) ? `<li class="measured">${x[0]}</li>` : `<li>${x}</li>`).join('')}</ul>${PHONE_FACTS[f.id] ? `<ul class="facts phone-facts">${PHONE_FACTS[f.id].map((x) => `<li>${x}</li>`).join('')}</ul>` : ''}</div><div class="demo"></div>`);
   if (f.more) { card.id = `more-${f.id}`; card.setAttribute('role', 'tabpanel'); card.setAttribute('aria-labelledby', `tab-${f.id}`); card.hidden = true; $('#morePanel').append(card); }
-  else { card.dataset.r = 'scale'; if (f.star) $('#bento').prepend(card); else bcols[f.col || 0].append(card); reveal.observe(card); if (isPhone.matches) card.classList.add('in'); }
+  else { card.dataset.r = 'scale'; if (f.star) $('#bento').prepend(card); else bcols[f.col || 0].append(card); reveal.observe(card); }
   try { demos[f.id]($('.demo', card), ctx()); } catch (err) { console.error(err); }
   // the tile follows the pointer: a bright edge and a soft light under it, and a slight lean toward it (not while it is over the demo, which is for pressing)
   card.addEventListener('pointermove', (e) => {
@@ -525,8 +528,7 @@ FEATURES.forEach((f) => {
 });
 // four more demos, one at a time: tabs, arrow keys move between them
 (function more() {
-  if (lite) { $('#more').hidden = true; return; }
-  const list = FEATURES.filter((f) => f.more), tabs = $('#moreTabs'), panel = $('#morePanel'), phone = matchMedia('(max-width: 720px)');
+  const list = FEATURES.filter((f) => f.more), tabs = $('#moreTabs'), panel = $('#morePanel'), phone = matchMedia('(max-width: 720px), (pointer: coarse) and (max-width: 960px) and (max-height: 500px)');
   let current = list[0].id, userPick = false;
   const vis = () => (phone.matches ? list.filter((f) => f.id !== 'keys') : list); // a phone has no keyboard to try
   const mark = (id, focus) => { current = id; list.forEach((f) => { const on = f.id === id, b = $(`#tab-${f.id}`); b.setAttribute('aria-selected', String(on)); b.tabIndex = on ? 0 : -1; if (on && focus) b.focus({ preventScroll: true }); }); const t = $(`#tab-${id}`); if (tabs.scrollWidth > tabs.clientWidth) tabs.scrollTo({ left: t.offsetLeft - 16, behavior: reduce ? 'auto' : 'smooth' }); };
@@ -630,6 +632,7 @@ FEATURES.forEach((f) => {
   const host = $('#qa');
   QA.forEach(([q, a], i) => {
     const row = el('div', 'q' + (i === 0 ? ' open' : ''), `<h3><button type="button" aria-expanded="${i === 0}" aria-controls="qa-${i}"><span>${q}</span><span class="pm" aria-hidden="true"></span></button></h3><div class="a" id="qa-${i}" role="region"><div>${a}</div></div>`);
+    if ([0, 5, 6, 7].includes(i)) row.dataset.phoneEssential = '';
     const b = $('button', row);
     b.addEventListener('click', () => { const open = !row.classList.contains('open'); row.classList.toggle('open', open); b.setAttribute('aria-expanded', String(open)); });
     host.append(row);
@@ -709,13 +712,13 @@ renderCompare(THEM[0].id);
 spy();
 
 // the roadmap's light runs the width of the line, so it needs to know how wide the line is
-(function roadWidth() { const road = $('.road'); if (road) { reveal.observe(road); if (isPhone.matches) road.classList.add('in'); } if (road) new ResizeObserver(() => road.style.setProperty('--roadw', `${road.clientWidth}px`)).observe(road); })();
+(function roadWidth() { const road = $('.road'); if (road) reveal.observe(road); if (road) new ResizeObserver(() => road.style.setProperty('--roadw', `${road.clientWidth}px`)).observe(road); })();
 
 // finer parts come in one by one as they are reached: the rows of a list, the stops of the roadmap, each question, each plan
 (function parts() {
   $$('.nevers li, .priv-h, .stage li, #qa .q, .plan, .reqs > div, .chips, .verdict, .lib-f, .more-tabs').forEach((e) => {
     if (e.closest('[data-r]') && !e.matches('.stage li, .nevers li, #qa .q, .reqs > div')) return; // a part inside a revealed block rides in with it
     if (e.dataset.r) return;
-    e.dataset.r = 'up'; reveal.observe(e); if (isPhone.matches) e.classList.add('in');
+    e.dataset.r = 'up'; reveal.observe(e);
   });
 })();

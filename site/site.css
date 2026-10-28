@@ -618,18 +618,22 @@ html.xh-on, html.xh-on * { cursor: none !important; }
 .more-panel .fcard { animation: fadeUp 420ms var(--ease) backwards; }
 .plan > .tags { grid-column: auto; grid-row: auto; align-self: auto; }
 
-/* Compare, stacked: below 640px each row is a small card with the two answers side by side */
-@media (max-width: 640px) {
-  .cmpwrap { overflow-x: visible; border: 0; background: transparent; }
-  .cmp { min-width: 0; display: block; }
-  .cmp thead { display: none; }
-  .cmp tbody, .cmp tfoot { display: block; }
-  .cmp tr { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); border: 1px solid var(--line); background: var(--s1); margin-bottom: 8px; }
-  .cmp tr > th { grid-column: 1 / -1; width: auto; padding: 12px 14px 8px; border: 0; }
-  .cmp tr > td { padding: 8px 14px 14px; border: 0; }
-  .cmp td::before { content: attr(data-l); display: block; margin-bottom: 6px; color: var(--muted); font: 700 11.5px var(--mono); }
-  .cmp tfoot > tr > * { border-top: 0; }
-  .cmp tfoot th small { display: none; }
+/* Compare, formerly stacked: below 640px each row is a small card with the two answers side by side.
+   Phones now use one compact matrix, with shared headers and a visible symbol key. */
+@media (max-width: 640px), (pointer: coarse) and (max-width: 960px) and (max-height: 500px) {
+  .cmp { min-width: 0; table-layout: fixed; }
+  .cmp th, .cmp td { padding: 10px 8px; vertical-align: middle; }
+  .cmp thead th { font-size: 12px; overflow-wrap: anywhere; }
+  .cmp thead th:first-child, .cmp tbody th { width: 44%; }
+  .cmp tbody th, .cmp tfoot th { font-size: 12px; line-height: 1.4; }
+  .cmp thead th:not(:first-child), .cmp td { text-align: center; }
+  .cmp thead th small, .cmp tbody th small, .cmp tfoot th small, .cmp tfoot td small { display: none; }
+  .cmp tbody tr { height: 44px; }
+  .cmp .mark { display: flex; justify-content: center; }
+  .cmp tbody .mark > span { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+  .cmp tbody .mk { margin: 0; animation: none; flex: none; }
+  .cmp .mk.none rect, .cmp .mk.half rect { stroke: var(--muted); }
+  .cmp tfoot td { font-size: 15px; white-space: nowrap; }
 }
 
 /* touch: every control is a finger wide */
@@ -715,7 +719,7 @@ html.xh-on, html.xh-on * { cursor: none !important; }
   .nav.min { height: 64px; }
   .nav.min .tabs { display: none; }
 }
-@media (max-width: 720px) {
+@media (max-width: 720px), (pointer: coarse) and (max-width: 960px) and (max-height: 500px) {
   .more-tabs { flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none; margin-inline: -16px; padding-inline: 16px; }
   .more-tabs::-webkit-scrollbar { display: none; }
   .more-tabs button { flex: none; }
@@ -745,9 +749,7 @@ html.xh-on, html.xh-on * { cursor: none !important; }
 
 /* ---- phones only (640px and under; a tablet keeps the full page): lighter, shorter, nothing to wait for ---- */
 @media (max-width: 640px) {
-  /* nothing animates in or blurs behind the bar while you scroll */
-  .js [data-r='up'], .js [data-r='scale'] { opacity: 1; transform: none; translate: none; scale: none; filter: none; clip-path: none; animation: none; transition: none; }
-  .js [data-r='head'] h2 { clip-path: none; transform: none; filter: none; transition: none; }
+  /* Previously nothing animates in or blurs behind the bar while you scroll; lightweight entrances now live below. */
   .js .road::before { transition: none; transform: none; clip-path: none; }
   .nav.stuck { backdrop-filter: none; background: var(--ground); }
   #bg { display: none; }
@@ -755,7 +757,7 @@ html.xh-on, html.xh-on * { cursor: none !important; }
   .fcard::before, .fcard::after { display: none; }
   html { scroll-behavior: auto; }
   /* the extras: the pause button, the theme popover's desktop switches, long descriptions */
-  #pause, #bgsw, #xhsw, .hknote { display: none; }
+  #bgsw, #xhsw, .hknote { display: none; }
   .facts li:nth-child(n + 3) { display: none; }
   .fcopy .head { font-size: 1rem; }
   .cmp tbody th small, .cmp tfoot th small, .race { display: none; }
@@ -786,13 +788,13 @@ html.xh-on, html.xh-on * { cursor: none !important; }
 .stage.now li b::before { position: absolute; left: 0; top: 0.4em; }
 @media (max-width: 640px) { .lib { grid-template-columns: repeat(2, minmax(0, 1fr)); max-height: 380px; } }
 
-@media (max-width: 640px) { #tab-keys, #more-keys, .more-panel .fcard#more-keys[hidden] { display: none; } }
+@media (max-width: 640px), (pointer: coarse) and (max-width: 960px) and (max-height: 500px) { #tab-keys, #more-keys, .more-panel .fcard#more-keys[hidden] { display: none; } }
 
 /* phone: a shorter, lighter page. Only phones (width up to 640px, or a phone turned sideways), never a tablet.
    Keep this query in step with `isPhone` in site.js. */
-@media (max-width: 640px), (pointer: coarse) and (max-height: 500px) {
-  #more, .about, .keyhint, .race, .get-mark, .foot, #roadmap .stage.later, #privacy .priv > div:last-child,
-  .claims .claim:nth-child(n+4), #qa .q:nth-child(n+6) { display: none !important; }
+@media (max-width: 640px), (pointer: coarse) and (max-width: 960px) and (max-height: 500px) {
+  .about, .race, .get-mark, #roadmap .stage.later, #privacy .priv > div:last-child,
+  .claims .claim:nth-child(n+4) { display: none !important; }
   .nav.stuck { backdrop-filter: none; background: var(--ground); }
   .kb.arm, .plan.prem::after, .ribbon { animation: none; }
   /* the library demo: six clips on the page itself, so a thumb that lands on it scrolls the page, not a box inside it */
@@ -965,3 +967,76 @@ html.xh-on, html.xh-on * { cursor: none !important; }
 :root { --ctl: color-mix(in srgb, var(--bx-muted) 72%, var(--bx-line)); }
 .btn:not(.primary):not(.dark), .themebtn, .seg, .billing, .chips button, .chips2 button, .hk, .kcap, .is-exp, .lib-f select, .is-link, .switch .sq { border-color: var(--ctl); }
 .btn:not(.primary):not(.dark):hover, .chips button:hover, .chips2 button:hover { border-color: var(--fg); }
+
+/* Phone copy stays separate so tablets and desktop retain every description. */
+.phone-facts { display: none; }
+@media (max-width: 640px), (pointer: coarse) and (max-width: 960px) and (max-height: 500px) {
+  .sec-head .lede, .get .lede, .claims .claim p, .fcopy .head,
+  .full-facts, .plan-d, .perks li span, .stage li span, .pop .note, .keyhint .hks, .hknote,
+  #bgsw, #xhsw, .site-foot { display: none; }
+  .phone-facts { display: grid; }
+  .claim { grid-template-columns: 32px minmax(0, 1fr); gap: 16px; padding-block: 24px; }
+  .claim svg { width: 28px; height: 28px; }
+  .fcard.star { padding: 24px 20px; gap: 20px; }
+  .fcard.star .fcopy h3 { font-size: clamp(1.6rem, 5vw, 2rem); }
+  .fcard.star .facts li { font-size: 14px; }
+  .fcard.star .demo { padding: 0; border: 0; background: transparent; gap: 12px; }
+  .is-stage { grid-template-columns: minmax(0, 1fr) 32px minmax(0, 1fr); gap: 6px; }
+  .is-pc { min-width: 0; }
+  .is-bar { padding: 6px; min-height: 36px; }
+  .is-bar i { display: none; }
+  .is-bar span { margin-left: 0; white-space: normal; overflow-wrap: anywhere; font-size: 10.5px; letter-spacing: 0; }
+  .is-shot { height: clamp(44px, 14vw, 72px); }
+  .is-shot .gshot { height: 100%; aspect-ratio: auto; }
+  .is-foot { padding: 6px; min-height: 30px; }
+  .is-foot b { font-size: 11px; overflow-wrap: anywhere; }
+  .fcard.star .is-link { display: grid; grid-template-columns: 20px minmax(0, 1fr) auto; gap: 8px; padding: 8px 0; border-inline: 0; border-block-style: solid; }
+  .is-exp { width: max-content; }
+  .is-exp button { min-width: 44px; min-height: 44px; padding-inline: 8px; }
+  .is-link > i { grid-column: 2 / -1; }
+  .is-link > i:empty { display: none; }
+  .is-act .btn { min-width: 0; padding-inline: 12px; white-space: normal; text-align: center; }
+  .keyhint { margin-top: 12px; margin-bottom: 16px; }
+  .keyhint .pause { min-height: 44px; min-width: 120px; border-color: var(--ctl); }
+  .nav .btn.nav-ico { width: 44px; height: 44px; }
+  .nav-in { transition: row-gap 320ms var(--ease); }
+  .nav.min .nav-in { row-gap: 0; }
+  .nav .tabs { max-height: 56px; opacity: 1; visibility: visible; transition: max-height 320ms var(--ease), padding-block 320ms var(--ease), border-width 320ms var(--ease), opacity 200ms var(--ease), translate 320ms var(--ease), visibility 0s; }
+  .nav.min .tabs { display: flex; max-height: 0; padding-block: 0; border-block-width: 0; opacity: 0; translate: 0 -6px; visibility: hidden; pointer-events: none; overflow: hidden; transition: max-height 320ms var(--ease), padding-block 320ms var(--ease), border-width 320ms var(--ease), opacity 180ms var(--ease), translate 320ms var(--ease), visibility 0s 320ms; }
+  .nav .btn.nav-ico.primary { transition: width 320ms var(--ease), margin-left 320ms var(--ease), border-width 320ms var(--ease), opacity 180ms var(--ease), visibility 0s; }
+  .nav.min .btn.nav-ico.primary { display: inline-flex; width: 0; margin-left: -12px; border-width: 0; opacity: 0; visibility: hidden; pointer-events: none; overflow: hidden; transition: width 320ms var(--ease), margin-left 320ms var(--ease), border-width 320ms var(--ease), opacity 180ms var(--ease), visibility 0s 320ms; }
+  .nav .themebtn { width: 52px; min-width: 44px; height: 44px; padding-inline: 7px; gap: 5px; justify-content: center; }
+  .themebtn .nm { display: none; }
+  .themebtn .sw3 { grid-template-columns: repeat(3, 6px); height: 12px; }
+  .themebtn .chev { width: 12px; height: 12px; }
+  .pop { left: auto; right: 12px; width: min(280px, calc(100vw - 24px)); padding: 12px; max-height: calc(100dvh - 124px); overflow-y: auto; overscroll-behavior: contain; }
+  .pop h2 { margin-bottom: 8px; }
+  .pop .th { padding-inline: 8px; gap: 6px; font-size: 12px; min-width: 0; }
+  .pop .sw3 { grid-template-columns: repeat(3, 5px); height: 12px; }
+  #qa .q:not([data-phone-essential]), .reqs-box { display: none; }
+  .get-in { grid-template-columns: minmax(0, 1fr); gap: 0; }
+  .get { margin-top: 56px; }
+  #compare .foot { margin-top: 12px; font-size: 12px; }
+  #compare .legend { gap: 8px 14px; }
+  #compare .legend span { gap: 5px; }
+  .hd { touch-action: pan-y; }
+  .hd::before { content: ''; position: absolute; inset: 0 -16px; }
+  .js [data-r='head'].in h2 { clip-path: none; }
+}
+
+/* No blur, scale or heading wipe on phones; reduced motion keeps the static rules above. */
+@media (prefers-reduced-motion: no-preference) {
+  @media (max-width: 640px), (pointer: coarse) and (max-width: 960px) and (max-height: 500px) {
+    .js [data-r='up'], .js [data-r='scale'] {
+      translate: 0 14px; scale: none; filter: none; transform: none;
+      transition: opacity 360ms var(--ease), translate 420ms var(--ease);
+      transition-delay: calc(var(--d, 0) * 1ms);
+    }
+    .js [data-r='up'].in, .js [data-r='scale'].in { translate: 0 0; }
+    .js [data-r='head'] h2 {
+      opacity: 0; translate: 0 12px; clip-path: none; transform: none; filter: none;
+      transition: opacity 360ms var(--ease), translate 420ms var(--ease);
+    }
+    .js [data-r='head'].in h2 { opacity: 1; translate: 0 0; }
+  }
+}
