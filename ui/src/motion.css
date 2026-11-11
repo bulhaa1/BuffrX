@@ -1,0 +1,20 @@
+/* Motion tokens for the editor, the clip preview and the components they share (docs/ui-fluidity-plan-2026-11-07.md, 6.2).
+   The native interface reads the same values from src/engine/ui/ui_anim_math.h, and test_motion holds the two together.
+   Variables and the reduced-motion rule only: element rules belong to the page that uses them (the Timeline page imports this
+   file for the variables alone). */
+:root {
+  --bx-dur-fast: 90ms;
+  --bx-dur-base: 140ms;
+  --bx-dur-slow: 220ms;
+  --bx-ease-out: cubic-bezier(0.215, 0.61, 0.355, 1);
+  --bx-ease-in: cubic-bezier(0.55, 0.055, 0.675, 0.19);
+}
+
+/* Reduced motion: every token arrives at once, and the state still changes. */
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --bx-dur-fast: 0.01ms;
+    --bx-dur-base: 0.01ms;
+    --bx-dur-slow: 0.01ms;
+  }
+}

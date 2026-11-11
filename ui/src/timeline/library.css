@@ -1,0 +1,328 @@
+/* The Timeline's library (library.tsx): the grid on the picture's stage, and a saved file playing in the preview card.
+   Loaded with the library, not with the page, so the live Timeline opens without it.
+
+   The clip preview's controls (views/Preview.tsx) are drawn with the editor's stylesheet in the editor. This page
+   does not carry that sheet, and must not: its element rules would reach the Timeline's own buttons. So the few
+   shapes those controls rely on are restated here, scoped to the card they live in. */
+
+/* ---- the grid, on the stage ---- */
+#timeline-library { position: absolute; inset: 0; z-index: 40; pointer-events: none; }
+
+.tl-lib {
+  position: absolute;
+  inset: 4px 16px 16px;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--bx-tile);
+  border: 1px solid var(--line-strong);
+  pointer-events: auto;
+  animation: tl-lib-in 440ms 60ms cubic-bezier(0.22, 0.9, 0.3, 1) backwards;
+  transition: opacity var(--bx-dur-base) ease;
+}
+@keyframes tl-lib-in {
+  from { opacity: 0; transform: translateY(22px) scale(0.99); }
+  to { opacity: 1; transform: none; }
+}
+/* A file is playing in the card: the grid steps aside, and Esc or Library brings it back. */
+.tl-lib[data-state='playing'] {
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transition: opacity var(--bx-dur-base) ease, visibility 0s var(--bx-dur-base);
+}
+/* Back to the Timeline: the grid fades while the footage resumes underneath it. */
+body.library-leaving .tl-lib { opacity: 0; pointer-events: none; }
+
+.tl-lib-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 16px 0;
+}
+.tl-lib-tabs { display: flex; gap: 6px; }
+.tl-lib-tabs button { gap: 8px; }
+.tl-lib-tabs button small { color: var(--bx-muted); font-size: 11px; }
+.tl-lib-tabs button[aria-selected='true'] { border-color: var(--bx-acc); color: var(--bx-acc); }
+.tl-lib-tabs button[aria-selected='true'] small { color: inherit; }
+
+.tl-lib-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 6px 16px 16px;
+  scrollbar-width: thin;
+  scrollbar-color: var(--bx-line) transparent;
+}
+.tl-lib-note { margin: 18px 0; color: var(--bx-muted); }
+.tl-lib-error { color: var(--bx-danger); padding: 0 16px; }
+.tl-lib-empty {
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: 8px;
+  height: 100%;
+  min-height: 160px;
+  color: var(--bx-muted);
+  text-align: center;
+}
+.tl-lib-empty strong { color: var(--bx-fg); font-size: 14px; letter-spacing: 0.06em; }
+.tl-lib-empty span { font-size: 12px; }
+
+.tl-day-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin: 16px 0 10px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--bx-line);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  color: var(--bx-fg);
+}
+.tl-day-head small { color: var(--bx-muted); font-size: 11px; font-weight: 500; }
+.tl-day:first-child .tl-day-head { margin-top: 8px; }
+
+.tl-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(212px, 1fr));
+  gap: 16px 14px;
+}
+
+.tl-card {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 5px;
+  height: auto;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--bx-fg);
+  text-align: left;
+  min-width: 0;
+}
+.tl-card:hover { color: var(--bx-fg); border-color: transparent; }
+.tl-card-thumb {
+  position: relative;
+  display: grid;
+  place-items: center;
+  aspect-ratio: 16 / 9;
+  overflow: hidden;
+  background: var(--bx-ground);
+  border: 1px solid var(--bx-line);
+  color: var(--bx-line);
+  transition: border-color var(--bx-dur-fast);
+}
+.tl-card-thumb img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+.tl-card:hover .tl-card-thumb,
+.tl-card:focus-visible .tl-card-thumb { border-color: var(--bx-acc); }
+.tl-card:focus-visible { outline: none; }
+.tl-card-length {
+  position: absolute;
+  right: 6px;
+  bottom: 6px;
+  padding: 1px 5px;
+  background: rgb(0 0 0 / 0.74);
+  color: #fff;
+  font-size: 11px;
+  line-height: 14px;
+}
+.tl-card-play {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: rgb(0 0 0 / 0.38);
+  color: #fff;
+  opacity: 0;
+  transition: opacity var(--bx-dur-fast);
+}
+.tl-card:hover .tl-card-play,
+.tl-card:focus-visible .tl-card-play { opacity: 1; }
+.tl-card-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  font-weight: 500;
+}
+.tl-card-source {
+  color: var(--bx-muted);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  margin-top: -3px;
+}
+
+/* ---- a saved file in the preview card: the card's border says it is not the live footage ---- */
+#timeline-library-preview { position: absolute; inset: 0; z-index: 42; overflow: hidden; transition: opacity var(--bx-dur-base) ease; }
+body.library-leaving #timeline-library-preview { opacity: 0; }
+body.library-selected #frame { animation: tl-frame-in var(--bx-dur-slow) ease-out backwards; }
+@keyframes tl-frame-in { from { opacity: 0; } to { opacity: 1; } }
+
+#frame { box-shadow: 0 0 0 0 transparent; transition: box-shadow var(--bx-dur-base) ease; }
+#frame::before { transition: opacity var(--bx-dur-base) ease; }
+/* The live card glows; a saved one is a plain bright frame with its name set into the top edge, so the two cannot be mistaken. */
+body[data-saved] #frame { box-shadow: 0 0 0 2px var(--bx-fg); }
+body[data-saved] #frame::before { opacity: 0; }
+#frame::after {
+  content: 'Saved clip';
+  position: absolute;
+  left: 14px;
+  top: -10px;
+  z-index: 44;
+  padding: 2px 8px;
+  background: var(--bx-fg);
+  color: var(--bx-ground);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  line-height: 14px;
+  white-space: nowrap;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity var(--bx-dur-base) ease;
+}
+body[data-saved] #frame::after { opacity: 1; }
+body[data-saved='screenshot'] #frame::after { content: 'Saved screenshot'; }
+/* The card has its own edge now; the clip preview's accent line would be a second one. */
+#timeline-library-preview .preview-frame { display: none; }
+
+/* ---- the clip preview's controls, restated for this page ---- */
+/* The names the clip preview's stylesheet paints with (the editor's sheet gives them; this page does not carry it). */
+#timeline-library-preview {
+  --bx-accent: var(--bx-acc);
+  --bx-canvas: var(--bx-ground);
+  --bx-surface: var(--bx-tile);
+  --bx-ink: var(--bx-fg);
+  --bx-faint: var(--bx-muted);
+  --bx-line-strong: var(--line-strong);
+}
+
+#timeline-library-preview .icon-btn {
+  display: inline-grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  gap: 0;
+  border: 0;
+  background: transparent;
+  color: var(--bx-muted);
+}
+#timeline-library-preview .icon-btn:hover { background: var(--bx-raised); color: var(--bx-fg); border: 0; }
+#timeline-library-preview .preview-play { color: var(--bx-acc); }
+#timeline-library-preview .btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  height: 30px;
+  padding: 0 12px;
+  border: 1px solid var(--line-strong);
+  background: var(--bx-tile);
+  color: var(--bx-fg);
+  font-weight: 700;
+}
+#timeline-library-preview .btn:hover { background: var(--bx-raised); border-color: var(--bx-muted); color: var(--bx-fg); }
+/* The play mark on a paused file: the accent glyph alone, as in the clip preview. This page does not carry the editor's
+   sheet, so the shape is restated here. The mark is the only thing shown when paused, and nothing pops when it resumes. */
+#timeline-library-preview .preview-pause {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  display: grid;
+  place-items: center;
+  width: 56px;
+  height: 56px;
+  padding: 0;
+  transform: translate(-50%, -50%);
+  background: none;
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+  border: 0;
+  color: var(--bx-acc);
+  cursor: pointer;
+  filter: drop-shadow(0 1px 6px rgb(0 0 0 / 0.6));
+  opacity: 0.9;
+  transition: opacity var(--bx-dur-fast);
+}
+#timeline-library-preview .preview-pause:hover { background: none; border: 0; opacity: 1; }
+#timeline-library-preview .preview-pause svg { width: 34px; height: 34px; }
+
+/* The file's name and its two actions: one glass cluster each, the same height, 12 px from the edge on both sides. */
+#timeline-library-preview .preview-actions { padding: 0; gap: 0; }
+#timeline-library-preview .tl-action {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  height: 100%;
+  padding: 0 14px;
+  border: 0;
+  background: transparent;
+  color: var(--bx-fg);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+}
+#timeline-library-preview .tl-action + .tl-action { border-left: 1px solid color-mix(in srgb, var(--bx-fg) 16%, transparent); }
+#timeline-library-preview .tl-action:hover { background: var(--accent-soft); color: var(--bx-acc); border-color: color-mix(in srgb, var(--bx-fg) 16%, transparent); }
+#timeline-library-preview .tl-action svg { flex: none; }
+
+/* The way back, at the left of the line the library names itself on. */
+#library-context .tl-back {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 26px;
+  padding: 0 10px 0 6px;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+}
+#library-context strong { letter-spacing: 0.08em; }
+
+#timeline-library-preview .bx-slider { display: flex; align-items: center; gap: 12px; }
+#timeline-library-preview .bx-slider-main { flex: 1; min-width: 0; }
+#timeline-library-preview .bx-slider-track { position: relative; display: block; width: 100%; height: 20px; cursor: pointer; }
+#timeline-library-preview .bx-slider-rail { position: absolute; left: 0; top: 0; bottom: 0; width: 100%; height: 4px; margin-block: auto; background: color-mix(in srgb, var(--bx-fg) 24%, transparent); }
+#timeline-library-preview .bx-slider-fill { position: absolute; left: 0; top: 0; bottom: 0; height: 4px; margin-block: auto; background: var(--bx-acc); }
+/* The handle: a small white bar centred on the rail, over the accent fill. It widens a little under the pointer and goes
+   accent while it is held. The slider centres it itself (an inline translate of half its own size), so it only asks for
+   the middle of the track: a margin on top of that is what lifted it off the rail. */
+#timeline-library-preview .bx-slider-thumb {
+  position: absolute;
+  top: 50%;
+  width: 3px;
+  height: 12px;
+  margin: 0;
+  background: var(--bx-fg);
+  box-shadow: 0 0 0 1px rgb(0 0 0 / 0.5);
+  transition: width var(--bx-dur-fast) ease, background-color var(--bx-dur-fast) ease;
+}
+#timeline-library-preview .bx-slider-track:hover .bx-slider-thumb { width: 4px; }
+#timeline-library-preview .bx-slider-thumb[data-dragging] { width: 4px; background: var(--bx-acc); }
+#timeline-library-preview .bx-slider-thumb[data-focus-visible] { outline: 2px solid var(--bx-acc); outline-offset: 2px; }
+
+/* A tooltip is drawn in a layer of its own, outside the card. */
+.bx-tooltip {
+  padding: 4px 8px;
+  border: 1px solid var(--line-strong);
+  background: var(--bx-raised);
+  color: var(--bx-fg);
+  font-size: 12px;
+  z-index: 200;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tl-lib,
+  body.library-selected #frame { animation: none; }
+  .tl-lib,
+  #timeline-library-preview,
+  #frame,
+  #frame::before,
+  #frame::after { transition: none; }
+}

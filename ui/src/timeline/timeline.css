@@ -1,0 +1,1293 @@
+@import '../motion.css';
+/* The Timeline preview's look: the same themes as everything else (themes.css), one face, square corners
+   and one accent fill. Steam's arrangement on BuffrX's own surface: one panel across the top holds the
+   session, the bar, the clip and the transport, and the picture sits under it on the glass card. */
+@import '../themes.css';
+@font-face {
+  font-family: 'JetBrains Mono';
+  src: url('../fonts/jetbrains-mono-medium.woff2') format('woff2');
+  font-weight: 500;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'JetBrains Mono';
+  src: url('../fonts/jetbrains-mono-bold.woff2') format('woff2');
+  font-weight: 700;
+  font-display: swap;
+}
+
+:root {
+  --video-bg: #000;
+  --on-video: #fff;
+  --line-strong: color-mix(in srgb, var(--bx-line) 62%, var(--bx-muted));
+  --accent-soft: color-mix(in srgb, var(--bx-acc) 16%, transparent);
+  --accent-line: color-mix(in srgb, var(--bx-acc) 58%, transparent);
+  --tick-major: color-mix(in srgb, var(--bx-fg) 30%, transparent);
+  --tick-minor: color-mix(in srgb, var(--bx-fg) 18%, transparent);
+  --veil: color-mix(in srgb, var(--bx-ground) 66%, transparent);
+  /* The one glass surface in the product, asked for by the owner: a high-opacity halo around the preview
+     card. Its colour is the theme's own accent, so the glow changes with the theme the panel wears; only the
+     screen's black stays fixed. It is the only blur and the only translucent colour in the interface;
+     everything else keeps DESIGN.md's flat rules. */
+  --glass-ink: rgb(0 0 0 / 0.74);
+  --glass-tint: color-mix(in srgb, var(--bx-acc) 16%, rgb(0 0 0 / 0.66));
+  --glass-line: color-mix(in srgb, var(--bx-acc) 45%, transparent);
+  --glass-halo: color-mix(in srgb, var(--bx-acc) 28%, transparent);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+#backdrop {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100vw;
+  height: 100vh;
+  z-index: -1;
+  background: var(--bx-ground) no-repeat left top / 100vw auto;
+  pointer-events: none;
+  /* Blurred past what the 320 px copy's own upscale gives: the screen behind is meant to read as a colour, not as
+     shapes. The scale grows the layer under the filter so no transparent halo shows at the edges. */
+  filter: blur(10px);
+  transform: scale(1.04);
+  /* The screen under the window dims and blurs in as the page opens, instead of switching on. */
+  /* The window is opaque from its first pixel: the shell fades the whole window in (timeline_fade), so there is nothing here to
+     fade and no see-through area for the window's own surface to show in (a pale Windows title bar showed through it for the
+     first frames of every open). */
+  opacity: 1;
+}
+
+/* The copy is 320 px wide and drawn across the screen, which already blurs it; the filter on #backdrop blurs it
+   further, and it is paid when a copy arrives (twice a second) rather than every frame. The dimming is a plain
+   cover instead. */
+#backdrop::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: rgb(0 0 0 / 0.2);
+}
+
+/* `hidden` always wins: buttons and grids set their own display, which would otherwise show a hidden one. */
+[hidden] {
+  display: none !important;
+}
+
+html,
+body {
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+}
+
+body {
+  display: grid;
+  /* The panel on top, the picture under it. */
+  grid-template-rows: auto minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr);
+  /* The window is see-through and #backdrop paints a blurred, dimmed copy of the screen behind it, the way Steam's
+     overlay does. Its own ground colour shows until the first copy arrives, or where there is none. */
+  background: var(--bx-ground);
+  color: var(--bx-fg);
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  font-size: 13px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+  user-select: none;
+  -webkit-font-smoothing: antialiased;
+}
+
+.pane {
+  background: color-mix(in srgb, var(--bx-tile) 82%, transparent);
+}
+
+button {
+  font: inherit;
+  letter-spacing: inherit;
+  text-transform: inherit;
+  color: inherit;
+  background: var(--bx-tile);
+  border: 1px solid var(--line-strong);
+  border-radius: 0;
+  height: 26px;
+  padding: 0 10px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  transition: border-color var(--bx-dur-fast), color var(--bx-dur-fast), background-color var(--bx-dur-fast);
+}
+
+button:hover {
+  border-color: var(--bx-acc);
+  color: var(--bx-acc);
+}
+
+button:disabled {
+  color: var(--bx-muted);
+  border-color: var(--bx-line);
+  cursor: default;
+}
+
+button:disabled:hover {
+  color: var(--bx-muted);
+  border-color: var(--bx-line);
+}
+
+button.primary {
+  background: var(--bx-acc);
+  border-color: var(--bx-acc);
+  color: var(--bx-on);
+  font-weight: 700;
+}
+
+button.primary:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--bx-acc) 84%, var(--bx-fg));
+  color: var(--bx-on);
+}
+
+button.primary:disabled {
+  background: transparent;
+  border-color: var(--bx-line);
+  color: var(--bx-muted);
+}
+
+button:focus-visible,
+select:focus-visible,
+input:focus-visible,
+[tabindex]:focus-visible {
+  outline: 2px solid var(--bx-acc);
+  outline-offset: 1px;
+}
+
+svg {
+  width: 16px;
+  height: 16px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linecap: square;
+}
+
+#playicon {
+  fill: currentColor;
+  stroke: none;
+}
+
+/* ---- the panel: name bar, bar, clip track, transport ---- */
+#timeline-panel {
+  position: relative;
+  z-index: 10;
+  /* Frosted: the blurred screen under the panel is blurred again and lightly tinted, so the controls read as one
+     sheet of glass over it. The tint stays under 80% or the frosting disappears into a flat bar. */
+  background: color-mix(in srgb, var(--bx-tile) 68%, transparent);
+  border-bottom: 1px solid color-mix(in srgb, var(--bx-fg) 14%, transparent);
+  box-shadow: 0 10px 28px -12px rgb(0 0 0 / 0.55);
+}
+/* The frosting is a live blur: it is on at rest and off while the panel moves (a blur under a moving layer is repainted every frame,
+   which is what made the arrival stutter). main.ts adds .settled when the arrival ends; the screen behind is already blurred, so
+   nothing visible changes at the switch. */
+#timeline-panel.settled,
+#timeline-panel:not(.arriving) {
+  -webkit-backdrop-filter: blur(22px) saturate(1.25);
+  backdrop-filter: blur(22px) saturate(1.25);
+}
+
+/* Until the arrival starts the panel and the picture are clear, so nothing shows at rest for the beat the first copy of the screen is waited for. */
+body:not(.arrival-started) #timeline-panel,
+body:not(.arrival-started) #stage {
+  opacity: 0;
+}
+html { background: var(--bx-ground); }
+
+/* One soft curve for the three layers (dim, panel, picture), longer than the 220 ms token on purpose: this is the one big arrival
+   (asked for: fluid, not quick). The panel drops 22 px from fully clear, the picture rises a beat later. Opacity and transform only. */
+#timeline-panel.arriving {
+  animation: panel-arrive 420ms cubic-bezier(0.22, 0.9, 0.3, 1) backwards;
+  will-change: transform, opacity;
+}
+
+@keyframes panel-arrive {
+  from { opacity: 0; transform: translateY(-22px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* The picture follows the panel: it rises a little and settles, a beat after the panel starts. Only transform and
+   opacity move, so the page stays on the compositor. */
+body.arriving #stage { animation: stage-arrive 480ms 90ms cubic-bezier(0.22, 0.9, 0.3, 1) backwards; }
+
+@keyframes stage-arrive {
+  from { opacity: 0; transform: translateY(16px) scale(0.985); }
+  to { opacity: 1; transform: none; }
+}
+
+/* One gutter for the whole panel: the name bar, the ruler and bar, the transport and the clip strip all start and end
+   16 px in, so their edges line up down the panel. Groups in the bar are 16 px apart, what is inside a group 8. */
+#top {
+  height: 44px;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 0 16px;
+}
+
+#title {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+  margin-right: auto;
+}
+
+#tools {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+#tools-rule {
+  width: 1px;
+  height: 18px;
+  background: var(--bx-line);
+}
+
+#viewclips[aria-pressed='true'] {
+  border-color: var(--bx-acc);
+  color: var(--bx-acc);
+  background: var(--accent-soft);
+}
+
+#name {
+  color: var(--bx-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+#timeline-title { color: var(--bx-fg); font-size: 14px; }
+
+/* What the writer is doing, as a chip: a square in its colour and a word. Every chip in the bar is 22 px tall. */
+#state {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  height: 22px;
+  padding: 0 9px;
+  border: 1px solid var(--bx-line);
+  color: var(--bx-fg);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  white-space: nowrap;
+}
+#state[hidden] { display: none; }
+
+#state::before {
+  content: '';
+  flex: none;
+  width: 6px;
+  height: 6px;
+  background: var(--bx-muted);
+}
+
+/* The square is the writer's: red while it writes, the warning colour while it waits. */
+#state[data-state='writing'] { border-color: color-mix(in srgb, var(--bx-danger) 55%, transparent); }
+#state[data-state='writing']::before { background: var(--bx-danger); }
+#state[data-state^='paused'] { border-color: color-mix(in srgb, var(--bx-warn) 50%, transparent); }
+#state[data-state^='paused']::before { background: var(--bx-warn); }
+
+/* How much it keeps: quiet, beside the state. The full sentence is its tooltip. */
+#span {
+  color: var(--bx-muted);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  white-space: nowrap;
+}
+
+#current-clock {
+  color: var(--bx-muted);
+  white-space: nowrap;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* The one way out of the whole Timeline: set apart from the tools by a rule, and the only button here with an accent edge. */
+#close {
+  padding: 0 12px;
+  white-space: nowrap;
+  font-weight: 700;
+  border-color: var(--accent-line);
+}
+
+#hidevideo[aria-pressed='true'] {
+  border-color: var(--bx-acc);
+  color: var(--bx-acc);
+}
+
+#speed {
+  min-width: 44px;
+  justify-content: center;
+}
+
+#speed:not([data-rate='1']) {
+  color: var(--bx-acc);
+  border-color: var(--bx-acc);
+}
+
+/* ---- footage: ruler, bar, clip track, overview ---- */
+#range {
+  position: relative;
+  display: grid;
+  grid-template-rows: 16px 14px 30px 22px auto;
+  gap: 4px;
+  padding: 4px 16px 8px;
+  border-top: 1px solid var(--bx-line);
+}
+
+/* What the library is showing: one line under the name bar while the bar and the transport are folded away. */
+#library-context {
+  display: flex; align-items: center; gap: 12px; padding: 0 16px; max-height: 0; overflow: hidden; opacity: 0;
+  color: var(--bx-fg); pointer-events: none;
+  transition: opacity var(--bx-dur-base) ease;
+}
+#library-context span { color: var(--bx-muted); font-size: 12px; }
+#library-context strong { letter-spacing: 0.08em; }
+body.library-mode #library-context { max-height: 40px; padding: 0 16px 12px; opacity: 1; pointer-events: auto; }
+
+#rulers {
+  position: relative;
+  color: var(--bx-muted);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+/* The small ticks between the labelled ones: short, hanging from the bar's edge, so a stretch reads at a glance. */
+#ruler-ticks {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+.rt {
+  position: absolute;
+  bottom: 0;
+  height: 5px;
+  border-left: 1px solid var(--tick-minor);
+}
+
+#markertrack { position: relative; }
+
+#ruler,
+#markers {
+  position: absolute;
+  inset: 0;
+}
+
+#markers {
+  pointer-events: none;
+}
+
+/* A round time beside a short tick, so a long session reads in minutes and a zoomed one in seconds. */
+.rl {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  padding-left: 5px;
+  border-left: 1px solid var(--tick-major);
+}
+/* Hanging off the right edge: the tick is on the side the text ends on, so it still names the moment it stands at. */
+.rl.end {
+  padding-left: 0;
+  padding-right: 5px;
+  border-left: 0;
+  border-right: 1px solid var(--tick-major);
+}
+.rl[data-now='true'] { color: var(--bx-fg); font-weight: 700; }
+
+/* A settings change: a clip cannot run across it, so the line runs down through the bar and the clip track. */
+.tick {
+  position: absolute;
+  top: 0;
+  bottom: -46px;
+  width: 0;
+  border-left: 1px dashed var(--bx-warn);
+  opacity: 0.7;
+  pointer-events: auto;
+}
+
+#strip {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  cursor: pointer;
+  touch-action: none;
+}
+
+#bar {
+  position: relative;
+  height: 30px;
+  background: color-mix(in srgb, var(--bx-ground) 70%, var(--bx-line));
+  box-shadow: inset 0 0 0 1px var(--bx-line);
+  cursor: pointer;
+}
+
+/* The quiet profile carries the sound; a few distinct loud regions use the accent. */
+#loud-viewport {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  z-index: 2;
+  pointer-events: none;
+}
+
+#loud {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  color: var(--bx-fg);
+  transform-origin: left top;
+}
+
+/* The clip band lies on the bar itself: its handles take the pointer, and the bare bar still seeks. */
+#cut {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  pointer-events: none;
+}
+
+
+#cells,
+#ovcells {
+  position: absolute;
+  inset: 0;
+}
+
+/* The stretches with nothing recorded, drawn by the page between the cells and the sound profile. */
+#gaps,
+#ovgaps {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 1;
+}
+
+/* A quiet band for footage leaves the sound profile and its accents legible. */
+.cell {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  background: color-mix(in srgb, var(--bx-muted) 24%, transparent);
+}
+
+.unavailable { position: absolute; top: 0; bottom: 0; display: grid; place-items: center; overflow: hidden; white-space: nowrap; color: var(--bx-muted); font-size: 10px; background: repeating-linear-gradient(135deg, var(--bx-ground) 0 3px, var(--bx-line) 3px 4px); }
+
+#ovcells .cell {
+  background: color-mix(in srgb, var(--bx-muted) 24%, transparent);
+}
+
+.gap {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  background: repeating-linear-gradient(
+    45deg,
+    color-mix(in srgb, var(--bx-muted) 45%, transparent) 0 2px,
+    transparent 2px 6px
+  );
+  pointer-events: none;
+}
+
+/* Centred in its gap band: the bar has room for it, the 10 px overview does not. */
+.gap-label {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--bx-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+#ovgaps .gap-label {
+  display: none;
+}
+
+#fill {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  background: color-mix(in srgb, var(--bx-fg) 10%, transparent);
+  pointer-events: none;
+}
+
+#bar-selection {
+  display: none;
+  position: absolute;
+  inset-block: 0;
+  background: color-mix(in srgb, var(--bx-acc) 22%, transparent);
+  border-inline: 2px solid var(--bx-acc);
+  box-sizing: border-box;
+  pointer-events: none;
+  z-index: 2;
+}
+
+/* One needle, and it ends 3 px below the bar, short of the overview: the overview under it is a window onto the whole session with its own
+   edge, not a second place the playhead can be, so nothing is drawn through it or inside it. */
+#head {
+  position: absolute;
+  top: -6px;
+  bottom: -3px;
+  width: 2px;
+  margin-left: -1px;
+  background: var(--bx-fg);
+  pointer-events: none;
+  z-index: 8;
+}
+
+#head::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: -5px;
+  border-inline: 6px solid transparent;
+  border-top: 7px solid var(--bx-fg);
+}
+
+#sel {
+  display: none;
+  transform-origin: 50% 100%;
+  animation: spring-grow var(--bx-dur-slow) var(--spring) both;
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  background: color-mix(in srgb, var(--bx-acc) 45%, var(--bx-ground));
+  box-shadow: inset 0 0 0 2px var(--bx-acc);
+  pointer-events: auto;
+  cursor: grab;
+  z-index: 4;
+}
+
+.edge {
+  display: none;
+  transition: transform var(--bx-dur-slow) var(--spring);
+  animation: spring-grow var(--bx-dur-slow) var(--spring) both;
+  position: absolute;
+  top: -6px;
+  bottom: -6px;
+  width: 16px;
+  margin-left: -8px;
+  background: var(--bx-acc);
+  cursor: ew-resize;
+  z-index: 6;
+  pointer-events: auto;
+}
+
+.edge:hover,
+.edge:active { transform: scaleX(1.25); }
+
+/* A grip mark so the handle reads as something to grab, not a range border. */
+.edge::after {
+  content: '';
+  position: absolute;
+  inset: 7px 5px;
+  border-left: 1px solid var(--bx-on);
+  border-right: 1px solid var(--bx-on);
+  opacity: 0.55;
+}
+
+/* A marker is a pin over the bar that names what happened there and jumps the playhead when pressed. */
+.mk {
+  position: absolute;
+  top: -3px;
+  width: 23px;
+  height: 20px;
+  margin-left: -11.5px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+  pointer-events: auto;
+  z-index: 8;
+}
+
+.mk::before {
+  content: '';
+  position: absolute;
+  top: 3px;
+  left: 6px;
+  width: 11px;
+  height: 14px;
+  background: var(--marker-color, var(--bx-fg));
+  clip-path: polygon(0 0, 100% 0, 100% 62%, 50% 100%, 0 62%);
+}
+
+.mk { transition: transform var(--bx-dur-slow) var(--spring); transform-origin: 50% 100%; }
+
+.mk:hover,
+.mk:focus-visible,
+.mk[aria-pressed='true'] {
+  transform: scale(1.3);
+}
+
+.mk.clip { --marker-color: var(--bx-acc); }
+.mk.screenshot { --marker-color: var(--bx-fg); }
+.mk.game { --marker-color: var(--bx-ok); }
+.mk.marker { --marker-color: var(--bx-warn); }
+.mk.recording { --marker-color: var(--bx-danger); }
+.mk.profile,
+.mk.gap { --marker-color: var(--bx-muted); }
+.mk:hover { background: transparent; }
+
+/* The whole session under a zoomed bar, with the stretch on screen as a window to drag. */
+#overview {
+  position: relative;
+  height: 10px;
+  background: color-mix(in srgb, var(--bx-ground) 82%, var(--bx-line));
+  box-shadow: inset 0 0 0 1px var(--bx-line);
+  cursor: grab;
+}
+
+#ovview {
+  position: absolute;
+  top: -1px;
+  bottom: -1px;
+  border: 1px solid var(--bx-fg);
+  background: color-mix(in srgb, var(--bx-fg) 12%, transparent);
+  pointer-events: none;
+}
+
+/* The moment under the pointer, and once it rests, its picture: it hangs under the tracks, over the video. */
+#trimread {
+  position: absolute;
+  transform: translateX(-50%);
+  padding: 0 6px;
+  font-size: 11px;
+  line-height: 14px;
+  font-weight: 700;
+  white-space: nowrap;
+  color: var(--bx-on);
+  background: var(--bx-acc);
+  pointer-events: none;
+  z-index: 7;
+}
+#bubble {
+  position: absolute;
+  top: 66px;
+  left: 0;
+  transform: translateX(-50%);
+  display: grid;
+  justify-items: center;
+  font-size: 11px;
+  pointer-events: none;
+  z-index: 20;
+}
+
+/* Appears with a small spring; `translate` composes with the transform the script sets while it follows the pointer. */
+#bubble:not([hidden]) { animation: spring-up var(--bx-dur-slow) var(--spring) both; }
+
+/* The hover is the picture and nothing else: no frame, no caption, only a shadow to lift it off the footage. */
+#bubbleimg {
+  display: block;
+  width: 192px;
+  aspect-ratio: 16 / 9;
+  object-fit: cover;
+  background: var(--video-bg);
+  box-shadow: 0 8px 24px rgb(0 0 0 / 0.55);
+}
+
+/* Words only when there is no picture: no footage at that moment, or none to show. */
+#bubbletime {
+  padding: 6px 10px;
+  color: var(--bx-fg);
+  background: var(--bx-ground);
+  box-shadow: 0 8px 24px rgb(0 0 0 / 0.55);
+}
+#bubbletime:empty { display: none; }
+
+/* The play mark on a paused picture: the same small outlined square as the saved clip's (library.css), accent glyph, quiet
+   until the pointer is on it. */
+#stage-play {
+  position: absolute;
+  left: 50%; top: 50%; transform: translate(-50%, -50%);
+  width: 56px; height: 56px; padding: 0; z-index: 12; justify-content: center;
+  background: color-mix(in srgb, var(--bx-ground) 55%, transparent); color: var(--bx-acc);
+  border: 1px solid var(--accent-line);
+  transition: background-color var(--bx-dur-fast), border-color var(--bx-dur-fast);
+}
+#stage-play:hover { background: color-mix(in srgb, var(--bx-acc) 18%, var(--bx-ground)); border-color: var(--bx-acc); }
+#stage-play svg { width: 22px; height: 22px; fill: currentColor; }
+#here, #time { display: none; }
+#rewind-age {
+  position: absolute; top: 12px; left: 12px; z-index: 12;
+  padding: 6px 10px; background: var(--bx-tile); color: var(--bx-fg);
+}
+/* The library lies on the Timeline's own stage (library.css, loaded with it), so a saved clip plays exactly where the
+   session plays and leaving it is a step back, never a window in front of a window. While it is open the bar and the
+   transport step aside (they fade, and keep their room, so nothing jumps when the Timeline comes back). */
+/* The video cannot be hidden while the library is open: the button stays where it is, dimmed, so the group does not change shape. */
+body.library-mode #hidevideo { opacity: 0.4; pointer-events: none; }
+#range { max-height: 220px; }
+#controls { max-height: 90px; }
+/* The rows no longer animate their height: max-height, padding and border-width are layout, repainted every frame under the panel's
+   live blur, which is what made the library open at a low frame rate. They change at once and the stage glides into its new place
+   instead (a transform, main.ts: glideStage); only opacity transitions here. */
+#range, #controls, #clip-guide { transition: opacity var(--bx-dur-base) ease; }
+body.library-mode #range, body.library-mode #controls, body.library-mode #clip-guide {
+  max-height: 0; padding-top: 0; padding-bottom: 0; border-width: 0; overflow: hidden;
+  opacity: 0; visibility: hidden; pointer-events: none;
+  transition: opacity var(--bx-dur-fast) ease;
+}
+body.library-selected #stage.empty #frame, body.library-selected #stage:has(#fail.on) #frame { display: grid; }
+body.library-mode #stage-play, body.library-mode #rewind-age, body.library-mode .chip, body.library-selected #empty, body.library-selected #fail { display: none !important; }
+
+#timeline-share-host { position: fixed; inset: 0; z-index: 100; }
+.timeline-share-backdrop { position: absolute; inset: 0; display: grid; place-items: center; padding: 16px; background: rgb(0 0 0 / 0.65); }
+.timeline-share { width: min(440px, 100%); max-height: calc(100vh - 32px); overflow-y: auto; display: flex; flex-direction: column; gap: 10px; padding: 14px; background: var(--bx-tile); border: 1px solid var(--line-strong); color: var(--bx-fg); }
+/* I7: the share panel rises 12 px and fades in on the base token when it opens (it mounts on each open). */
+@keyframes timeline-share-rise { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: none; } }
+.timeline-share { animation: timeline-share-rise 140ms cubic-bezier(0.215, 0.61, 0.355, 1) backwards; }
+@media (prefers-reduced-motion: reduce) { .timeline-share { animation: none; } }
+.timeline-share header, .timeline-share footer, .timeline-share-tabs { display: flex; align-items: center; gap: 8px; }
+.timeline-share header { justify-content: space-between; }
+.timeline-share footer { justify-content: flex-end; }
+.timeline-share-tabs button[aria-pressed="true"] { border-color: var(--bx-acc); color: var(--bx-acc); }
+.timeline-share-picture { width: 100%; height: min(200px, 25vh); background: #000; }
+.timeline-share-picture video, .timeline-share-picture img { width: 100%; height: 100%; object-fit: contain; }
+.timeline-share-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.timeline-share-meta, .timeline-share-content p, .timeline-share-notice { color: var(--bx-muted); font-size: 12px; }
+.timeline-share-content { display: flex; flex-direction: column; gap: 8px; }
+.timeline-share-content label { display: flex; align-items: center; gap: 8px; }
+.timeline-share-content label select { margin-left: auto; }
+.timeline-share-content p, .timeline-share-error, .timeline-share-notice { margin: 0; }
+.timeline-share-error { color: var(--bx-danger); }
+.timeline-share input:not([type="checkbox"]), .timeline-share select { min-width: 0; padding: 6px; color: var(--bx-fg); background: var(--bx-ground); border: 1px solid var(--line-strong); font: inherit; }
+
+/* ---- the transport ---- */
+#controls {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  align-items: center;
+  gap: 12px;
+  padding: 0 16px 10px;
+}
+
+/* The clip strip under the transport: what is selected (its length first), then the three steps to keep it. */
+#clip-guide {
+  padding: 0 16px 10px;
+  color: var(--bx-muted);
+  font-size: 12px;
+}
+#clip-guide[hidden] { display: none; }
+
+#clip-card {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 24px;
+  padding: 8px 12px;
+  border: 1px solid var(--accent-line);
+  background: var(--accent-soft);
+}
+
+#clip-summary { display: flex; align-items: baseline; gap: 10px; min-width: 0; }
+#clip-label { font-size: 11px; letter-spacing: 0.08em; color: var(--bx-muted); }
+#clip-length { font-size: 16px; line-height: 1; color: var(--bx-fg); }
+#clip-range { color: var(--bx-muted); white-space: nowrap; }
+
+#clip-steps { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 16px; margin: 0; padding: 0; list-style: none; }
+#clip-steps li { display: inline-flex; align-items: center; gap: 8px; white-space: nowrap; }
+#clip-steps b {
+  display: inline-grid;
+  place-items: center;
+  width: 16px;
+  height: 16px;
+  border: 1px solid var(--bx-line);
+  color: var(--bx-fg);
+  font-size: 10px;
+  font-weight: 700;
+}
+
+#left,
+#right,
+#transport,
+#zoom,
+#clipbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+#right {
+  justify-content: flex-end;
+}
+
+#zoom {
+  gap: 0;
+  margin-right: 4px;
+}
+
+#zoom button + button {
+  margin-left: -1px;
+}
+
+#controls button {
+  height: 30px;
+  font-size: 13px;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+  flex: none;
+}
+
+/* A clip's controls are wider than half the row: the sides take what they need and the transport keeps the middle. */
+#transport { justify-self: center; }
+
+.corner {
+  justify-content: center;
+}
+
+#controls .corner {
+  width: 30px;
+  padding: 0;
+  font-size: 15px;
+}
+
+#controls #play {
+  width: 36px;
+  height: 36px;
+}
+
+.corner svg {
+  width: 18px;
+  height: 18px;
+}
+
+#time {
+  min-width: 15ch;
+  margin-left: 6px;
+  color: var(--bx-fg);
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+#here {
+  color: var(--bx-fg);
+  font-size: 13px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+#previewclip[aria-pressed='true'] {
+  color: var(--bx-on);
+  background: var(--bx-acc);
+  border-color: var(--bx-acc);
+}
+
+#volume {
+  appearance: none;
+  width: 76px;
+  height: 20px;
+  padding: 0;
+  background: transparent;
+  cursor: pointer;
+}
+#volume::-webkit-slider-runnable-track {
+  height: 4px;
+  background: linear-gradient(to right, var(--bx-acc) 0 var(--volume-percent, 100%), var(--bx-raised) var(--volume-percent, 100%) 100%);
+}
+#volume::-webkit-slider-thumb {
+  appearance: none;
+  width: 8px;
+  height: 14px;
+  margin-top: -5px;
+  border: 0;
+  border-radius: 0;
+  background: var(--bx-acc);
+}
+#volume:focus-visible {
+  outline: 2px solid var(--bx-acc);
+  outline-offset: 2px;
+}
+
+#addmark svg {
+  width: 15px;
+  height: 15px;
+}
+
+/* Live is red in every theme (a fixed colour, not the accent): solid with a filled dot while it follows the writer,
+   an outline with a hollow dot when the picture is behind. The hover rule must not take its label away. */
+#live {
+  --live-red: #e5342d;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--live-red);
+  border-color: var(--live-red);
+}
+
+#live::before {
+  content: '';
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  border: 1.5px solid currentColor;
+  box-sizing: border-box;
+}
+
+#live[aria-pressed='true'],
+#live[aria-pressed='true']:hover {
+  background: var(--live-red);
+  border-color: var(--live-red);
+  color: #fff;
+}
+
+#live[aria-pressed='true']::before {
+  background: currentColor;
+}
+
+#mute[aria-pressed='true'] {
+  color: var(--bx-muted);
+}
+
+/* Save and its menu are one control: the arrow is the second half of the button. */
+#savegroup {
+  position: relative;
+  display: flex;
+}
+
+#savemenu {
+  width: 26px;
+  padding: 0;
+  justify-content: center;
+  border-left: 1px solid color-mix(in srgb, var(--bx-on) 40%, transparent);
+}
+
+#menu {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 4px);
+  display: grid;
+  min-width: 270px;
+  padding: 6px;
+  background: var(--bx-raised);
+  border: 1px solid var(--line-strong);
+  z-index: 30;
+}
+
+.menuhead {
+  padding: 6px 8px 4px;
+  color: var(--bx-acc);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+#menu button {
+  justify-content: space-between;
+  gap: 16px;
+  border: 0;
+  background: transparent;
+  color: var(--bx-fg);
+}
+
+#menu button:hover,
+#menu button:focus-visible {
+  background: var(--bx-tile);
+  color: var(--bx-acc);
+}
+
+kbd {
+  font: inherit;
+  font-size: 11px;
+  color: var(--bx-muted);
+}
+
+/* ---- the picture ---- */
+#stage.pane {
+  background: transparent;
+}
+
+#stage {
+  min-height: 0;
+  position: relative;
+  overflow: hidden;
+  container-type: size;
+  background: transparent;
+}
+
+/* Hide video: the window is the panel alone and the game shows under it. */
+body.novideo {
+  grid-template-rows: auto 0;
+}
+
+body.novideo #stage {
+  display: none;
+}
+
+/* The preview card: the picture on the glass, with the product's one halo spilling past its edge. */
+#frame {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  /* The card takes the recording's own shape (--ar, set from the video's size), as large as 78% by 86% of the room
+     allows, so the picture meets its border on every side: a 21:9 or 4:3 recording no longer sits in bars inside a
+     16:9 box. */
+  --fit-w: 78cqw;
+  --fit-h: 86cqh;
+  width: min(var(--fit-w), calc(var(--fit-h) * var(--ar, 1.7778)));
+  aspect-ratio: var(--ar, 1.7778);
+  display: grid;
+  grid-template-rows: minmax(0, 1fr);
+}
+
+#frame::before {
+  content: '';
+  position: absolute;
+  inset: -44px;
+  background: var(--glass-halo);
+  filter: blur(36px);
+  pointer-events: none;
+  z-index: -1;
+}
+
+#screen {
+  position: relative;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--glass-ink);
+  box-shadow: inset 0 0 0 1px var(--glass-line);
+}
+
+#v {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  background: transparent;
+  transition: opacity var(--bx-dur-base) ease-out;
+}
+
+#stage.empty #v {
+  opacity: 0;
+}
+
+/* The frame already on screen, kept sharp while the video element is blank during a seek or a rebuild;
+   and a still from the thumbnail cache standing in while a far moment's window arrives. */
+#hold,
+#still {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  pointer-events: none;
+}
+
+#stage.empty #hold {
+  display: none;
+}
+
+#empty {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: 8px;
+  text-align: center;
+  z-index: 9;
+}
+
+#emptyline {
+  font-size: 22px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+}
+
+#emptysub {
+  color: var(--bx-muted);
+  font-size: 12px;
+  max-width: 46ch;
+  line-height: 1.6;
+}
+
+#fail {
+  position: absolute;
+  inset: 0;
+  display: none;
+  place-content: center;
+  justify-items: center;
+  gap: 12px;
+  padding: 24px;
+  text-align: center;
+  color: var(--bx-muted);
+  background: var(--veil);
+  z-index: 9;
+}
+
+#fail.on {
+  display: grid;
+}
+
+#stage:has(#fail.on) #empty {
+  display: none;
+}
+
+/* Nothing to show means no card: the message stands on the theme ground alone. */
+#stage.empty #frame,
+#stage:has(#fail.on) #frame {
+  display: none;
+}
+
+/* The saved-clip card on the picture's lower edge, with what can be done with the clip next. */
+#card {
+  position: absolute;
+  left: 12px;
+  bottom: 12px;
+  display: none;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  background: var(--bx-raised);
+  border: 1px solid var(--line-strong);
+  font-size: 12px;
+  z-index: 6;
+}
+
+#card.on {
+  display: flex;
+}
+
+#cardname {
+  text-transform: none;
+  max-width: 42ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  margin-right: 4px;
+}
+
+/* ---- the one status line over the picture ---- */
+.chip {
+  position: absolute;
+  top: 16px;
+  left: 50%;
+  transform: translateX(-50%);
+  height: 26px;
+  display: none;
+  align-items: center;
+  padding: 0 10px;
+  font-size: 12px;
+  color: var(--bx-fg);
+  background: var(--bx-raised);
+  border: 1px solid var(--line-strong);
+  border-radius: 4px;
+  white-space: nowrap;
+  pointer-events: none;
+  z-index: 12;
+}
+
+.chip.on {
+  display: inline-flex;
+}
+
+.chip.problem {
+  color: var(--bx-danger);
+  border-color: color-mix(in srgb, var(--bx-danger) 55%, transparent);
+}
+
+/* The state chips, one tone each: a session that is not the one on screen and a session that has ended. */
+.chip.new-session {
+  color: var(--bx-on);
+  background: var(--bx-acc);
+  border-color: var(--bx-acc);
+}
+
+.chip.ended {
+  color: var(--bx-muted);
+  background: var(--bx-raised);
+  border-color: var(--bx-line);
+}
+
+/* A narrow window gives up the clock first, then the keep chip, then wraps the name bar: the gutter and the gaps stay the
+   same on every row, so nothing sits off the line the bar below it keeps. */
+@media (max-width: 980px) {
+  #current-clock { display: none; }
+}
+@media (max-width: 860px) {
+  #span { display: none; }
+}
+
+@media (max-width: 1100px) {
+  #volume {
+    display: none;
+  }
+  #frame {
+    --fit-w: 90cqw;
+    --fit-h: 90cqh;
+  }
+  /* A clip's controls do not fit beside the rest: they take a row of their own, on the same left edge as the row above. The
+     marker group keeps the left, the transport the right, and nothing is centred on a line it shares with nothing. */
+  body.clipping #controls { grid-template-columns: minmax(0, 1fr) auto; row-gap: 10px; }
+  body.clipping #left { grid-column: 1; grid-row: 1; }
+  body.clipping #transport { grid-column: 2; grid-row: 1; justify-self: end; }
+  body.clipping #right { grid-column: 1 / -1; grid-row: 2; justify-content: flex-start; flex-wrap: wrap; }
+}
+
+@media (max-width: 760px) {
+  #top { height: auto; min-height: 44px; flex-wrap: wrap; gap: 8px 12px; padding: 8px 12px; }
+  #title { width: 100%; flex-wrap: wrap; }
+  #range, #controls, #clip-guide, body.library-mode #library-context { padding-inline: 12px; }
+  #controls { display: flex; flex-wrap: wrap; justify-content: space-between; }
+  #left { display: flex; }
+  #right { width: 100%; margin-left: 0; justify-content: flex-start; }
+  #clipbar { flex-wrap: wrap; }
+  #time { min-width: 0; }
+}
+
+/* One spring, sampled: it overshoots a little and settles. Used for things that appear or are grabbed. */
+:root { --spring: linear(0, 0.2 5%, 0.65 14%, 0.96 25%, 1.07 36%, 1.04 46%, 0.99 62%, 1); }
+@keyframes spring-up { from { opacity: 0; translate: 0 8px; } }
+@keyframes spring-grow { from { opacity: 0; scale: 1 0.35; } }
+
+@media (prefers-reduced-motion: reduce) {
+  #bubble:not([hidden]), #sel, .edge { animation: none; }
+  .mk, .edge { transition: none; }
+  #timeline-panel.arriving { animation: none; }
+  body.arriving #stage { animation: none; }
+  #backdrop { transition: none; }
+  #v,
+  button {
+    transition: none;
+  }
+  #range, #controls, #clip-guide, #library-context, #stage-play { transition: none; }
+  body.library-mode #library-context { animation: none; }
+}
+
+/* I8: the play / pause icon pops in when it changes. I6: the Save control reads Saved with a small pop. */
+@keyframes tl-icon-swap { from { opacity: 0; transform: scale(0.88); } to { opacity: 1; transform: none; } }
+#play svg.swap { animation: tl-icon-swap var(--bx-dur-fast) cubic-bezier(0.22, 0.9, 0.3, 1) backwards; }
+@keyframes tl-saved-pop { 0% { transform: scale(0.96); } 55% { transform: scale(1.05); } 100% { transform: scale(1); } }
+#saveclip[data-state='saved'] { animation: tl-saved-pop 280ms cubic-bezier(0.22, 0.9, 0.3, 1); }
+@media (prefers-reduced-motion: reduce) {
+  #play svg.swap, #saveclip[data-state='saved'] { animation: none; }
+}
+
+/* View clips opens in two beats: the rows fade out first (layout unchanged), then fold away at once while the stage glides. */
+body.library-fading #range, body.library-fading #controls, body.library-fading #clip-guide {
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 140ms ease;
+}

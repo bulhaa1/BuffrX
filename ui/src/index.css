@@ -1,0 +1,719 @@
+@import 'tailwindcss';
+
+/* BuffrX's design language, one file.
+ *
+ * Fourteen themes (themes.css, the same table as src/engine/themes.h) are token sets selected by
+ * data-theme on :root; Clutch is the main one. No component knows which one is on: they paint with the
+ * semantic tokens below, which Tailwind exposes as utilities through @theme inline. The older names
+ * (canvas, surface, ink, faint, accent) are kept as aliases of the table's roles, so the views did not
+ * have to learn new ones.
+ *
+ * The look is a tiling desktop's: panes on a ground, 1 px seams, square corners, no shadows; the focused
+ * pane carries a 2 px accent border. Glass is scoped to the clip preview's floating chrome and the
+ * Timeline preview's halo. One face, JetBrains Mono, self-hosted, no outbound request. */
+
+@import './themes.css';
+@import './motion.css';
+
+@font-face {
+  font-family: 'JetBrains Mono';
+  src: url('./fonts/jetbrains-mono-medium.woff2') format('woff2');
+  font-weight: 400 500;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'JetBrains Mono';
+  src: url('./fonts/jetbrains-mono-bold.woff2') format('woff2');
+  font-weight: 600 700;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'JetBrains Mono';
+  src: url('./fonts/jetbrains-mono-extrabold.woff2') format('woff2');
+  font-weight: 800 900;
+  font-display: swap;
+}
+
+:root {
+  --bx-canvas: var(--bx-ground);
+  --bx-surface: var(--bx-tile);
+  --bx-ink: var(--bx-fg);
+  --bx-faint: var(--bx-muted);
+  --bx-accent: var(--bx-acc);
+  --bx-accent-dim: color-mix(in srgb, var(--bx-acc) 78%, var(--bx-ground));
+  --bx-line-strong: color-mix(in srgb, var(--bx-line) 68%, var(--bx-muted));
+}
+
+@theme inline {
+  --color-canvas: var(--bx-canvas);
+  --color-surface: var(--bx-surface);
+  --color-raised: var(--bx-raised);
+  --color-hover: var(--bx-raised);
+  --color-line: var(--bx-line);
+  --color-line-strong: var(--bx-line-strong);
+  --color-ink: var(--bx-ink);
+  --color-muted: var(--bx-muted);
+  --color-faint: var(--bx-faint);
+  --color-accent: var(--bx-accent);
+  --color-accent-dim: var(--bx-accent-dim);
+  --color-accent-soft: color-mix(in srgb, var(--bx-accent) 14%, transparent);
+  --color-accent-line: color-mix(in srgb, var(--bx-accent) 55%, transparent);
+  --color-on-accent: var(--bx-on);
+  --color-ok: var(--bx-ok);
+  --color-danger: var(--bx-danger);
+  --color-danger-soft: color-mix(in srgb, var(--bx-danger) 14%, transparent);
+  --color-warn: var(--bx-warn);
+  --color-warn-soft: color-mix(in srgb, var(--bx-warn) 12%, transparent);
+  --color-rec: var(--bx-rec);
+  --font-display: 'JetBrains Mono', ui-monospace, Consolas, monospace;
+  --font-sans: 'JetBrains Mono', ui-monospace, Consolas, monospace;
+  --font-mono: 'JetBrains Mono', ui-monospace, Consolas, monospace;
+  --shadow-pop: none;
+  --shadow-glow: none;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+body {
+  margin: 0;
+  background: var(--bx-canvas);
+  color: var(--bx-ink);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  font-weight: 500;
+  line-height: 1.45;
+  font-variant-numeric: tabular-nums;
+  /* Hinted glyphs on whole pixels: the face is the hinted no-ligature cut, so the renderer is asked for hinted outlines
+   * (legibility), never synthesised weights or slants, and no kerning (a monospace face has none to apply). */
+  text-rendering: optimizeLegibility;
+  font-synthesis: none;
+  font-kerning: none;
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+  overflow: hidden;
+  /* The caret is the accent, so a field's insertion point belongs to the product rather than the browser. */
+  caret-color: var(--bx-accent);
+  /* Every letter is a capital, as in the panel. Form fields keep what was typed (the browser does not pass this on to them). */
+  text-transform: uppercase;
+}
+/* Corners are square whatever a component asks for. A thing that has to be round (a spinner's ring)
+ * opts back in with .round. */
+*:not(.round) {
+  border-radius: 0 !important;
+}
+input,
+textarea {
+  user-select: text;
+}
+::selection {
+  background: var(--bx-accent);
+  color: var(--bx-on);
+}
+/* J5: a thin scrollbar that takes its place without moving the content: it shows while the pointer is over the list (or the
+   list has focus) and fades out on the base token. (No delayed exit: a transition delay here would hold every other transition.) */
+/* In @layer base: an unlayered `*` rule would beat every Tailwind utility (`transition-*` included). */
+@layer base {
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: transparent transparent;
+    transition: scrollbar-color var(--bx-dur-base) var(--bx-ease-out);
+  }
+  *:hover,
+  *:focus-within {
+    scrollbar-color: var(--bx-line) transparent;
+  }
+}
+:focus-visible {
+  outline: 2px solid var(--bx-accent);
+  outline-offset: 2px;
+}
+.num {
+  font-variant-numeric: tabular-nums;
+}
+/* A field label or a pane's title: small, capitals, muted. */
+.label {
+  font-size: 13px;
+  font-weight: 500;
+  text-transform: uppercase;
+  color: var(--bx-muted);
+}
+/* A pane: a face on the ground with a 1 px seam; its title (.pane-title) sits in the top border. The
+ * focused one carries the 2 px accent border. */
+.pane {
+  position: relative;
+  background: var(--bx-surface);
+  border: 1px solid var(--bx-line);
+}
+.pane.is-focused {
+  border: 2px solid var(--bx-accent);
+}
+.pane-title {
+  position: absolute;
+  /* Above the pane's own content: a picture that spills past its stage would otherwise paint over
+   * the title that names the pane. */
+  z-index: 1;
+  top: -0.7em;
+  left: 10px;
+  padding: 0 6px;
+  font-size: 13px;
+  line-height: 1.2;
+  text-transform: uppercase;
+  color: var(--bx-muted);
+  background: linear-gradient(var(--bx-canvas) 50%, var(--bx-surface) 50%);
+}
+.pane.is-focused > .pane-title {
+  color: var(--bx-accent);
+}
+.editor-workspace h3.pane-title::after {
+  content: ' //';
+  color: var(--bx-accent);
+  font-weight: 700;
+}
+/* The editor's body: the library (clips, screenshots) on the left, and on the right whichever of the two editors is
+ * open. The sequence editor is one screen of its own: picture, tools, and the timeline across the foot, which takes
+ * the height its rows need while the picture gets the rest. */
+.editor-body {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: clamp(268px, 21vw, 330px) minmax(0, 1fr);
+}
+
+@keyframes editor-arrive { from { opacity: 0; } to { opacity: 1; } }
+.editor-arrive { animation: editor-arrive var(--bx-dur-base) var(--bx-ease-out) both; }
+@keyframes editor-leave { from { opacity: 1; } to { opacity: 0; } }
+.editor-leave { animation: editor-leave var(--bx-dur-fast) var(--bx-ease-in) both; }
+@media (prefers-reduced-motion: reduce) { .editor-arrive, .editor-leave { animation: none; } }
+.editor-body > * {
+  min-width: 0;
+  min-height: 0;
+}
+.editor-shell {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: minmax(0, 1fr) clamp(280px, 22vw, 340px);
+  grid-template-rows: minmax(0, 1fr) auto;
+  grid-template-areas:
+    'stage inspector'
+    'timeline timeline';
+}
+.editor-shell > * {
+  min-width: 0;
+  min-height: 0;
+}
+.area-stage { grid-area: stage; }
+.area-inspector { grid-area: inspector; }
+.area-timeline { grid-area: timeline; }
+/* The screenshot editor keeps its own two-pane row. */
+.editor-inspector {
+  min-height: 0;
+  width: clamp(290px, 24vw, 360px);
+}
+.editor-actions {
+  padding: 12px;
+}
+/* The export pane's sections: a rule between each, and the same room above and below it. */
+.inspector-section {
+  padding: 16px 12px;
+}
+.inspector-section + .inspector-section {
+  border-top: 1px solid var(--bx-line);
+}
+/* One size for every control in the pane, so a dropdown reads like the chips beside it. */
+.editor-sections .field,
+.editor-sections .field * {
+  font-size: 13px;
+  font-weight: 700;
+}
+.editor-advanced {
+  padding-top: 16px;
+}
+.editor-advanced summary {
+  color: var(--bx-ink);
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 700;
+}
+.editor-advanced summary:focus-visible {
+  outline: 2px solid var(--bx-accent);
+  outline-offset: 3px;
+}
+.editor-actions {
+  background: var(--bx-surface);
+}
+/* Shared shapes the React components put on, so the same row looks the same everywhere. */
+.card {
+  background: var(--bx-surface);
+  border: 1px solid var(--bx-line);
+}
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  height: 30px;
+  padding: 0 12px;
+  font-weight: 700;
+  font-size: 14px;
+  border: 1px solid var(--bx-line-strong);
+  background: var(--bx-surface);
+  color: var(--bx-ink);
+  cursor: default;
+  /* Motion tokens (motion.css): hovers settle in the fast token; a press (below) answers at once. */
+  transition: background var(--bx-dur-fast) var(--bx-ease-out), border-color var(--bx-dur-fast) var(--bx-ease-out),
+    color var(--bx-dur-fast) var(--bx-ease-out), transform var(--bx-dur-fast) var(--bx-ease-out),
+    opacity var(--bx-dur-fast) var(--bx-ease-out);
+  white-space: nowrap;
+}
+.btn[data-hovered],
+.btn:hover:not([disabled]) {
+  background: var(--bx-raised);
+  border-color: var(--bx-muted);
+}
+.btn[data-pressed],
+.btn:active:not([disabled]) {
+  background: color-mix(in srgb, var(--bx-raised) 80%, var(--bx-canvas));
+  /* A press shows on its own frame: no transition going down, the release settles through the transitions above. */
+  transform: scale(0.985);
+  transition-duration: 0ms;
+}
+.btn[data-disabled],
+.btn:disabled {
+  opacity: 0.45;
+}
+.btn-primary {
+  background: var(--bx-accent);
+  border-color: var(--bx-accent);
+  color: var(--bx-on);
+}
+.btn-primary[data-hovered],
+.btn-primary:hover:not([disabled]) {
+  background: color-mix(in srgb, var(--bx-accent) 88%, var(--bx-ink));
+  border-color: color-mix(in srgb, var(--bx-accent) 88%, var(--bx-ink));
+}
+.btn-ghost {
+  background: transparent;
+  border-color: transparent;
+  color: var(--bx-muted);
+}
+.btn-ghost[data-hovered],
+.btn-ghost:hover:not([disabled]) {
+  background: var(--bx-raised);
+  color: var(--bx-ink);
+}
+.btn-danger {
+  border-color: var(--bx-danger);
+  color: var(--bx-danger);
+  background: transparent;
+}
+.btn-danger[data-hovered],
+.btn-danger:hover:not([disabled]) {
+  background: var(--bx-danger);
+  color: var(--bx-on);
+}
+.icon-btn {
+  display: inline-grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  color: var(--bx-muted);
+  transition: background var(--bx-dur-fast) var(--bx-ease-out), color var(--bx-dur-fast) var(--bx-ease-out),
+    transform var(--bx-dur-fast) var(--bx-ease-out);
+}
+.icon-btn[data-hovered],
+.icon-btn:hover {
+  background: var(--bx-raised);
+  color: var(--bx-ink);
+}
+.icon-btn[data-pressed],
+.icon-btn:active:not([disabled]) {
+  transform: scale(0.985);
+  transition-duration: 0ms;
+}
+.field {
+  height: 30px;
+  border: 1px solid var(--bx-line-strong);
+  background: var(--bx-canvas);
+  padding: 0 10px;
+  color: var(--bx-ink);
+  font: inherit;
+}
+.field:focus {
+  outline: none;
+  border-color: var(--bx-accent);
+}
+/* The browser's own placeholder is a grey from outside the theme. */
+.field::placeholder {
+  color: var(--bx-muted);
+  opacity: 1;
+}
+/* A key: a square cap with its legend in lower case. */
+.keycap {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 20px;
+  height: 20px;
+  padding: 0 6px;
+  border: 1px solid var(--bx-line-strong);
+  color: var(--bx-muted);
+  font-size: 13px;
+  font-weight: 500;
+  text-transform: uppercase;
+}
+.popover {
+  background: var(--bx-surface);
+  border: 1px solid var(--bx-line-strong);
+  padding: 4px;
+  outline: none;
+  /* F3: a popover arrives from its trigger (4 px, by placement) and leaves in the fast token, ease-in. */
+  transition: opacity var(--bx-dur-base) var(--bx-ease-out), transform var(--bx-dur-base) var(--bx-ease-out);
+}
+.popover[data-entering] {
+  opacity: 0;
+  transform: translateY(-4px);
+}
+.popover[data-placement='top'][data-entering] {
+  transform: translateY(4px);
+}
+.popover[data-exiting] {
+  opacity: 0;
+  transition-duration: var(--bx-dur-fast);
+  transition-timing-function: var(--bx-ease-in);
+}
+/* F2: a tooltip fades in 2 px toward its trigger; its exit is the fast token. */
+.bx-tooltip {
+  transition: opacity var(--bx-dur-fast) var(--bx-ease-out), transform var(--bx-dur-fast) var(--bx-ease-out);
+}
+.bx-tooltip[data-entering] {
+  opacity: 0;
+  transform: translateY(-2px);
+}
+.bx-tooltip[data-placement='top'][data-entering] {
+  transform: translateY(2px);
+}
+.bx-tooltip[data-exiting] {
+  opacity: 0;
+  transition-timing-function: var(--bx-ease-in);
+}
+/* F4: a dialog's overlay fades and its card rises 8 px; the exit is the fast token. */
+.bx-overlay {
+  transition: opacity var(--bx-dur-base) var(--bx-ease-out);
+}
+.bx-overlay[data-entering],
+.bx-overlay[data-exiting] {
+  opacity: 0;
+}
+.bx-overlay[data-exiting] {
+  transition-duration: var(--bx-dur-fast);
+  transition-timing-function: var(--bx-ease-in);
+}
+.bx-dialog {
+  transition: opacity var(--bx-dur-base) var(--bx-ease-out), transform var(--bx-dur-base) var(--bx-ease-out);
+}
+.bx-dialog[data-entering] {
+  opacity: 0;
+  transform: translateY(8px);
+}
+.bx-dialog[data-exiting] {
+  opacity: 0;
+  transform: translateY(4px);
+  transition-duration: var(--bx-dur-fast);
+  transition-timing-function: var(--bx-ease-in);
+}
+/* F8: a slider's thumb grows a little under the pointer and while it is dragged (`scale` composes with the thumb's own translate). */
+.bx-slider-thumb {
+  transition: scale var(--bx-dur-fast) var(--bx-ease-out);
+}
+.bx-slider-thumb:hover,
+.bx-slider-thumb[data-dragging] {
+  scale: 1.25 1;
+}
+/* A playback bar moves with the picture: its fill and its thumb take each value at once, with no easing behind it. */
+.bx-slider-instant .bx-slider-thumb,
+.bx-slider-instant .bx-slider-fill {
+  transition: none;
+}
+.menu-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 10px;
+  color: var(--bx-ink);
+  outline: none;
+  cursor: default;
+  transition: background var(--bx-dur-fast) var(--bx-ease-out), color var(--bx-dur-fast) var(--bx-ease-out);
+}
+.menu-item[data-focused],
+.menu-item[data-hovered] {
+  background: var(--bx-accent);
+  color: var(--bx-on);
+}
+.menu-item[data-selected] {
+  color: var(--bx-accent);
+}
+.menu-item[data-selected][data-focused],
+.menu-item[data-selected][data-hovered] {
+  color: var(--bx-on);
+}
+.menu-item[data-danger] {
+  color: var(--bx-danger);
+}
+.menu-item[data-disabled] {
+  opacity: 0.4;
+}
+/* A meter in cells: the track's empty cells, and the lit run over it (its width is the value). */
+.cells {
+  background: repeating-linear-gradient(90deg, var(--bx-raised) 0 6px, transparent 6px 8px);
+}
+.cells-on {
+  background: repeating-linear-gradient(90deg, var(--bx-accent) 0 6px, transparent 6px 8px);
+}
+/* The titlebar is the window's handle: drag anywhere that is not a control. */
+.drag {
+  -webkit-app-region: drag;
+}
+.no-drag {
+  -webkit-app-region: no-drag;
+}
+@keyframes bx-breathe {
+  0%,
+  100% {
+    opacity: 0.35;
+  }
+  50% {
+    opacity: 0.85;
+  }
+}
+@keyframes bx-ripple {
+  from {
+    transform: scale(1);
+    opacity: 0.55;
+  }
+  to {
+    transform: scale(1.35);
+    opacity: 0;
+  }
+}
+@keyframes bx-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+@keyframes bx-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.animate-in {
+  animation: bx-in 180ms ease-out both;
+}
+.spin {
+  animation: bx-spin 0.9s linear infinite;
+}
+/* The spinner's cells: each one lit in turn, its trail fading behind it. */
+@keyframes bx-cell {
+  0% {
+    opacity: 1;
+  }
+  25% {
+    opacity: 0.45;
+  }
+  100% {
+    opacity: 0.12;
+  }
+}
+.bx-cell {
+  opacity: 0.12;
+  animation: bx-cell 720ms linear infinite;
+}
+/* Reduced motion: nothing slides, rises or chases, but a busy state still reads as busy: the spinner's cells all pulse
+ * together, slowly, instead of running round the square. */
+@keyframes bx-pulse {
+  0%,
+  100% {
+    opacity: 0.2;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .animate-in {
+    animation: none;
+  }
+  .spin,
+  .bx-cell {
+    animation: bx-pulse 1.6s ease-in-out infinite !important;
+    animation-delay: 0s !important;
+  }
+}
+
+/* A 1366x768 laptop at 200% has 683 CSS pixels: two side panes leave no stage. Below 900 px the editor
+ * stacks its panes instead, so the picture keeps a usable width and every control stays reachable by
+ * scrolling the column. */
+@media (max-width: 900px) {
+  .editor-body {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: 320px minmax(0, 1fr);
+  }
+  .editor-shell {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: none;
+    grid-auto-rows: auto;
+    grid-template-areas:
+      'stage'
+      'timeline'
+      'inspector';
+    overflow-y: auto;
+  }
+  /* Stacked, a row is as tall as its content: with a zero minimum the rows would share what is left. */
+  .editor-shell > * {
+    min-height: auto;
+  }
+  .editor-shell .area-stage {
+    min-height: 380px;
+  }
+  .editor-shell .area-inspector {
+    min-height: 320px;
+  }
+  .editor-workspace:not(.editor-shell) {
+    flex-direction: column;
+    min-height: 650px;
+  }
+  .editor-workspace:not(.editor-shell) > div:first-child {
+    min-height: 390px;
+  }
+  .editor-inspector {
+    width: 100%;
+    min-height: 300px;
+    flex: none;
+  }
+}
+
+/* View transitions (preview -> editor): a quick cross-fade, and the picture pane glides to its new place. */
+::view-transition-group(*) { animation-duration: var(--bx-dur-base); animation-timing-function: var(--bx-ease-out); }
+::view-transition-old(root), ::view-transition-new(root) { animation-duration: var(--bx-dur-base); }
+::view-transition-old(clip-pane), ::view-transition-new(clip-pane) { height: 100%; }
+@media (prefers-reduced-motion: reduce) {
+  ::view-transition-group(*), ::view-transition-old(*), ::view-transition-new(*) { animation: none; }
+}
+
+/* While a clip from the library is being dragged, the places it can be dropped on show their frame, and
+ * the one under the pointer takes its whole face: the area answers the drag, not only its outline.
+ * The timeline takes a drop too, but stays still while one is carried: its own tools already fill it. */
+.clip-dragging [data-drop]:not(.area-timeline) {
+  border-color: var(--bx-accent);
+  border-style: dashed;
+}
+.clip-dragging [data-drop]:not(.area-timeline)[data-drop-over] {
+  border-style: solid;
+  background-color: color-mix(in srgb, var(--bx-accent) 14%, transparent);
+}
+/* The overlay says it too, so the area under the pointer is never the same face as the ones beside it. */
+.clip-dragging [data-drop][data-drop-over] .drop-zone {
+  border-style: solid;
+  background-color: color-mix(in srgb, var(--bx-accent) 10%, transparent);
+}
+.clip-dragging {
+  cursor: grabbing;
+  user-select: none;
+}
+
+/* A right-click menu: a short list close to the pointer, not a dialog. */
+.menu-compact {
+  min-width: 124px;
+  padding: 2px;
+}
+.menu-compact .menu-item {
+  padding: 3px 9px;
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+/* F6: a notice enters 12 px from the side and fades in on the base token (chrome.tsx: .bx-toast). */
+@keyframes bx-toast-in {
+  from {
+    opacity: 0;
+    transform: translateX(12px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.bx-toast {
+  animation: bx-toast-in var(--bx-dur-base) var(--bx-ease-out) backwards;
+}
+/* J6: a list stops scrolling at its ends instead of carrying the page with it. */
+.overflow-y-auto {
+  overscroll-behavior: contain;
+}
+
+/* Motion utilities (ui-fluidity plan, 6.3). Each runs once when its element mounts, on the token it names; none runs at rest. */
+/* F5: a tab's panel rises 6 px and fades in when its tab is chosen. */
+@keyframes bx-tab-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: none; }
+}
+.bx-tab-enter { animation: bx-tab-in var(--bx-dur-base) var(--bx-ease-out) backwards; }
+/* G3: a clip that joins a lane scales in from 0.96 and fades. */
+@keyframes bx-pop-in {
+  from { opacity: 0; transform: scale(0.96); }
+  to { opacity: 1; transform: none; }
+}
+.bx-pop-in { animation: bx-pop-in var(--bx-dur-base) var(--bx-ease-out) backwards; }
+/* G9, H6, I8: an icon that changes cross-fades with a 0.9 -> 1 scale (its wrapper is keyed by the icon's name). */
+@keyframes bx-swap {
+  from { opacity: 0; transform: scale(0.9); }
+  to { opacity: 1; transform: none; }
+}
+.bx-swap { animation: bx-swap var(--bx-dur-fast) var(--bx-ease-out) backwards; }
+/* G13: a drop notice fades in on the fast token. */
+@keyframes bx-fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+.bx-fade-in { animation: bx-fade-in var(--bx-dur-fast) var(--bx-ease-out) backwards; }
+/* F3: a select's chevron turns when its list opens. */
+.bx-chevron { transition: transform var(--bx-dur-base) var(--bx-ease-out); }
+.field[aria-expanded='true'] .bx-chevron { transform: rotate(180deg); }
+/* F1, F11: a field's colour, border and opacity move on the fast token instead of swapping. */
+.field {
+  transition: border-color var(--bx-dur-fast) var(--bx-ease-out), background-color var(--bx-dur-fast) var(--bx-ease-out),
+    color var(--bx-dur-fast) var(--bx-ease-out), opacity var(--bx-dur-fast) var(--bx-ease-out);
+}
+/* Reduced motion: the arrivals above are not played; the state they show is already there. */
+@media (prefers-reduced-motion: reduce) {
+  .bx-tab-enter, .bx-pop-in, .bx-swap, .bx-fade-in { animation: none; }
+}
+
+/* G11: a finished export pops its check from 0.6 to 1 (slightly past, then settles). */
+@keyframes bx-check-pop {
+  0% { transform: scale(0.6); opacity: 0; }
+  65% { transform: scale(1.08); opacity: 1; }
+  100% { transform: scale(1); opacity: 1; }
+}
+.bx-check-pop { animation: bx-check-pop var(--bx-dur-base) var(--bx-ease-out) backwards; }
+@media (prefers-reduced-motion: reduce) {
+  .bx-check-pop { animation: none; }
+}
+
+/* G7: a split flashes a line at the cut. G5: a dropped clip settles. G4: a removed clip dissolves where it was. */
+@keyframes bx-split-flash { 0% { opacity: 1; width: 4px; } 100% { opacity: 0; width: 2px; } }
+.bx-split-flash { animation: bx-split-flash 180ms var(--bx-ease-out) forwards; }
+@keyframes bx-settle { 0% { transform: scale(1.04); } 100% { transform: scale(1); } }
+.bx-settle { animation: bx-settle var(--bx-dur-fast) var(--bx-ease-out); }
+@keyframes bx-ghost-out { from { opacity: 0.9; } to { opacity: 0; } }
+.bx-ghost-out { animation: bx-ghost-out 90ms var(--bx-ease-in) forwards; }
+@media (prefers-reduced-motion: reduce) {
+  .bx-split-flash, .bx-settle, .bx-ghost-out { animation: none; }
+  .bx-split-flash, .bx-ghost-out { display: none; }
+}

@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en" data-theme="clutch">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#0b0c0d" />
+    <title>BuffrX</title>
+    <!-- The first paint is this shell (docs/ui-fluidity-plan-2026-11-07.md, 6.6). It is drawn when the HTML parses, before the bundle
+         loads, so the window never shows an unpainted frame. It carries the default theme's ground and the frame's seams, no text
+         and no spinner; React replaces it on mount, and the page's own theme (store.ts) takes over from there. -->
+    <style>
+      html, body { margin: 0; height: 100%; background: #0b0c0d; color: #f5f3ef; }
+      .shell-bar { position: fixed; left: 0; right: 0; top: 0; height: 40px; border-bottom: 1px solid #55575a; }
+      .shell-pane { position: fixed; top: 52px; bottom: 12px; border: 1px solid #55575a; background: #141517; }
+      .shell-pane.rail { left: 12px; width: 300px; }
+      .shell-pane.stage { left: 324px; right: 12px; }
+    </style>
+  </head>
+  <body>
+    <div id="root">
+      <div class="shell-bar" aria-hidden="true"></div>
+      <div class="shell-pane rail" aria-hidden="true"></div>
+      <div class="shell-pane stage" aria-hidden="true"></div>
+    </div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

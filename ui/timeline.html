@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>BuffrX Timeline</title>
+    <!-- 3.1: the first paint is this shell, drawn when the HTML parses (before timeline.css and the bundle load): the panel's ground,
+         its seam and the bar's place, with no text to move when the page takes over. The page's own styles replace it. -->
+    <style>
+      html, body { margin: 0; height: 100%; background: transparent; }
+      #timeline-panel { position: fixed; left: 0; right: 0; top: 0; background: rgba(11, 12, 13, 0.94); border-bottom: 1px solid #55575a; min-height: 118px; }
+      #top { height: 40px; }
+      /* Nothing of the panel or the picture shows until main.ts starts the arrival: before timeline.css loads its buttons are unstyled
+         browser buttons, a pale bar at the top of the screen for a few frames. */
+      body:not(.arrival-started) #timeline-panel, body:not(.arrival-started) #stage { opacity: 0; }
+    </style>
+  </head>
+  <body>
+    <div id="backdrop" aria-hidden="true"></div>
+    <div id="timeline-panel" class="pane">
+    <div id="top">
+      <div id="title">
+        <strong id="timeline-title">Timeline [beta]</strong>
+        <span id="state" role="status" hidden></span>
+        <span id="span"></span>
+      </div>
+      <time id="current-clock"></time>
+      <div id="tools">
+        <button id="viewclips" title="Open the saved clips and screenshots here, in the preview" aria-pressed="false">View clips</button>
+        <button id="hidevideo" title="Hide the video and see the game under the timeline (H)" aria-pressed="false">Hide video</button>
+      </div>
+      <span id="tools-rule" aria-hidden="true"></span>
+      <button id="close" title="Back to the game (Esc, Alt+4)">Back to game</button>
+    </div>
+
+    <div id="range">
+      <div id="rulers" aria-label="Time before now"><span id="ruler-ticks"></span><span id="ruler"></span></div>
+      <div id="markertrack" aria-label="Timeline markers"><span id="markers"></span></div>
+      <div id="bar" role="slider" tabindex="0" aria-label="Playhead" aria-valuemin="0" aria-valuemax="0" aria-valuenow="0">
+        <div id="cells"></div>
+        <div id="gaps"></div>
+        <div id="loud-viewport"><canvas id="loud" aria-hidden="true"></canvas></div>
+        <div id="fill"></div>
+        <div id="strip"></div>
+        <div id="head"></div>
+        <div id="cut" aria-label="Clip selection" title="Drag the selection or its ends; I and O set the ends."></div>
+      </div>
+      <div id="overview" hidden title="The whole session: drag the window to scroll along it">
+        <div id="ovcells"></div>
+        <div id="ovgaps"></div>
+        <div id="ovview"></div>
+      </div>
+      <span id="trimread" hidden></span>
+      <div id="bubble" hidden><img id="bubbleimg" alt="" hidden><span id="bubbletime"></span></div>
+    </div>
+
+    <div id="controls">
+      <div id="left">
+        <button id="addmark" title="Add a marker at the playhead (M)">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 21s-6-5.6-6-10.5a6 6 0 0 1 12 0C18 15.4 12 21 12 21Z" /><path d="M12 8v5M9.5 10.5h5" /></svg>
+          Marker
+        </button>
+        <button id="removemark" disabled hidden title="Select a marker to remove it">Remove marker</button>
+        <button id="mute" class="corner" title="Mute (Shift+M)" aria-label="Mute" aria-pressed="false">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9h4l5-4v14l-5-4H4z" /><path id="wave" d="M16 9a4 4 0 0 1 0 6M18.5 6.5a8 8 0 0 1 0 11" /></svg>
+        </button>
+        <input id="volume" type="range" min="0" max="1" step="0.01" value="1" aria-label="Volume" title="Volume" />
+        <button id="speed" data-rate="1" title="Playback speed: [ slower, ] faster" aria-label="Playback speed">1&times;</button>
+        <span id="here" aria-live="off">Here 0:00</span>
+        <span id="time" aria-live="off">0:00 / 0:00</span>
+      </div>
+      <div id="transport">
+        <button id="back10" title="Back 10 seconds (Shift+Left)">&minus;10 s</button>
+        <button class="corner" id="play" title="Play (Space)" aria-label="Play">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path id="playicon" d="M8 5v14l11-7L8 5Z" /></svg>
+        </button>
+        <button id="fwd10" title="Forward 10 seconds (Shift+Right)">+10 s</button>
+      </div>
+      <div id="right">
+        <div id="zoom">
+          <button id="zoomout" class="corner" title="Zoom out (-)" aria-label="Zoom out">&minus;</button>
+          <button id="zoomwin" title="Length of the bar: click for 1, 5, 15, 60 minutes, all (0: back to 5 minutes)">5 MIN</button>
+          <button id="zoomin" class="corner" title="Zoom in (+, Ctrl+wheel)" aria-label="Zoom in">+</button>
+        </div>
+        <button id="live" title="Play the newest footage (L)" aria-pressed="false">Live</button>
+        <button id="clip" class="primary" title="Clip the 30 seconds before the playhead (C). I and O set its start and end at the playhead">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="6" cy="7" r="2.5" /><circle cx="6" cy="17" r="2.5" /><path d="M8 8.5 20 17M8 15.5 20 7" /></svg>
+          Clip
+        </button>
+        <div id="clipbar" hidden>
+          <button id="previewclip" title="Play the selected clip on repeat" aria-pressed="false">Play clip</button>
+          <button id="trimclip" title="Pause and zoom in to adjust clip handles">Adjust clip</button>
+          <button id="cancelclip" title="Cancel the clip (Esc)">Cancel</button>
+          <div id="savegroup">
+            <button id="saveclip" class="primary" title="Save the clip (Enter)">Save clip</button>
+            <button id="savemenu" class="primary" title="More ways to save" aria-label="More ways to save" aria-haspopup="menu" aria-expanded="false">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9l6 6 6-6" /></svg>
+            </button>
+            <div id="menu" role="menu" hidden>
+              <span class="menuhead">Save</span>
+              <button role="menuitem" data-then="stay">Save clip<kbd>Enter</kbd></button>
+              <button role="menuitem" data-then="game">Save and back to game<kbd>Shift+Enter</kbd></button>
+              <button role="menuitem" data-then="edit">Save and edit<kbd>E</kbd></button>
+              <span class="menuhead">Share</span>
+              <button role="menuitem" data-then="copy">Save and copy<kbd>Ctrl+C</kbd></button>
+              <button role="menuitem" data-then="share">Save and share<kbd>Shift+S</kbd></button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div id="clip-guide" hidden>
+      <div id="clip-card">
+        <div id="clip-summary">
+          <span id="clip-label">Clip</span>
+          <strong id="clip-length"></strong>
+          <span id="clip-range"></span>
+          <span id="clip-details" hidden></span>
+        </div>
+        <ol id="clip-steps">
+          <li><b>1</b>Drag the ends</li>
+          <li><b>2</b>Play clip to check</li>
+          <li><b>3</b>Save clip to keep</li>
+        </ol>
+      </div>
+    </div>
+    <div id="library-context"></div>
+    </div>
+
+    <div id="stage" class="pane">
+      <div id="frame">
+        <div id="screen">
+          <video id="v" playsinline></video>
+          <canvas id="hold" aria-hidden="true" hidden></canvas>
+          <img id="still" alt="" hidden src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7">
+        </div>
+      </div>
+      <button id="stage-play" hidden aria-label="Play" title="Play (Space)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14l11-7z" /></svg></button>
+      <span id="rewind-age" hidden></span>
+      <div id="empty" hidden>
+        <span id="emptyline">Nothing recorded yet</span>
+        <span id="emptysub">The buffer fills while it runs. Edited footage stays in the panel.</span>
+      </div>
+      <div id="fail">
+        <span id="failtext">There is no Timeline footage to play.</span>
+        <button id="retry" hidden>Retry</button>
+      </div>
+    </div>
+
+    <script type="module" src="/src/timeline/main.ts"></script>
+  </body>
+</html>

@@ -1,0 +1,87 @@
+# Build and download caches: recreated by tools/*.ps1, verified by SHA-256 on every run.
+work/
+build/
+build-share-spike/
+
+# Staged runtime: the pinned OBS binaries and generated import libraries. Rebuilt by
+# tools/prepare-runtime.ps1; never edited by hand and never committed.
+runtime/
+
+# UI dependencies and build output
+ui/node_modules/
+ui/dist/
+
+# Rust build cache for the Tauri host (src-tauri/target). Rebuilt by tools/build.ps1.
+src-tauri/target/
+src-share/target/
+# Capability schemas tauri-build regenerates on every build (thousands of lines of churn).
+src-tauri/gen/schemas/
+
+# Packaging output: rebuilt by tools/package.ps1 from the staged runtime and ui/dist.
+dist/
+dist-fresh/
+
+# Local state: test data roots, logs, scratch
+data/
+*.log
+
+# Agent scratch: working screenshots and skill task briefs. Not product source.
+.openchamber/
+.superpowers/
+
+# Editor and OS noise
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Impeccable design mocks: local thumbnails of real clips, never committed.
+.impeccable/mocks/thumbs/
+.impeccable/mocks/omarchy-themes.html
+.impeccable/questions/
+.impeccable/review/
+
+# Agent and index state: local, never published.
+.claude/
+.codegraph/
+.impeccable/critique/
+
+# Local website design snapshots and scratch copies, never product source.
+site-main/
+site-original/
+site-v2/
+site-main-main.js.bak
+
+# Private side: never published. Agent instructions, internal notes, audits, handoffs, QA reports.
+AGENTS.md
+CLAUDE.md
+DESIGN.md
+GITHUB-SAFETY.md
+PRODUCT.md
+ISSUES.md
+QA_*.md
+HANDOFF_*.md
+AUDIT_*.md
+CAPTURE_OPTIMIZATION_HANDOFF.md
+docs/
+.impeccable/
+*.bak
+*.local.*
+
+# Generated or personal scratch
+*.orig
+*.rej
+ui/PRODUCT.md
+ui/.impeccable/
+site-snapshot-*/
+site-snapshots/
+tools/installer-art/
+
+# wrangler files
+.wrangler
+.dev.vars*
+!.dev.vars.example
+.env*
+!.env.example
+
+# The launch-video project (Remotion, its node_modules and renders), never product source.
+shotcraft-buffrx-launch/

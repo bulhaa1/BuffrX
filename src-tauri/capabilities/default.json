@@ -1,0 +1,23 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "What the editor (and the clip preview and Timeline preview it starts as) needs: engine events and invoke, its own frameless window (drag, minimise, maximise, close), and drag-and-drop of files.",
+  "windows": ["editor", "timeline"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-start-dragging",
+    "core:window:allow-minimize",
+    "core:window:allow-unminimize",
+    "core:window:allow-toggle-maximize",
+    "core:window:allow-maximize",
+    "core:window:allow-unmaximize",
+    "core:window:allow-close",
+    "core:window:allow-destroy",
+    "core:window:allow-show",
+    "core:window:allow-set-focus",
+    "core:window:allow-set-title",
+    "core:window:allow-set-fullscreen",
+    "core:window:allow-is-fullscreen",
+    "core:window:allow-set-max-size"
+  ]
+}
