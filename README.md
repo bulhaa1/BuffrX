@@ -20,8 +20,8 @@ No account. No ads. No watermark. No telemetry.
 
 | 🎬 **Watch the trailer** |
 | :---: |
-| <video src="https://github.com/bulhaa1/BuffrX/raw/main/assets/trailer.mp4" controls muted width="100%"></video> |
-| *Video not playing? [Open the trailer](assets/trailer.mp4).* |
+| [<img src="assets/trailer-poster.jpg" alt="BuffrX trailer. Click to play." width="100%">](https://github.com/bulhaa1/BuffrX/raw/main/assets/trailer.mp4) |
+| ▶ *[Click to play the trailer](https://github.com/bulhaa1/BuffrX/raw/main/assets/trailer.mp4) (30 s)* |
 
 &nbsp;
 
