@@ -2,7 +2,7 @@
 
 # BuffrX
 
-<img src="assets/banner.svg" alt="BuffrX. Clip it. Cut it. Send it." width="100%">
+<img src="assets/banner.jpg" alt="BuffrX. Clip it. Cut it. Send it." width="100%">
 
 &nbsp;
 
