@@ -98,13 +98,7 @@ Every change to BuffrX has to pass all five.
 
 ## Hotkeys
 
-| Key | Action |
-| :--- | :--- |
-| `Alt` + `1` | **Save clip**: the whole buffer |
-| `Ctrl` + `Alt` + `1` | **Quick clip**: just the last 20 seconds (you choose how long) |
-| `Alt` + `2` | **Screenshot** |
-| `Alt` + `3` | **Record**: press once to start, again to stop |
-| `Alt` + `4` | **Timeline** preview |
+<img width="797" height="307" alt="image" src="https://github.com/user-attachments/assets/8e3ce5ad-7117-4bd8-ad13-064ae43e73c6" />
 
 Every hotkey can be changed in Settings, and each one also works from a controller.
 
