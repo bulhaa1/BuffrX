@@ -1,19 +1,27 @@
 ﻿#include "update_feed.h"
 
+#ifdef _WIN32
 #include <windows.h>
 #include <winhttp.h>
+#else
+#include <curl/curl.h>
+#include "../linux/compat/windows.h"
+#endif
 
 #include <cstdlib>
 #include <algorithm>
 #include <string>
 
 #include "../shared/json.h"
+#ifdef _WIN32
 #include "update_http.h"
+#endif
 #include "update_math.h"
 
 namespace bx {
 namespace {
 
+#ifdef _WIN32
 std::wstring wide(const std::string& text) {
   if (text.empty()) return std::wstring();
   const int size = MultiByteToWideChar(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), nullptr, 0);
@@ -21,11 +29,13 @@ std::wstring wide(const std::string& text) {
   MultiByteToWideChar(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), out.data(), size);
   return out;
 }
+#endif
 
 // One GET into a string. False with `error` set when the request, the connection or the status fails.
 // `status` is 0 when the request never reached a server, which the caller reads as "no network".
-bool http_get(const std::string& url, int timeout_ms, ULONGLONG deadline, size_t max_bytes, std::string& body, DWORD& status,
-              std::string& error, const std::string& user_agent) {
+bool http_get(const std::string& url, int timeout_ms, ULONGLONG deadline, size_t max_bytes, std::string& body,
+              DWORD& status, std::string& error, const std::string& user_agent) {
+#ifdef _WIN32
   body.clear();
   status = 0;
   const std::wstring target = wide(url);
@@ -91,7 +101,79 @@ bool http_get(const std::string& url, int timeout_ms, ULONGLONG deadline, size_t
   }
   return true;
 }
-
+#else
+  (void)deadline;
+  body.clear();
+  status = 0;
+  // The feed is HTTPS; a probe may ask a loopback HTTP service. Nothing else is accepted.
+  if (url.rfind("https://", 0) != 0 && !is_loopback_url(url)) {
+    error = "not an https address";
+    return false;
+  }
+  CURL* curl = curl_easy_init();
+  if (!curl) {
+    error = "could not open the request";
+    return false;
+  }
+  const struct curl_slist* headers = nullptr;
+  struct curl_slist* list = curl_slist_append(nullptr, "Accept: application/vnd.github+json");
+  headers = list;
+  curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+  curl_easy_setopt(curl, CURLOPT_USERAGENT, user_agent.c_str());
+  curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, static_cast<long>(timeout_ms));
+  curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 0L);
+  curl_easy_setopt(curl, CURLOPT_HTTPHEADER, list);
+  size_t limit = max_bytes;
+  bool too_large = false;
+  curl_easy_setopt(curl, CURLOPT_WRITEDATA, &body);
+  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION,
+                   +[](char* data, size_t size, size_t count, void* user) -> size_t {
+                     size_t* remaining = static_cast<size_t*>(user);
+                     const size_t bytes = size * count;
+                     if (bytes > *remaining) return 0;
+                     *remaining -= bytes;
+                     return bytes;
+                   });
+  // WRITEDATA is the body; the limit pointer travels through it as well.
+  struct Sink {
+    std::string* body;
+    size_t* limit;
+  } sink{&body, &limit};
+  curl_easy_setopt(curl, CURLOPT_WRITEDATA, &sink);
+  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION,
+                   +[](char* data, size_t size, size_t count, void* user) -> size_t {
+                     auto* sink = static_cast<Sink*>(user);
+                     const size_t bytes = size * count;
+                     if (bytes > *sink->limit) {
+                       *sink->limit = 0;
+                       return 0;
+                     }
+                     *sink->limit -= bytes;
+                     sink->body->append(data, bytes);
+                     return bytes;
+                   });
+  const CURLcode code = curl_easy_perform(curl);
+  if (code == CURLE_WRITE_ERROR) too_large = limit == 0;
+  long http_status = 0;
+  curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_status);
+  curl_slist_free_all(list);
+  curl_easy_cleanup(curl);
+  if (code != CURLE_OK || too_large) {
+    error = too_large ? "the answer was too large" : "no answer";
+    return false;
+  }
+  status = static_cast<DWORD>(http_status);
+  if (status == 404) {
+    error = "no release published yet";
+    return false;
+  }
+  if (status != 200) {
+    error = "GitHub answered " + std::to_string(status);
+    return false;
+  }
+  return true;
+#endif
+}
 }  // namespace
 
 // Localhost only: a probe may point the attempt at a development service, and nothing else, so an

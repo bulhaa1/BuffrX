@@ -13,7 +13,9 @@
 // notification replaces the one on screen.
 #pragma once
 
+#ifdef _WIN32
 #include <windows.h>
+#endif
 
 #include <cstdint>
 #include <functional>
@@ -96,6 +98,7 @@ bool fullscreen_app_running();
 // falls, an alert is two flat pulses. `none` is an empty sound that is never played.
 const std::vector<uint8_t>& toast_chime_wav(ToastChime chime);
 
+#ifdef _WIN32
 class Toast {
 public:
   ~Toast();
@@ -143,5 +146,19 @@ private:
   bool leaving_ = false;
   bool fine_timer_ = false;  // timeBeginPeriod(1) is held: only while the card fades, so the fade steps every ~8 ms
 };
+
+#else
+class Toast {
+public:
+  ~Toast();
+  bool create(std::function<void()> on_click, const std::string& font_dir = std::string());
+  void destroy();
+  void show(ToastKind kind, const std::string& title, const std::string& detail, ToastChime chime, bool sound_enabled,
+            const ToastColors& colors, bool show_over_fullscreen = false, bool panel_in_front = false, bool compact = false,
+            bool capture_active = false, bool sound_while_capturing = true);
+private:
+  std::function<void()> on_click_;
+};
+#endif
 
 }  // namespace bx

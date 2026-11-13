@@ -9,7 +9,9 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
 #include <cstdio>
+#include <ctime>
 #include <mutex>
 #include <cstdlib>
 #include <cstring>
@@ -496,6 +498,49 @@ bool library_can_remove(const std::string& file) {
 }
 
 bool library_trash(const std::string& file) {
+#ifndef _WIN32
+  // The freedesktop Trash: the file moves to ~/.local/share/Trash/files with a .trashinfo record, so
+  // a delete stays undoable exactly as the Recycle Bin makes it on Windows.
+  if (!library_can_remove(file)) return false;
+  const char* home = std::getenv("HOME");
+  if (!home || !*home) return false;
+  const std::string base = std::string(home) + "/.local/share/Trash";
+  const std::string files_dir = base + "/files";
+  const std::string info_dir = base + "/info";
+  // CreateDirectoryA makes a missing parent chain, so the two folders the spec needs are enough.
+  CreateDirectoryA(base.c_str(), nullptr);
+  CreateDirectoryA(files_dir.c_str(), nullptr);
+  CreateDirectoryA(info_dir.c_str(), nullptr);
+  const std::string leaf = file.substr(file.find_last_of("/\\") + 1);
+  std::string target = files_dir + "/" + leaf;
+  for (int suffix = 1; access(target.c_str(), F_OK) == 0 && suffix < 1000; ++suffix) {
+    target = files_dir + "/" + leaf + "." + std::to_string(suffix);
+  }
+  if (rename(file.c_str(), target.c_str()) != 0) {
+    // One line, so a person's "it did not delete" has an answer in the log, as the Recycle Bin branch has.
+    BX_LOG_WARN("could not move a file to the Trash: %s -> %s (%s)", file.c_str(), target.c_str(), std::strerror(errno));
+    return false;
+  }
+  const std::string record = info_dir + "/" + target.substr(files_dir.size() + 1) + ".trashinfo";
+  FILE* info = std::fopen(record.c_str(), "wb");
+  if (info) {
+    // The freedesktop spec's local ISO 8601 timestamp, not a placeholder: a trash browser shows it as the deletion time.
+    char deleted[32] = "1970-01-01T00:00:00";
+    const std::time_t now = std::time(nullptr);
+    std::tm local{};
+    if (localtime_r(&now, &local)) std::strftime(deleted, sizeof(deleted), "%Y-%m-%dT%H:%M:%S", &local);
+    // The record names the file as the desktop filesystem spells it, so a trash browser restores it in place.
+    std::string record_path = file;
+    for (char& c : record_path) {
+      if (c == '\\') c = '/';
+    }
+    std::fprintf(info, "[Trash Info]\nPath=%s\nDeletionDate=%s\n", record_path.c_str(), deleted);
+    std::fclose(info);
+  }
+  delete_cached_images(file);
+  return true;
+#else
+
   if (!library_can_remove(file)) return false;
   // The shell item this goes through refuses a path that mixes the engine's two separators.
   const std::string native = bx::native_path(file);
@@ -541,6 +586,8 @@ bool library_trash(const std::string& file) {
   }
   delete_cached_images(file);
   return true;
+}
+#endif
 }
 
 void library_forget_cached_images(const std::string& file) {

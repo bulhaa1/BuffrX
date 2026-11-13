@@ -8,6 +8,10 @@
 // timeout instead, and a client that misses it is dropped.
 #pragma once
 
+#ifndef _WIN32
+#include "../linux/pipe_linux.h"
+#else
+
 #include <windows.h>
 
 #include <atomic>
@@ -672,3 +676,5 @@ private:
 };
 
 }  // namespace bx
+
+#endif  // _WIN32

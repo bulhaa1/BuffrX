@@ -198,6 +198,7 @@ AVPixelFormat decoder_software_format(AVCodecContext* context) {
 // The pixel format an encoder takes: NV12 (what GPU encoders want) or 4:2:0 planar (x264), whichever
 // it lists first.
 AVPixelFormat encoder_pixel_format(AVCodecContext* context, const AVCodec* codec) {
+#if LIBAVCODEC_VERSION_MAJOR >= 61
   const void* formats = nullptr;
   int count = 0;
   if (avcodec_get_supported_config(context, codec, AV_CODEC_CONFIG_PIX_FORMAT, 0, &formats, &count) >= 0 && formats) {
@@ -206,6 +207,12 @@ AVPixelFormat encoder_pixel_format(AVCodecContext* context, const AVCodec* codec
       if (list[i] == AV_PIX_FMT_NV12 || list[i] == AV_PIX_FMT_YUV420P) return list[i];
     }
   }
+#else
+  // FFmpeg 6 and older expose the encoder's list directly. Still present in 7 as a deprecated field.
+  for (const AVPixelFormat* format = codec->pix_fmts; format && *format != AV_PIX_FMT_NONE; ++format) {
+    if (*format == AV_PIX_FMT_NV12 || *format == AV_PIX_FMT_YUV420P) return *format;
+  }
+#endif
   return AV_PIX_FMT_YUV420P;
 }
 

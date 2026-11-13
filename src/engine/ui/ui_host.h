@@ -6,6 +6,10 @@
 // work and no texture memory (AGENTS.md: nothing drawn while no window is open).
 #pragma once
 
+#ifndef _WIN32
+#include "ui_host_linux.h"
+#else
+
 #include <windows.h>
 
 #include <array>
@@ -289,3 +293,5 @@ private:
 };
 
 }  // namespace bx::ui
+
+#endif  // _WIN32

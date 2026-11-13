@@ -23,6 +23,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <sys/stat.h>
 #include <fstream>
 #include <map>
 #include <mutex>
@@ -56,8 +57,20 @@
 #include "screenshot.h"
 #include "timeline_pins.h"
 
+#ifndef _WIN32
+#include "../linux/display_linux.h"
+#endif
+
 // Live level meters: volmeters report peak and RMS dB from the audio thread.
 #include <obs-audio-controls.h>
+
+#if LIBOBS_API_MAJOR_VER >= 33
+#define BX_ENCODER_FRAMES(encoder) obs_encoder_get_encoded_frames(encoder)
+#else
+// libobs 30's public API does not expose the encoder's running frame count. The status keeps the
+// output's own count instead; the picture and the buffer are unaffected.
+#define BX_ENCODER_FRAMES(encoder) static_cast<uint64_t>(obs_get_total_frames())
+#endif
 
 namespace bx {
 namespace {
@@ -75,6 +88,16 @@ std::string capacity_key_for(const Config& config) {
 // clip came out with a silent AAC track. Channel 0 is the capture scene.
 constexpr uint32_t kDesktopViewChannel = 1;
 constexpr uint32_t kMicViewChannel = 2;
+
+// The capture plugin and its two source ids differ by platform; everything above this line is the
+// same graph either way.
+#ifdef _WIN32
+constexpr const char* kDesktopCaptureSource = "wasapi_output_capture";
+constexpr const char* kMicCaptureSource = "wasapi_input_capture";
+#else
+constexpr const char* kDesktopCaptureSource = "pulse_output_capture";
+constexpr const char* kMicCaptureSource = "pulse_input_capture";
+#endif
 
 // Defined further down; a recording that wrote no byte at all leaves nothing to keep.
 int64_t file_size_now(const std::string& file);
@@ -172,6 +195,7 @@ std::string slashify(const std::string& path) {
 
 
 bool primary_monitor_size(int& width, int& height) {
+#ifdef _WIN32
   struct Lookup {
     int width = 0;
     int height = 0;
@@ -194,11 +218,15 @@ bool primary_monitor_size(int& width, int& height) {
   width = lookup.width;
   height = lookup.height;
   return lookup.found;
+#else
+  return linux_primary_size(width, height);
+#endif
 }
 
 // Every monitor the desktop has right now, in EnumDisplayMonitors order (the order libobs's monitor
 // list uses).
 std::vector<DisplayInfo> enumerate_displays() {
+#ifdef _WIN32
   std::vector<DisplayInfo> list;
   EnumDisplayMonitors(
       nullptr, nullptr,
@@ -221,6 +249,9 @@ std::vector<DisplayInfo> enumerate_displays() {
       },
       reinterpret_cast<LPARAM>(&list));
   return list;
+#else
+  return linux_displays();
+#endif
 }
 
 // The GDI device name (\\.\DISPLAY1) of the configured display: by name when the config carries one,
@@ -243,11 +274,15 @@ std::string monitor_device_name(const Config& config, std::string* warned = null
 
 // The refresh rate the capture's display is running at right now, 0 when it cannot be read.
 int display_refresh_hz(const Config& config) {
+#ifdef _WIN32
   const std::string device = monitor_device_name(config);
   DEVMODEA mode{};
   mode.dmSize = sizeof(mode);
   if (device.empty() || !EnumDisplaySettingsA(device.c_str(), ENUM_CURRENT_SETTINGS, &mode)) return 0;
   return mode.dmDisplayFrequency > 1 ? static_cast<int>(mode.dmDisplayFrequency) : 0;
+#else
+  return linux_display_refresh_hz(config.display_id, monitor_device_name(config));
+#endif
 }
 
 // The window_capture and game_capture sources identify a window as "title:class:exe" (see
@@ -264,6 +299,7 @@ bool win32_target_size(const Config& config, int& width, int& height) {
   if (!wanted.empty() && find_window_size(wanted, width, height)) return true;
 
   if (config.capture_mode == "display") {
+#ifdef _WIN32
     const std::string device = monitor_device_name(config);
     DEVMODEA mode{};
     mode.dmSize = sizeof(mode);
@@ -271,6 +307,17 @@ bool win32_target_size(const Config& config, int& width, int& height) {
     width = static_cast<int>(mode.dmPelsWidth);
     height = static_cast<int>(mode.dmPelsHeight);
     return true;
+#else
+    const DisplayPick pick = pick_display(enumerate_displays(), config.display_id, config.display_name);
+    if (!pick.found) return false;
+    for (const DisplayInfo& display : enumerate_displays()) {
+      if (display.id != pick.id) continue;
+      width = display.width;
+      height = display.height;
+      return width > 0 && height > 0;
+    }
+    return false;
+#endif
   }
   // A window or game target that is not running yet: the primary monitor is the honest guess.
   return primary_monitor_size(width, height);
@@ -445,6 +492,7 @@ bool ObsHost::initialize(const std::string& runtime_root, const std::string& dat
 bool ObsHost::start_obs(std::string& error) {
   // The package keeps the OBS binaries in bin/64bit, which the Windows loader does not search by
   // default: tell it once, before anything loads a DLL from there.
+#ifdef _WIN32
   const std::string binaries = runtime_root_ + "\\bin\\64bit";
   SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS | LOAD_LIBRARY_SEARCH_USER_DIRS);
   const std::wstring wide = wide_path(binaries);
@@ -453,8 +501,17 @@ bool ObsHost::start_obs(std::string& error) {
   // Vulkan layer as "..\..\data\obs-plugins\win-capture\" relative to the working directory. Launched
   // from anywhere else, game capture had no hook to inject and could never capture a game.
   SetCurrentDirectoryW(wide.c_str());
+#else
+  (void)runtime_root_;
+#endif
 
   const std::string module_config = slashify(data_root_);
+#ifndef _WIN32
+  // The Ubuntu obs-ffmpeg build hardcodes its muxer helper's path (the package patches an absolute
+  // path into the plugin). The shimmed copy points at /tmp, where the engine puts a fresh helper.
+  const std::string helper = std::string(runtime_root_) + "/obs-ffmpeg-mux";
+  if (CopyFileA(helper.c_str(), "/tmp/buffrx-obs-ffmpeg-mux", FALSE)) chmod("/tmp/buffrx-obs-ffmpeg-mux", 0755);
+#endif
   if (!obs_startup("en-US", module_config.c_str(), nullptr)) {
     error = "libobs failed to start";
     return false;
@@ -490,6 +547,7 @@ bool ObsHost::load_modules(std::string& error) {
     const char* name;
     bool required;
   };
+#ifdef _WIN32
   const Module modules[] = {
       {"win-capture", true},  {"win-wasapi", true},   {"obs-ffmpeg", true},  {"obs-nvenc", false},
       {"obs-qsv11", false},    {"obs-x264", false},    {"obs-filters", false}, {"image-source", false},
@@ -497,6 +555,15 @@ bool ObsHost::load_modules(std::string& error) {
   for (const auto& module : modules) {
     const std::string binary = slashify(runtime_root_ + "\\obs-plugins\\64bit\\" + module.name + ".dll");
     const std::string data = slashify(runtime_root_ + "\\data\\obs-plugins\\" + module.name + "\\");
+#else
+  const Module modules[] = {
+      {"linux-capture", true}, {"linux-pulseaudio", true}, {"obs-ffmpeg", true}, {"obs-outputs", true},
+      {"obs-x264", false},     {"obs-filters", false},     {"image-source", false},
+  };
+  for (const auto& module : modules) {
+    const std::string binary = slashify(runtime_root_ + "/obs-plugins/" + module.name + ".so");
+    const std::string data = slashify(runtime_root_ + "/data/obs-plugins/" + module.name + "/");
+#endif
     if (GetFileAttributesA(binary.c_str()) == INVALID_FILE_ATTRIBUTES) {
       if (module.required) {
         error = std::string("required module missing from the package: ") + module.name;
@@ -597,7 +664,11 @@ bool ObsHost::configure_video(const Config& requested, std::string& error) {
       {1280, 720, 1280, 720, 30, VIDEO_FORMAT_NV12, false, "720p30 compatibility"},
   };
 
+#ifdef _WIN32
   const std::string graphics = slashify(runtime_root_ + "\\bin\\64bit\\libobs-d3d11.dll");
+#else
+  const std::string graphics = slashify(runtime_root_ + "/libobs/libobs-opengl.so");
+#endif
 
   // How much memory the machine has left. libobs allocates the graphics device and the frame pool
   // inside obs_reset_video, and when the machine cannot give it, it does not return an error - it
@@ -627,12 +698,20 @@ bool ObsHost::configure_video(const Config& requested, std::string& error) {
 
   // The adapter: the one a display capture's display hangs off, else the card with the most memory (gpu.h).
   // Adapter 0 is tried after it if libobs refuses the choice, so this can only help a machine that works.
+#ifdef _WIN32
   const std::vector<GpuAdapterInfo> adapters = gpu_adapters();
   const int chosen_adapter = pick_gpu_adapter(adapters, config.capture_mode == "display" ? monitor_device_name(config, &display_warned_name_) : std::string());
   if (adapters.size() > 1) BX_LOG_INFO("%zu graphics adapters; using adapter %d", adapters.size(), chosen_adapter);
   std::vector<int> adapter_order = {chosen_adapter};
   if (chosen_adapter != 0) adapter_order.push_back(0);
+#else
+  // libobs's OpenGL backend has no adapter index to choose; the driver's default is the one OBS uses.
+  std::vector<int> adapter_order = {0};
+#endif
 
+#ifndef _WIN32
+  BX_LOG_INFO("graphics module: %s", graphics.c_str());
+#endif
   int last_code = 0;
   for (const int adapter_index : adapter_order)
   for (const Variant& variant : variants) {
@@ -665,7 +744,11 @@ bool ObsHost::configure_video(const Config& requested, std::string& error) {
     }
     BX_LOG_WARN("video variant '%s' refused (code %d)", variant.label, last_code);
   }
+  #ifdef _WIN32
   error = "video initialisation failed (D3D11), code " + std::to_string(last_code);
+#else
+  error = "video initialisation failed (OpenGL), code " + std::to_string(last_code);
+#endif
   return false;
 }
 
@@ -697,6 +780,7 @@ bool ObsHost::configure_capture(const Config& requested, std::string& error, boo
 
   game_fallback_ = window_fallback;
   capture_created_ms_ = GetTickCount();
+#ifdef _WIN32
   if (config.capture_mode == "game" && window_fallback && !config.game_title.empty()) {
     // The game hook delivered nothing (anti-cheat, a renderer the hook does not know, a protected
     // process): capture the same window through Windows Graphics Capture, which needs no injection.
@@ -741,6 +825,27 @@ bool ObsHost::configure_capture(const Config& requested, std::string& error, boo
     obs_data_set_bool(settings, "capture_cursor", config.capture_cursor);
     target = config.display_name.empty() ? "display" : config.display_name;
   }
+#else
+  if (config.capture_mode == "display" || (config.capture_mode == "game" && config.game_title.empty())) {
+    // The X11 SHM screen capture. Its "screen" is the Xinerama screen index, which is the same order
+    // the display picker uses; the monitor's device name is kept for the log and the config only.
+    source_id = "xshm_input";
+    obs_data_set_int(settings, "screen", config.display_id);
+    obs_data_set_bool(settings, "show_cursor", config.capture_cursor);
+    target = config.display_name.empty() ? "display" : config.display_name;
+  } else {
+    // XComposite captures one window by its title (the first part of the picker's id). A game and a
+    // window are the same thing on Linux: OBS has no injection-based game hook here.
+    source_id = "xcomposite_input";
+    std::string title = config.capture_mode == "window"
+                            ? (config.window_name.empty() ? decode_window_part(config.window_id.substr(0, config.window_id.find(':')))
+                                                          : config.window_name)
+                            : decode_window_part(config.game_title.substr(0, config.game_title.find(':')));
+    obs_data_set_string(settings, "capture_window", title.c_str());
+    obs_data_set_bool(settings, "show_cursor", config.capture_cursor);
+    target = title.empty() ? "window" : title;
+  }
+#endif
 
   capture_ = obs_source_create(source_id, "BuffrX capture", settings, nullptr);
   obs_data_release(settings);
@@ -1091,11 +1196,11 @@ bool ObsHost::configure_audio(const Config& config) {
   if (config.separate_tracks) mic_mixers |= 1u << 2;      // track 3: microphone alone
 
   const double mic_gain = std::pow(10.0, config.mic_gain_db / 20.0);
-  update_audio_channel(desktop_, &desktop_volmeter_, &desktop_level_db_, desktop_device_, "wasapi_output_capture",
+  update_audio_channel(desktop_, &desktop_volmeter_, &desktop_level_db_, desktop_device_, kDesktopCaptureSource,
                        "Desktop audio", config.desktop_device.empty() ? "default" : config.desktop_device.c_str(),
                        static_cast<float>(config.desktop_volume), config.desktop_muted, desktop_mixers,
                        config.desktop_enabled, kDesktopViewChannel);
-  update_audio_channel(mic_, &mic_volmeter_, &mic_level_db_, mic_device_, "wasapi_input_capture", "Microphone",
+  update_audio_channel(mic_, &mic_volmeter_, &mic_level_db_, mic_device_, kMicCaptureSource, "Microphone",
                        config.mic_device.empty() ? "default" : config.mic_device.c_str(),
                        static_cast<float>(config.mic_volume * mic_gain), config.mic_muted, mic_mixers,
                        config.mic_enabled, kMicViewChannel);
@@ -3131,6 +3236,7 @@ namespace {
 // and it cannot be produced any other way on demand. On a thread of its own that only sleeps between the suspend
 // and the resume: the suspended thread may hold a lock everything else needs, and the resume must not wait for it.
 void start_test_freeze() {
+#ifdef _WIN32
   char text[64] = {0};
   if (GetEnvironmentVariableA("BUFFRX_TEST_FREEZE_VIDEO", text, sizeof(text)) == 0) return;
   char* end = nullptr;
@@ -3170,6 +3276,9 @@ void start_test_freeze() {
     CloseHandle(graphics);
     BX_LOG_WARN("test freeze: the graphics thread runs again");
   }).detach();
+#else
+  // A probe of the Windows thread-suspension path; there is no equivalent Linux need for it.
+#endif
 }
 
 }  // namespace
@@ -3505,7 +3614,7 @@ void ObsHost::tick() {
 void ObsHost::watch_encoder(uint32_t now_ms) {
   if (!video_encoder_) return;
   const bool changed = buffrx::encoder_watch_feed(encoder_watch_, now_ms, obs_get_total_frames(),
-                                                  obs_encoder_get_encoded_frames(video_encoder_),
+                                                  BX_ENCODER_FRAMES(video_encoder_),
                                                   obs_encoder_active(video_encoder_));
   // The relief ladder runs in every effort, Maximum included (decided with the user, 2026-11-05): a person must never
   // be left with a clip missing frames. It is a layer over the stored settings and never rewrites them.
@@ -3583,7 +3692,7 @@ EngineStats ObsHost::stats() const {
   stats.video_lagged = obs_get_lagged_frames();
   stats.render_time_ms = static_cast<double>(obs_get_average_frame_time_ns()) / 1000000.0;
   stats.active_fps = obs_get_active_fps();
-  if (video_encoder_) stats.encoder_frames = obs_encoder_get_encoded_frames(video_encoder_);
+  if (video_encoder_) stats.encoder_frames = BX_ENCODER_FRAMES(video_encoder_);
   if (replay_) {
     stats.total_frames = obs_output_get_total_frames(replay_);
     stats.total_bytes = static_cast<uint64_t>(obs_output_get_total_bytes(replay_));
@@ -3836,7 +3945,7 @@ std::vector<AudioDeviceInfo> ObsHost::audio_devices(bool inputs) {
   // that task runs is installed after it was freed. The audio thread then reads it every tick and
   // faults in obs.dll (+0x443e, should_silence_monitored_source) once the heap reuses the memory.
   obs_properties_t* properties =
-      obs_get_source_properties(inputs ? "wasapi_input_capture" : "wasapi_output_capture");
+      obs_get_source_properties(inputs ? kMicCaptureSource : kDesktopCaptureSource);
   obs_property_t* property = properties ? obs_properties_get(properties, "device_id") : nullptr;
   if (property) {
     const size_t count = obs_property_list_item_count(property);
@@ -4225,6 +4334,7 @@ namespace {
 // A fresh handle sees the true size of a file another process is still writing; the directory entry
 // keeps saying zero until the writer closes it, which is why the listing must ask the file itself.
 int64_t file_size_now(const std::string& file) {
+#ifdef _WIN32
   HANDLE handle = CreateFileA(file.c_str(), FILE_READ_ATTRIBUTES,
                               FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
                               FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -4233,6 +4343,10 @@ int64_t file_size_now(const std::string& file) {
   const bool ok = GetFileSizeEx(handle, &size) != 0;
   CloseHandle(handle);
   return ok ? size.QuadPart : 0;
+#else
+  struct stat st{};
+  return stat(file.c_str(), &st) == 0 ? static_cast<int64_t>(st.st_size) : 0;
+#endif
 }
 }  // namespace
 

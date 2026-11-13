@@ -149,6 +149,41 @@ for connections except the sharing helper, and only while a BuffrX link you made
 
 ---
 
+## Linux (AppImage)
+
+The source now builds a native Linux application: the same engine (libobs 30, X11 capture, VAAPI/x264,
+PulseAudio, the replay ring and the library), the Dear ImGui panel drawn with OpenGL, and the Tauri
+editor running in WebKitGTK. It is packaged as a single AppImage.
+
+Build it on Ubuntu 24.04 (or a current Debian/Mint):
+
+```bash
+sudo apt install build-essential cmake pkg-config libgtk-3-dev libx11-dev libxrandr-dev \
+  libavformat-dev libavcodec-dev libavutil-dev libswscale-dev libswresample-dev libavfilter-dev \
+  libcurl4-openssl-dev libssl-dev libwebkit2gtk-4.1-0
+tools/bootstrap-linux.sh        # OBS packages, ImGui/GLFW/stb, fonts, Rust, Node, WebKit .pc files
+export RUSTUP_HOME="$PWD/work/rustup" CARGO_HOME="$PWD/work/cargo"
+export PATH="$PWD/work/cargo/bin:$PWD/work/toolchain-linux/node-v22.14.0-linux-x64/bin:$PATH"
+cmake -S linux -B build-linux && cmake --build build-linux -j8
+(cd ui && npm_config_script_shell=/bin/bash npm install --package-lock=false && npm run build)
+(cd src-tauri && PKG_CONFIG_PATH="$PWD/../work/linux-ui/pkgconfig" \
+  LIBRARY_PATH="$PWD/../work/linux-ui/lib" cargo build --release)
+tools/package-linux.sh          # -> dist/BuffrX-<version>-x86_64.AppImage
+```
+
+Run it with `./dist/BuffrX-0.5.0-x86_64.AppImage`, or pass `--show`. The panel, global hotkeys
+(Alt+1 save, Alt+2 screenshot, Alt+3 record, Alt+X toggle, Alt+4 Timeline), the tray menu, recording,
+screenshots, the library and the editor with video preview work. The AppImage needs the system's
+GTK 3 and WebKitGTK 4.1 for the editor, and a H.264-capable GStreamer for its `<video>` player (both
+are present on a normal Ubuntu/Mint desktop).
+
+Not yet ported: the share sheet's fit/upload jobs, BuffrX app-to-app links and Discord posting are
+reported as unavailable; controller hotkeys need XInput and are inactive; game capture uses XComposite
+window capture (there is no game-hook injection on Linux), and automatic fullscreen-game detection is
+off by default. The panel, capture, clips and editor are the working core.
+
+---
+
 ## Install
 
 1. Open the [latest release](https://github.com/bulhaa1/BuffrX/releases/latest) and download

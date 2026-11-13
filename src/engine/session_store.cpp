@@ -70,12 +70,20 @@ bool ensure_directory(const std::string& path) {
 // exists. Anything else is how a session ends up written outside the library.
 bool root_is_usable(const std::string& root) {
   if (root.size() < 4) return false;
+#ifdef _WIN32
   const bool drive_path = root[1] == ':' && (root[2] == '\\' || root[2] == '/');
   const bool unc_path = root.rfind("\\\\", 0) == 0;
   if (!drive_path && !unc_path) return false;
   const size_t slash = root.find_last_of("\\/");
   if (slash == std::string::npos || slash < 2) return false;
   return directory_exists(root.substr(0, slash));
+#else
+  // A Linux root is absolute: /home/... . Its parent must exist before the store creates one level.
+  if (root[0] != '/') return false;
+  const size_t slash = root.find_last_of('/');
+  if (slash == std::string::npos || slash < 1) return false;
+  return directory_exists(root.substr(0, slash));
+#endif
 }
 
 // The root counts as ready only once it exists: `session_store_init` creates it one level under its
