@@ -1,0 +1,152 @@
+name: PR checks
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-checks-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      editor: ${{ steps.paths.outputs.editor }}
+      native: ${{ steps.paths.outputs.native }}
+      build: ${{ steps.paths.outputs.build }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: paths
+        shell: pwsh
+        run: |
+          $event = Get-Content $env:GITHUB_EVENT_PATH -Raw | ConvertFrom-Json
+          $base = if ($event.pull_request) { $event.pull_request.base.sha } else { $event.before }
+          $editor = $false; $native = $false; $build = $false
+          if (-not $base -or $base -match '^0+$') {
+            $editor = $true; $native = $true; $build = $true
+          } else {
+            $files = @(git diff --name-only $base HEAD)
+            if ($LASTEXITCODE -ne 0) { throw 'Cannot determine changed files.' }
+            foreach ($file in $files) {
+              if ($file -match '^ui/') { $editor = $true; $build = $true }
+              elseif ($file -match '^docs/protocol\.md$') { $native = $true }
+              elseif ($file -match '\.md$|^\.github/(ISSUE_TEMPLATE/|PULL_REQUEST_TEMPLATE\.md$)') { continue }
+              elseif ($file -match '^(src/|tests/|src-tauri/|src-share/|tools/|CMakeLists\.txt$|assets/|brand/)') {
+                $native = $true; $build = $true
+              } else { $editor = $true; $native = $true; $build = $true }
+            }
+          }
+          "editor=$($editor.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+          "native=$($native.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+          "build=$($build.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+
+  docs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - shell: pwsh
+        run: ./tools/verify.ps1 -Area Docs
+
+  editor:
+    needs: changes
+    if: needs.changes.outputs.editor == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      - run: npm ci --prefix ui
+      - shell: pwsh
+        run: ./tools/verify.ps1 -Area Editor
+
+  native:
+    needs: changes
+    if: needs.changes.outputs.native == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: work/toolchain
+          key: minimal-${{ runner.os }}-${{ hashFiles('tools/bootstrap-toolchain.ps1') }}
+      - shell: powershell
+        run: ./tools/bootstrap-toolchain.ps1 -Minimal
+      - shell: powershell
+        run: ./tools/verify.ps1 -Area Native
+
+  build:
+    needs: changes
+    if: needs.changes.outputs.build == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            work/toolchain
+            work/cargo/registry
+          key: full-${{ runner.os }}-${{ hashFiles('tools/bootstrap-toolchain.ps1', 'tools/bootstrap-rust.ps1', '**/Cargo.lock') }}
+      - shell: powershell
+        run: |
+          ./tools/bootstrap-toolchain.ps1
+          ./tools/bootstrap-rust.ps1
+          ./tools/prepare-runtime.ps1
+          ./tools/prepare-headers.ps1
+      - run: npm ci --prefix ui
+      - shell: powershell
+        run: ./tools/verify.ps1 -Area Build
+
+  pr-gate:
+    if: always()
+    needs: [changes, docs, editor, native, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      CHANGES: ${{ needs.changes.result }}
+      DOCS: ${{ needs.docs.result }}
+      EDITOR_REQUIRED: ${{ needs.changes.outputs.editor }}
+      NATIVE_REQUIRED: ${{ needs.changes.outputs.native }}
+      BUILD_REQUIRED: ${{ needs.changes.outputs.build }}
+      EDITOR: ${{ needs.editor.result }}
+      NATIVE: ${{ needs.native.result }}
+      BUILD: ${{ needs.build.result }}
+    steps:
+      - shell: pwsh
+        run: |
+          if ($env:CHANGES -ne 'success' -or $env:DOCS -ne 'success') { throw 'Required setup/docs job failed.' }
+          foreach ($area in @('EDITOR', 'NATIVE', 'BUILD')) {
+            $required = [Environment]::GetEnvironmentVariable("${area}_REQUIRED")
+            $result = [Environment]::GetEnvironmentVariable($area)
+            if ($required -notin @('true', 'false')) { throw "Missing route for $area" }
+            if ($required -eq 'true' -and $result -ne 'success') { throw "$area checks did not pass: $result" }
+            if ($required -eq 'false' -and $result -notin @('skipped', 'success')) { throw "Unexpected $area result: $result" }
+          }

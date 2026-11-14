@@ -1,0 +1,15 @@
+name: Feature request
+description: Suggest a feature or explore an idea.
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What would this help you do?
+      description: Describe the problem or workflow. An example helps.
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: Your idea (optional)
+      description: How could BuffrX help? Mention alternatives you have tried.

@@ -12,9 +12,13 @@
 cmake_minimum_required(VERSION 3.20)
 project(BuffrX CXX)
 
+option(BUFFRX_TESTS_ONLY "Build native logic checks without OBS or product assets" OFF)
+
 # Resources (the engine manifest) are compiled by the toolchain's own llvm-windres; tools/build.ps1
 # passes it as CMAKE_RC_COMPILER.
-enable_language(RC)
+if(NOT BUFFRX_TESTS_ONLY)
+  enable_language(RC)
+endif()
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -29,7 +33,7 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 set(BUFFRX_RUNTIME "${CMAKE_SOURCE_DIR}/runtime" CACHE PATH "Staged OBS runtime (bin, data, modules, lib)")
-if(NOT EXISTS "${BUFFRX_RUNTIME}/bin/64bit/obs.dll")
+if(NOT BUFFRX_TESTS_ONLY AND NOT EXISTS "${BUFFRX_RUNTIME}/bin/64bit/obs.dll")
   message(FATAL_ERROR "runtime/ is not staged. Run tools/prepare-runtime.ps1 first.")
 endif()
 
@@ -42,6 +46,7 @@ set(BUFFRX_SHARED_SOURCES
   src/shared/pipe.h
 )
 
+if(NOT BUFFRX_TESTS_ONLY)
 # ---------------------------------------------------------------- interface library
 # Dear ImGui (MIT, pinned by tools/bootstrap-toolchain.ps1): the engine's own interface is drawn with
 # it, in-process. Third-party code, compiled without our warnings.
@@ -165,6 +170,8 @@ endif()
 add_executable(buffrx-present-loop src/tools/present_loop.cpp)
 target_link_libraries(buffrx-present-loop PRIVATE d3d11 dxgi user32)
 
+endif()
+
 # ---------------------------------------------------------------- tests
 # The pure logic only: config, JSON, hotkey chords and library guards. No libobs, no GPU, no window,
 # so this target runs anywhere and guards the units a refactor is most likely to break.
@@ -213,6 +220,15 @@ target_include_directories(buffrx-tests PRIVATE "${CMAKE_SOURCE_DIR}/src")
 # The tests read ui/src/themes.css to hold the editor page to the engine's theme table.
 target_compile_definitions(buffrx-tests PRIVATE BUFFRX_SOURCE_DIR="${CMAKE_SOURCE_DIR}" BUFFRX_TEST_HOOKS)
 target_link_libraries(buffrx-tests PRIVATE user32 gdi32 shell32 advapi32 ole32 comdlg32 wtsapi32 dxgi d2d1 dwrite winmm crypt32 bcrypt winhttp)
+
+enable_testing()
+add_test(NAME buffrx-tests COMMAND buffrx-tests)
+set_tests_properties(buffrx-tests PROPERTIES TIMEOUT 180)
+if(BUFFRX_TESTS_ONLY)
+  # This target links no OBS; static toolchain libraries keep its run independent of runtime/.
+  target_link_options(buffrx-tests PRIVATE -static)
+  return()
+endif()
 
 # The mutation harness (N4): the same units, fed mutated bytes. Test-only, never packaged.
 add_executable(buffrx-fuzz tests/buffrx_fuzz.cpp ${BUFFRX_TEST_SOURCES})

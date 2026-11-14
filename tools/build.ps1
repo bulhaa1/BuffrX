@@ -1,4 +1,4 @@
-﻿# Builds BuffrX with the pinned toolchain. One entry point for humans and CI:
+# Builds BuffrX with the pinned toolchain. One entry point for humans and CI:
 #   powershell -File tools/build.ps1            # configure + build everything staged
 #   powershell -File tools/build.ps1 -Target buffrx-engine
 #
@@ -26,6 +26,13 @@ function Invoke-Step([string]$label, [scriptblock]$action) {
   Write-Host "== $label"
   & $action
   if ($LASTEXITCODE -ne 0 -and $null -ne $LASTEXITCODE) { throw "$label failed with exit code $LASTEXITCODE" }
+}
+
+function Copy-IfChanged([string]$source, [string]$target) {
+  # A development process may have an unchanged runtime DLL loaded. Leave it in place.
+  if ((Test-Path -LiteralPath $target) -and
+      (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash -eq (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash) { return }
+  Copy-Item -LiteralPath $source -Destination $target -Force
 }
 
 Invoke-Step 'configure' {
@@ -91,7 +98,7 @@ Write-Host "interface fonts staged"
 
 if ($ConfigureOnly) { return }
 
-if ($Target -ne 'buffrx-ui') {
+if ($Target -notin @('buffrx-ui', 'buffrx-share')) {
   $buildArgs = @('--build', (Join-Path $root 'build'))
   if ($Target) { $buildArgs += @('--target', $Target) }
   Invoke-Step 'build' { & $paths.cmake @buildArgs }
@@ -99,11 +106,20 @@ if ($Target -ne 'buffrx-ui') {
 
 # Build the Tauri shell (Rust). It replaces the old C++ WebView2 host; the binary keeps the
 # same name so the package layout and the launcher keep working.
+if (-not $Target -or $Target -in @('buffrx-ui', 'buffrx-share')) {
 $cargoHome = Join-Path $root 'work\cargo'
 $rustupHome = Join-Path $root 'work\rustup'
 $mingwBin = $paths.llvm_bin
 $env:RUSTUP_HOME = $rustupHome
 $env:CARGO_HOME = $cargoHome
+$rustManifest = Join-Path $root 'work\rust-toolchain.json'
+if (-not (Test-Path $rustManifest) -or -not (Test-Path (Join-Path $cargoHome 'bin\cargo.exe'))) { throw 'Run: powershell -File tools/bootstrap-rust.ps1' }
+$rust = Get-Content -LiteralPath $rustManifest -Raw | ConvertFrom-Json
+$env:RUSTUP_TOOLCHAIN = $rust.toolchain
+$compiler = Join-Path $rustupHome "toolchains\$($rust.toolchain)\bin\rustc.exe"
+if (-not (Test-Path $compiler)) { throw 'Rust toolchain missing. Run: powershell -File tools/bootstrap-rust.ps1' }
+$compilerVersion = & $compiler --version
+if ($LASTEXITCODE -ne 0 -or -not $compilerVersion.StartsWith("rustc $($rust.version) ")) { throw 'Rust version changed. Run: powershell -File tools/bootstrap-rust.ps1' }
 $env:BUFFRX_LLVM_RC = Join-Path $paths.llvm_bin 'llvm-rc.exe'
 $env:RC = Join-Path $paths.llvm_bin 'llvm-rc.exe'
 $env:PATH = (Join-Path $cargoHome 'bin') + ';' + $mingwBin + ';' + $env:PATH
@@ -113,6 +129,8 @@ $env:RUSTFLAGS = (@($env:RUSTFLAGS, "--remap-path-prefix=$root=.") -join ' ').Tr
 # The page is embedded into the shell when main.rs is compiled, and cargo does not notice that ui/dist changed: a shell built
 # after a page change carried the old page (the viewer ran the editor's bundle and never got to its first frame). Touching
 # main.rs makes cargo embed what is in ui/dist now.
+if (-not $Target -or $Target -eq 'buffrx-ui') {
+if (-not (Test-Path (Join-Path $root 'ui\dist\index.html'))) { throw 'Build the editor page first: npm ci --prefix ui, then npm --prefix ui run build' }
 $shellExe = Join-Path $root 'src-tauri\target\release\buffrx-ui.exe'
 $pageFiles = Get-ChildItem (Join-Path $root 'ui\dist') -Recurse -File -ErrorAction SilentlyContinue
 if (-not (Test-Path $shellExe) -or ($pageFiles | Where-Object { $_.LastWriteTime -gt (Get-Item $shellExe).LastWriteTime })) {
@@ -125,22 +143,30 @@ Invoke-Step 'cargo build (tauri shell)' {
 }
 # Stage the rust binary into build/ so the normal staging loop picks it up.
 Copy-Item -LiteralPath (Join-Path $root 'src-tauri\target\release\buffrx-ui.exe') -Destination (Join-Path $root 'build\buffrx-ui.exe') -Force
+}
 
 # The sharing helper (BuffrX links, src-share): iroh over QUIC, started by the engine only while a link
 # is live or a clip is arriving. Its crates are pinned by src-share/Cargo.lock.
+if (-not $Target -or $Target -eq 'buffrx-share') {
 Invoke-Step 'cargo build (sharing helper)' {
   Push-Location (Join-Path $root 'src-share')
   try { & (Join-Path $cargoHome 'bin\cargo.exe') build --release --locked }
   finally { Pop-Location }
 }
 Copy-Item -LiteralPath (Join-Path $root 'src-share\target\release\buffrx-share.exe') -Destination (Join-Path $root 'build\buffrx-share.exe') -Force
+}
 # Notices for the helper's crates (MIT, Apache and BSD require them to ship), and the GPL text the OBS release keeps
 # under data (it has no COPYING at its root, so prepare-runtime.ps1 never staged one).
+if (-not $Target -or $Target -eq 'buffrx-share') {
 & (Join-Path $PSScriptRoot 'rust-licenses.ps1') -CargoHome $cargoHome
+}
+if (-not $Target -or $Target -eq 'buffrx-ui') {
 & (Join-Path $PSScriptRoot 'rust-licenses.ps1') -CargoHome $cargoHome -Manifest 'src-tauri' `
   -Out (Join-Path $root 'runtime\licenses\buffrx-editor-THIRD-PARTY.txt') `
   -Title 'BuffrX editor (buffrx-ui.exe): third-party Rust crates'
 & node (Join-Path $PSScriptRoot 'ui-licenses.mjs')
+}
+}
 Copy-Item -LiteralPath (Join-Path $root 'work\obs\official\data\obs-studio\license\gplv2.txt') -Destination (Join-Path $root 'runtime\licenses\OBS-GPL-2.0.txt') -Force
 
 # Ship the C++ runtime beside the binaries: both the build directory (for local runs) and the
@@ -150,10 +176,11 @@ $runtimeDlls = Get-ChildItem -LiteralPath (Resolve-Path $mingwBin).Path -Filter 
   Where-Object { $_.Name -match '^(libc\+\+|libunwind|libwinpthread)\.dll$' }
 # The Rust shell is linked against the gnullvm target and needs libunwind at runtime; the MinGW
 # runtime DLLs above already cover it.
-$destinations = @((Join-Path $root 'build'), (Join-Path $root 'runtime\bin\64bit'))
+$destinations = @((Join-Path $root 'build'))
+if (-not $NoStage) { $destinations += (Join-Path $root 'runtime\bin\64bit') }
 foreach ($dll in $runtimeDlls) {
   foreach ($destination in $destinations) {
-    Copy-Item -LiteralPath $dll.FullName -Destination $destination -Force
+    Copy-IfChanged $dll.FullName (Join-Path $destination $dll.Name)
   }
 }
 Write-Host ("runtime dlls staged: " + (($runtimeDlls | ForEach-Object { $_.Name }) -join ', '))
@@ -165,7 +192,7 @@ if (-not (Test-Path -LiteralPath $paths.webview2_loader)) {
   throw "WebView2 loader missing: $($paths.webview2_loader)"
 }
 foreach ($destination in $destinations) {
-  Copy-Item -LiteralPath $paths.webview2_loader -Destination (Join-Path $destination 'WebView2Loader.dll') -Force
+  Copy-IfChanged $paths.webview2_loader (Join-Path $destination 'WebView2Loader.dll')
 }
 Write-Host "staged: WebView2Loader.dll"
 
@@ -186,7 +213,7 @@ if (-not $NoStage) {
   $stage = Join-Path $root 'runtime\bin\64bit'
   New-Item -ItemType Directory -Force $stage | Out-Null
   foreach ($exe in Get-ChildItem -LiteralPath (Join-Path $root 'build') -Filter '*.exe' -ErrorAction SilentlyContinue |
-             Where-Object { $devTools -notcontains $_.Name }) {
+             Where-Object { $devTools -notcontains $_.Name -and (-not $Target -or $_.BaseName -eq $Target) }) {
     Copy-Item -LiteralPath $exe.FullName -Destination $stage -Force
   }
   Write-Host "executables staged to runtime\bin\64bit"
