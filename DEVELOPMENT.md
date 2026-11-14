@@ -57,6 +57,18 @@ logic and regression checks. No Visual Studio, OBS runtime, Rust, GPU or
 capture session is needed. Tests use an isolated temporary data directory.
 Downloads are reused on later runs; no setup-time or download-size guarantee is made.
 
+The 2,000-marker persistence/recovery checks always run. Their elapsed time is
+reported in the native test log. To also enforce the five-second disk-write budget
+on a dedicated performance-test machine, run:
+
+```powershell
+powershell -File tools/verify.ps1 -Area Native -Performance
+```
+
+Shared-runner CI checks correctness without enforcing that machine-dependent budget.
+Running the test executable directly accepts `BUFFRX_TEST_PERFORMANCE=1` for the
+same benchmark assertion. A functional test pass is not a performance result.
+
 ## Full Windows app
 
 Use this route for capture, native rendering, Rust hosts, or real-media integration.

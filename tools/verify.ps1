@@ -4,9 +4,13 @@ Run the same software checks as pull-request CI. No area means all software chec
 .EXAMPLE
 powershell -File tools/verify.ps1 -Area Native
 #>
-param([ValidateSet('Docs', 'Editor', 'Native', 'Build', 'All')][string]$Area = 'All')
+param(
+  [ValidateSet('Docs', 'Editor', 'Native', 'Build', 'All')][string]$Area = 'All',
+  [switch]$Performance
+)
 
 $ErrorActionPreference = 'Stop'
+if ($Performance -and $Area -notin @('Native', 'All')) { throw '-Performance requires -Area Native or -Area All.' }
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 
 function Invoke-Check([string]$Name, [scriptblock]$Action) {
@@ -63,15 +67,20 @@ try {
     }
     $previousData = $env:BUFFRX_DATA_ROOT
     $previousSource = $env:BUFFRX_SOURCE_DIR
+    $previousPerformance = $env:BUFFRX_TEST_PERFORMANCE
     $testRoot = Join-Path ([IO.Path]::GetTempPath()) ('buffrx-contrib-' + [Guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $testRoot | Out-Null
     try {
       $env:BUFFRX_DATA_ROOT = $testRoot
       $env:BUFFRX_SOURCE_DIR = $root
-      Invoke-Check 'native logic tests' { & (Join-Path (Split-Path $tools.cmake) 'ctest.exe') --test-dir $build --output-on-failure }
+      $env:BUFFRX_TEST_PERFORMANCE = if ($Performance) { '1' } else { '0' }
+      $ctestArgs = @('--test-dir', $build, '--output-on-failure')
+      if ($Performance) { $ctestArgs += '--verbose' }
+      Invoke-Check 'native logic tests' { & (Join-Path (Split-Path $tools.cmake) 'ctest.exe') @ctestArgs }
     } finally {
       $env:BUFFRX_DATA_ROOT = $previousData
       $env:BUFFRX_SOURCE_DIR = $previousSource
+      $env:BUFFRX_TEST_PERFORMANCE = $previousPerformance
       # Only remove the unique temporary directory this invocation created.
       $resolvedTest = [IO.Path]::GetFullPath($testRoot)
       $tempPrefix = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
