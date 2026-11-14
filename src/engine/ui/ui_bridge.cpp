@@ -50,8 +50,9 @@ void UiBridge::call(const std::string& command, Json args, Reply reply) {
   frame.set("cmd", Json(command));
   frame.set("args", std::move(args));
   const bool media = command == "screenshots.list" || command == "clips.thumbnail" || command == "clips.frames";
-  // A picker holds until the person answers: it gets a lane of its own, ahead of every other rule.
-  const bool dialog = command == "app.pick_folder" || command == "app.pick_file";
+  // A picker holds until the person answers: it gets a lane of its own, ahead of every other rule. The compatibility report
+  // waits 10 s on the encoder, so it shares that lane rather than hold up the library's.
+  const bool dialog = command == "app.pick_folder" || command == "app.pick_file" || command == "diagnostics.report";
   Worker& worker = dialog ? dialog_ : command == "update.check" || command == "update.notes" ? update_ :
                    command_needs_engine_lock(command) ? locked_ : media ? media_ : lock_free_;
   worker.jobs.push_back(Job{command, frame.dump(), std::move(reply)});

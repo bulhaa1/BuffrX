@@ -3,9 +3,13 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <ctime>
 #include <map>
+#include <unordered_map>
 
 #include "imgui_internal.h"
 #include "../update_math.h"
@@ -14,6 +18,10 @@
 #include "../public_links.h"
 #include "misc/cpp/imgui_stdlib.h"
 #include "../config.h"
+#include "../audio_routing.h"
+#include "audio_speaker.h"
+#include "ui_audio_math.h"
+#include "ui_display_math.h"
 #include "../encoder_settings.h"
 #include "../game_watch.h"
 #include "../themes.h"
@@ -193,19 +201,26 @@ void capture_section(ViewEnv& env) {
     load(env, "sources.displays", panel.displays, panel.displays_loading);
   }
   const bool window_mode = config["capture_mode"].as_string() == "window";
-  const int source = window_mode ? 2 : config["auto_game_capture"].as_bool() ? 0 : 1;
+  // 0 Games + display, 1 Games only, 2 Display, 3 Window.
+  const bool detecting = config["auto_game_capture"].as_bool();
+  const int source = window_mode ? 3 : !detecting ? 2 : config["game_only"].as_bool() ? 1 : 0;
   if ((window_mode || panel.picking_window) && panel.windows.is_null() && !panel.windows_loading) load(env, "sources.windows", panel.windows, panel.windows_loading);
 
   begin_section("##source", "Source");
-  begin_row("What to capture", source == 0   ? "Your display, switching to a game on its own when one is fullscreen, and back when it closes."
-                               : source == 1 ? "Always the whole display. Games are not detected."
-                                             : "One window, wherever it is. Nothing else is captured.");
+  // One description per choice, shown when the pointer is over that choice (and the chosen one's when it is not).
+  const std::vector<std::string> source_hints = {
+      "Your display, switching to a game on its own when one is fullscreen, and back when it closes.",
+      "Only games. The buffer pauses when the game closes and starts on the next one. The desktop is never captured.",
+      "Always the whole display. Games are not detected.",
+      "One window, wherever it is. Nothing else is captured."};
+  begin_row("What to capture", source_hints[static_cast<size_t>(source)]);
   int choice = source;
-  if (segmented("##source", {"Games + display", "Display", "Window"}, choice)) {
-    panel.picking_window = choice == 2;
+  if (segmented("##source", {"Games + display", "Games only", "Display", "Window"}, choice, 0.0f, 28.0f, nullptr, 12.0f, source_hints)) {
+    panel.picking_window = choice == 3;
     Json patch = Json::object();
-    if (choice < 2) {
-      patch.set("auto_game_capture", Json(choice == 0));
+    if (choice < 3) {
+      patch.set("auto_game_capture", Json(choice < 2));
+      patch.set("game_only", Json(choice == 1));
       patch.set("capture_mode", Json("display"));
       env.store.set_config(patch);
     } else {
@@ -214,25 +229,50 @@ void capture_section(ViewEnv& env) {
     }
   }
   end_row();
-  if (!panel.picking_window && source != 2 && panel.displays.is_array() && !panel.displays.items().empty()) {
+  if (!panel.picking_window && source != 3 && panel.displays.is_array() && !panel.displays.items().empty()) {
     ImGui::Separator();
     ImGui::Dummy(ImVec2(0, px(4)));
     const float avail = ImGui::GetContentRegionAvail().x;
     const float gap = px(8);
-    const int columns = std::max(1, static_cast<int>((avail + gap) / (px(180) + gap)));
-    const float card_w = (avail - gap * (columns - 1)) / columns, card_h = px(52);
+    const auto& displays = panel.displays.items();
+    size_t primary = 0;
+    for (size_t i = 0; i < displays.size(); ++i) if (displays[i]["primary"].as_bool()) primary = i;
+    const DisplayCardLayout layout = display_card_layout(displays.size(), primary, unpx(avail));
+    const float card_w = px(layout.width), card_h = px(52);
     const ImVec2 origin = ImGui::GetCursorScreenPos();
-    int index = 0;
+    // Which card the capture is on now. The saved device is the choice, followed wherever a reorder puts
+    // it; while that device is gone ObsHost captures the primary and says so, so the primary card is on.
+    // The old index is never the answer: after a rearrange it is another screen.
+    const std::string saved_device = config["display_name"].as_string();
+    std::string captured_device;
     for (const Json& display : panel.displays.items()) {
+      if (!saved_device.empty() && display["device"].as_string() == saved_device) captured_device = saved_device;
+    }
+    if (saved_device.empty()) {
+      const int saved_id = config["display_id"].as_int(-1);
+      for (const Json& display : panel.displays.items())
+        if (display["id"].as_int(-1) == saved_id) captured_device = display["device"].as_string();
+    }
+    if (captured_device.empty()) {
+      for (const Json& display : panel.displays.items())
+        if (display["primary"].as_bool()) captured_device = display["device"].as_string();
+    }
+    for (const DisplayCardSlot& slot : layout.slots) {
+      const Json& display = displays[slot.index];
       const int id = static_cast<int>(display["id"].as_int());
-      const ImVec2 min(origin.x + (index % columns) * (card_w + gap), origin.y + (index / columns) * (card_h + gap));
+      const ImVec2 min(origin.x + px(slot.x), origin.y + px(slot.y));
       ImGui::SetCursorScreenPos(min);
       ImGui::PushID(id);
-      const bool chosen = config["display_id"].as_int(-1) == id && config["capture_mode"].as_string() != "window";
+      const bool chosen = config["capture_mode"].as_string() != "window" && !captured_device.empty() &&
+                          display["device"].as_string() == captured_device;
       if (ImGui::InvisibleButton("display", ImVec2(card_w, card_h))) {
         Json args = Json::object();
         args.set("mode", Json("display"));
         args.set("display_id", Json(id));
+        // The card's device travels with its number: the engine refuses the pair if a rearrange made it
+        // stale instead of capturing whatever is at that index now.
+        args.set("display_name", Json(display["device"].as_string()));
+        panel.displays_at = 0;  // the list is redrawn from the desk as it is now, even after a refusal
         env.store.attempt("capture.set", args, "Display not selected", [&store = env.store](const Json&) { store.refresh_config(); });
       }
       const bool hovered = ImGui::IsItemHovered();
@@ -240,19 +280,16 @@ void capture_section(ViewEnv& env) {
       draw->AddRectFilled(min, ImVec2(min.x + card_w, min.y + card_h), chosen ? pal().raised : pal().canvas);
       draw->AddRect(min, ImVec2(min.x + card_w, min.y + card_h), chosen ? pal().accent : (hovered ? pal().muted : pal().line), 0, 0, chosen ? px(2) : 1.0f);
       draw_icon(draw, "monitor", ImVec2(min.x + px(12), min.y + (card_h - px(20)) / 2), px(20), chosen ? pal().accent : pal().faint);
-      std::string name = display["name"].as_string();
-      if (name.empty()) name = "Display " + std::to_string(id + 1);
-      if (display["primary"].as_bool() && name.find("rimary") == std::string::npos) name += " (Primary)";
+      const std::string name = display["primary"].as_bool() ? "Primary display" : "Display " + std::to_string(id + 1);
+      tooltip(display["name"].as_string() + "\n" + display["device"].as_string());
       // The name ends in an ellipsis at the card's edge, never under it.
       ImGui::SetCursorScreenPos(ImVec2(min.x + px(42), min.y + px(9)));
       text_ellipsis(fonts().strong, pal().ink, name, card_w - px(42) - px(10));
       const std::string size = std::to_string(display["width"].as_int()) + " \xC3\x97 " + std::to_string(display["height"].as_int());
       draw->AddText(fonts().small, fonts().small->LegacySize, ImVec2(min.x + px(42), min.y + px(28)), pal().faint, size.c_str());
       ImGui::PopID();
-      ++index;
     }
-    const int rows = (index + columns - 1) / columns;
-    ImGui::SetCursorScreenPos(ImVec2(origin.x, origin.y + rows * (card_h + gap)));
+    ImGui::SetCursorScreenPos(ImVec2(origin.x, origin.y + px(layout.height) + gap));
     ImGui::Dummy(ImVec2(0, px(2)));
   }
   // The picker closes on the pick and this line says what is captured: standing open after a choice, the only answer to a
@@ -321,6 +358,7 @@ void capture_section(ViewEnv& env) {
           // One window, nothing else: game detection off so it does not switch away.
           Json off = Json::object();
           off.set("auto_game_capture", Json(false));
+          off.set("game_only", Json(false));
           env.store.set_config(off);
           Json args = Json::object();
           args.set("mode", Json("window"));
@@ -361,12 +399,11 @@ void capture_section(ViewEnv& env) {
   }
   // How the display is read. It sits under where the window is picked because both answer the same question - what is
   // recorded - and it used to stand above that pick, so the page asked how before it asked what.
-  if (source != 2) {
+  if (source != 3) {
     const std::string method = config["display_method"].as_string("auto");
     const int current = method == "dxgi" ? 1 : method == "wgc" ? 2 : 0;
     // The list names each API beside plain words, because "desktop duplication" alone named nothing a person could choose
-    // between. What the one chosen costs is a hover hint, not a line under the label: the line pushed every row below it down
-    // for words the dropdown already tags.
+    // between. What the one chosen costs stays in the row's hover hint.
     static const char* const what[3] = {
         "Fast copy, falling back to Windows' own capture.",
         "Fastest. Reads the picture from the graphics card.",
@@ -374,8 +411,8 @@ void capture_section(ViewEnv& env) {
     begin_row("Screen capture method", what[current]);
     {
       int selected = current;
-      if (select("##capturemethod", {"Automatic", "Desktop duplication (DXGI)", "Windows capture (WGC)"}, selected, 280, false,
-                 {"recommended", "fastest", "most compatible"})) {
+      if (select("##capturemethod", {"Automatic", "Desktop duplication (DXGI)", "Windows capture (WGC)"}, selected, 260,
+                 false, {}, false, {}, false, {}, false)) {
         set(env, "display_method", Json(selected == 1 ? "dxgi" : selected == 2 ? "wgc" : "auto"));
       }
     }
@@ -386,7 +423,8 @@ void capture_section(ViewEnv& env) {
   {
     const std::string modes[2] = {"fit", "stretch"};
     int selected = config["stretch_mode"].as_string("auto") == "stretch" ? 1 : 0;
-    if (select("##stretch", {"Keep their shape", "Stretch to fill"}, selected, 240)) {
+    if (select("##stretch", {"Keep their shape", "Stretch to fill"}, selected, 260,
+               false, {}, false, {}, false, {}, false)) {
       set(env, "stretch_mode", Json(modes[selected]));
     }
   }
@@ -408,18 +446,23 @@ void capture_section(ViewEnv& env) {
     }
   }
   end_row();
-  begin_row("Quick clip", "A shorter save from the same buffer.");
+  // Never longer than the buffer: a quick clip is a save from the same ring, and always one of the offered lengths.
+  // The lengths the buffer cannot keep stay in the list, greyed, so raising the buffer again does not need the old
+  // value retyped. A buffer shorter than every length leaves the control off rather than naming one it cannot keep.
+  const int buffer = static_cast<int>(config["buffer_seconds"].as_int(60));
+  const QuickClipRow quick = quick_clip_row(static_cast<int>(config["quick_clip_seconds"].as_int(20)), buffer);
+  const bool quick_any =
+      std::find(quick.unavailable.begin(), quick.unavailable.end(), false) != quick.unavailable.end();
+  begin_row("Quick clip", quick_any ? "A shorter save from the same buffer."
+                                    : "The buffer must be longer than " +
+                                          std::to_string(quick.values.front()) + " seconds for a quick clip.",
+            quick_any ? 0 : pal().muted);
   {
-    int seconds = static_cast<int>(config["quick_clip_seconds"].as_int(20));
-    // Never longer than the buffer: a quick clip is a shorter save from the same ring.
-    const int buffer = static_cast<int>(config["buffer_seconds"].as_int(60));
-    const std::vector<int> options = quick_clip_choices();
-    std::vector<int> choices;
-    for (int option : options) {
-      if (option <= buffer) choices.push_back(option);
-    }
-    if (int_select("##quickclip", seconds, choices, [](int v) { return std::to_string(v) + " seconds"; })) {
-      set(env, "quick_clip_seconds", Json(seconds));
+    std::vector<std::string> labels;
+    for (int value : quick.values) labels.push_back(std::to_string(value) + " seconds");
+    int selected = quick.selected;
+    if (select("##quickclip", labels, selected, 160, !quick_any, {}, false, {}, false, quick.unavailable)) {
+      set(env, "quick_clip_seconds", Json(quick.values[static_cast<size_t>(selected)]));
     }
   }
   end_row();
@@ -563,26 +606,560 @@ void volume_row(ViewEnv& env, const char* key, const char* mute_key, const char*
   end_row();
 }
 
+bool program_active(const Json& sessions, const std::string& exe) {
+  for (const Json& session : sessions["sessions"].items()) {
+    if (same_program(session["exe"].as_string(), exe)) return session["active"].as_bool();
+  }
+  return false;
+}
+
+
 void audio_section(ViewEnv& env) {
   PanelState& panel = env.panel;
   const Json& config = env.store.config;
   if (panel.devices.is_null() && !panel.devices_loading)
     load(env, "devices.list", panel.devices, panel.devices_loading, Json::object(), "The device list did not load");
 
-  const bool desktop = config["desktop_enabled"].as_bool(), desktop_muted = config["desktop_muted"].as_bool();
-  begin_section("##desktop", "Desktop audio", [&] {
-    // Level on the switch's own line, a hand's width left of the switch, centred on it.
-    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + px(62));
-    ImGui::SetCursorPosY(ImGui::GetCursorPosY() + px(18));
-    level_bar(90, desktop && !desktop_muted ? env.store.desktop_level : 0.0f);
-  });
-  switch_row(env, "desktop_enabled", "Record desktop audio", "Game sound, voice chat, music: everything you hear.");
-  device_row(env, "desktop_device", "outputs", "Output device", "Pick the speakers or headset you actually listen on.", !desktop);
-  volume_row(env, "desktop_volume", "desktop_muted", "speaker", "speakerOff", "desktop audio");
+  const std::string mode = config["audio_capture_mode"].as_string("desktop");
+  const bool auto_mode = audio_is_auto(config);
+  const bool apps_mode = mode == "apps";
+  if (!apps_mode) panel.picking_audio_app = false;
+  const Json apps = config["audio_apps"].is_array() ? config["audio_apps"] : Json::array();
+  const bool performance_on = env.store.status["performance"]["active"].as_bool();
+  const bool mic = config["mic_enabled"].as_bool();
+  const Json& status = env.store.status;
+  // What Performance mode's own mix really records: it forces one track from the output device, never the
+  // app routes, and it does not turn the desktop or microphone switches back on.
+  const bool perf_desktop = config["desktop_enabled"].as_bool();
+  const char* perf_mix = nullptr;
+  if (perf_desktop && mic) perf_mix = "desktop audio and the microphone";
+  else if (perf_desktop) perf_mix = "desktop audio";
+  else if (mic) perf_mix = "the microphone";
+
+  begin_section("##audiomode", "What to record");
+  begin_row("Mode");
+  int selected_mode = auto_mode ? 0 : apps_mode ? 1 : 2;
+  const bool mode_locked = !env.store.connected || status["recording"].as_bool() || status["rebuilding"].as_bool(false);
+  if (mode_locked) ImGui::BeginDisabled();
+  if (segmented("##capturemode", {"Automatic", "Manual", "All sound together"}, selected_mode, 0, 28, nullptr, 10)) {
+    Json patch = Json::object();
+    patch.set("audio_capture_mode", Json(selected_mode == 0 ? "auto" : selected_mode == 1 ? "apps" : "desktop"));
+    if (selected_mode != 0) {
+      patch.set("audio_tracks", Json(selected_mode == 1 ? 3 : 1));
+      patch.set("separate_tracks", Json(selected_mode == 1));
+    }
+    if (selected_mode == 2) patch.set("desktop_enabled", Json(true));
+    env.store.set_config(patch);
+  }
+  if (mode_locked) ImGui::EndDisabled();
+  end_row();
+  note(auto_mode ? "Apps are discovered automatically; up to three have their own track and the rest share Other audio."
+       : apps_mode ? "Choose up to four apps to record on separate tracks."
+                   : "Desktop sound and the enabled microphone are recorded together on one track.");
+  if (mode_locked) note(status["recording"].as_bool() ? "Stop the recording first: changing audio mode rebuilds the encoder."
+                                                       : status["rebuilding"].as_bool(false) ? "Wait for the encoder to finish rebuilding."
+                                                                                             : "Connect to the engine to change audio mode.");
+  else if (env.store.buffer_on()) note("Changing mode restarts the buffer and clears its footage.");
+  if (performance_on && !auto_mode) {
+    note(perf_mix ? std::string("Performance mode is on: it records one mixed track of ") + perf_mix + "."
+                  : "Performance mode is on: no audio is recorded, only the picture.");
+  }
   end_section();
+  ImGui::Dummy(ImVec2(0, px(6)));
+
+  if (auto_mode) {
+    // The automatic experience shows what is recorded now and puts the mixer one press away.
+    const Json& audio_status = status["audio"];
+    const Json& auto_info = audio_status["auto"];
+    const Json& prefs = config["audio_app_prefs"];
+    const bool capturing = env.store.buffer_on() || status["recording"].as_bool();
+    const AutoAudioState state = audio_auto_state(audio_status, capturing);
+    const auto lane_hint = [&](const Json& lane) {
+      const std::string lane_state = lane["state"].as_string();
+      if (lane_state == "failed") return std::string("Audio capture failed");
+      if (lane_state == "waiting") return std::string("Waiting for this app to play sound");
+      if (lane_state == "covered") return std::string("Shared with another app's capture");
+      return capturing ? std::string("Recording on its own track")
+                       : std::string("Ready when the buffer or a recording runs");
+    };
+    begin_section("##audioauto", "Automatic app audio");
+    const float section_w = ImGui::GetContentRegionAvail().x;
+    text_wrapped(fonts().small, pal().muted,
+                 "Apps are added and removed as they play sound.",
+                 section_w);
+    ImGui::Dummy(ImVec2(0, px(6)));
+    bool other_present = false;
+    if (state == AutoAudioState::active) {
+      for (const Json& lane : audio_lanes_of(audio_status).items()) {
+        const bool other = audio_lane_other(lane);
+        const std::string exe = lane["exe"].as_string();
+        const bool known = !other && audio_pref_has(prefs, exe);
+        const bool muted = other ? audio_other_muted(config)
+                                 : known ? audio_pref_muted(prefs, exe) : lane["muted"].as_bool(false);
+        std::string hint = lane_hint(lane);
+        if (other) {
+          const size_t count = lane["apps"].items().size();
+          hint = std::to_string(count) + (count == 1 ? " app shares this track" : " apps share this track");
+          other_present = true;
+        }
+        if (muted) hint += " \xC2\xB7 muted";
+        begin_row(other ? std::string("Other audio") : audio_lane_title(lane), hint,
+                  lane["state"].as_string() == "failed" ? pal().danger : pal().muted);
+        end_row();
+      }
+    } else {
+      text_wrapped(fonts().small, pal().muted, audio_auto_line(state), section_w);
+    }
+    if (other_present) {
+      ImGui::Dummy(ImVec2(0, px(4)));
+      note("Apps with no track of their own share Other audio; set each one's level in the mixer.");
+    }
+    // Programs the engine could not capture: named, with the reason. The page must never read as if every
+    // program were being recorded.
+    const size_t uncaptured = audio_uncaptured_total(audio_status);
+    if (uncaptured > 0) {
+      const std::vector<AutoWarning> warnings = audio_uncaptured_warnings(audio_status, 4);
+      ImGui::Dummy(ImVec2(0, px(4)));
+      text_wrapped(fonts().small, pal().danger, "Some apps are not being recorded:", section_w);
+      for (const AutoWarning& warning : warnings) {
+        begin_row(warning.name, warning.reason, pal().danger);
+        end_row();
+      }
+      if (uncaptured > warnings.size()) {
+        note(std::to_string(uncaptured - warnings.size()) + " more apps are not being recorded.", true);
+      }
+    }
+    const std::vector<std::string> excluded = audio_excluded(prefs);
+    if (!excluded.empty()) {
+      note(std::to_string(excluded.size()) + (excluded.size() == 1 ? " excluded app is" : " excluded apps are") +
+           " left out until you restore them in the mixer.");
+    }
+    if (auto_info["performance_override"].as_bool()) {
+      note("Performance mode is on: app audio is recorded as one mix until it ends.");
+    }
+    ImGui::Dummy(ImVec2(0, px(6)));
+    if (button("Manage audio##automanage", Variant::normal, "sliders", false, 0, 30)) {
+      panel.settings.clear();
+      panel.audio_mixer_open = true;
+    }
+    tooltip("Open the mixer: every app's level and mute, the Other group, and the microphone.");
+    end_section();
+  }
+
+  const bool desktop = config["desktop_enabled"].as_bool(), desktop_muted = config["desktop_muted"].as_bool();
+  if (!apps_mode && !auto_mode) {
+    ImGui::Dummy(ImVec2(0, px(6)));
+    begin_section("##desktop", "Desktop sound", [&] {
+      // Level on the switch's own line, a hand's width left of the switch, centred on it.
+      ImGui::SetCursorPosX(ImGui::GetCursorPosX() + px(62));
+      ImGui::SetCursorPosY(ImGui::GetCursorPosY() + px(18));
+      level_bar(90, desktop && !desktop_muted ? env.store.desktop_level : 0.0f);
+    });
+    device_row(env, "desktop_device", "outputs", "Output device", "Pick the speakers or headset you actually listen on.", false);
+    volume_row(env, "desktop_volume", "desktop_muted", "speaker", "speakerOff", "desktop audio");
+    end_section();
+  }
+
+  if (apps_mode) {
+    ImGui::Dummy(ImVec2(0, px(6)));
+    begin_section("##appsaudio", "Selected apps");
+    const Json& status = env.store.status;
+    const Json& audio_status = status["audio"];
+    const bool app_change_locked = status["recording"].as_bool() || status["rebuilding"].as_bool(false);
+    const char* app_change_reason = status["recording"].as_bool()
+        ? "Stop the recording first: changing apps rebuilds the encoder."
+        : "Wait for the encoder to finish rebuilding.";
+    if (app_change_locked) panel.picking_audio_app = false;
+    const size_t slot_limit = static_cast<size_t>(kAudioAppMax);
+    const size_t used = std::min(apps.items().size(), slot_limit);
+    const size_t legacy_over = apps.items().size() > slot_limit ? apps.items().size() - slot_limit : 0;
+    const bool full = used >= slot_limit;
+    const bool addable = !full && legacy_over == 0;  // a legacy extra must be removed before a new slot is added
+    const auto set_apps = [&](const Json& list) {
+      Json patch = Json::object();
+      patch.set("audio_apps", list);
+      patch.set("audio_apps_chosen", Json(true));
+      env.store.set_config(patch);
+    };
+    const auto app_entry = [](const Json& window) {
+      Json entry = Json::object();
+      entry.set("window", Json(window["id"].as_string()));
+      entry.set("exe", Json(window["exe"].as_string()));
+      entry.set("title", Json(window["name"].as_string()));
+      entry.set("track", Json(2));  // written for older builds; the slot's position decides the track
+      return entry;
+    };
+    // The picker's snapshot: read only while the page shows a picker, never for a selection that is kept
+    // in desktop mode. A refresh keeps the rows it already has; only the first load has nothing to show.
+    if (panel.picking_audio_app) {
+      const bool first = panel.audio_programs.is_null();
+      if (first || env.now_ms - panel.audio_programs_at >= 3000) {
+        if (!panel.audio_programs_loading) {
+          panel.audio_programs_at = env.now_ms;
+          panel.audio_programs_loading = true;
+          auto& store = env.store;
+          auto& picker = panel;
+          store.bridge_call("sources.windows", Json::object(), [&store, &picker](bool ok, const Json& reply, const std::string&) {
+            picker.audio_programs_loading = false;
+            picker.audio_programs_first = false;
+            if (ok) picker.audio_programs = reply;  // a failure keeps the rows the picker already shows
+            store.dirty = true;
+          });
+        }
+      }
+    }
+    // A program's own meter: four times a second while the picker sorts and marks its rows, twice while only the
+    // selected rows show whether they are sounding. Read only while this page draws, so a closed panel or another
+    // Settings page asks for no sessions and samples no meter.
+    if (panel.picking_audio_app || used > 0) {
+      const uint32_t period = panel.picking_audio_app ? 250 : 500;
+      if (env.now_ms - panel.audio_sessions_at >= period) {
+        if (!panel.audio_sessions_loading) {
+          panel.audio_sessions_at = env.now_ms;
+          panel.audio_sessions_loading = true;
+          auto& store = env.store;
+          auto& picker = panel;
+          store.bridge_call("audio.sessions", Json::object(), [&store, &picker](bool ok, const Json& reply, const std::string&) {
+            picker.audio_sessions_loading = false;
+            if (ok) picker.audio_sessions = reply;
+            store.dirty = true;
+          });
+        }
+      }
+    }
+    // What the page knows about a slot, by the selection's order: the engine's own health.
+    const std::vector<Json>& slot_health = audio_status["slots"].items();
+    // One capacity reading, beside the one way to grow the selection. Each app takes a slot and its own
+    // track; the rows below say what each selection is doing now.
+    begin_row("Apps", "Each app takes one slot and one track of its own.");
+    ImGui::AlignTextToFramePadding();
+    text(fonts().small, pal().muted, std::to_string(used) + " of " + std::to_string(slot_limit) + " app slots used");
+    ImGui::SameLine(0, px(8));
+    if (button("Add app##appaudio", Variant::normal, "plus", !addable || app_change_locked, 0, 34)) {
+      if (addable) {
+        panel.picking_audio_app = true;
+        panel.audio_replace_slot = -1;
+        panel.audio_picked.clear();
+        panel.audio_search.clear();
+        panel.audio_programs_first = panel.audio_programs.is_null();
+      }
+    }
+    tooltip(app_change_locked ? app_change_reason
+          : legacy_over > 0 ? "Remove the saved apps that are not recorded first."
+          : full          ? "4 of 4 app slots used. Remove one first."
+                          : "Add a running app.");
+    end_row();
+    if (app_change_locked) note(app_change_reason);
+    for (size_t i = 0; i < used; ++i) {
+      const Json& app = apps.items()[i];
+      const bool game = app["kind"].as_string() == kAudioGameKind;
+      const std::string exe = app["exe"].as_string();
+      const std::string name = game ? std::string("Current game") : program_name(exe);
+      const bool failed = i < slot_health.size() && slot_health[i]["state"].as_string() == "failed";
+      const std::string state = i < slot_health.size() ? slot_health[i]["state"].as_string("waiting") : "waiting";
+      const bool show_hint = failed || state == "waiting" || !audio_status["recorded"].as_bool(true);
+      const std::string hint = audio_slot_hint(status, i, game, name);
+      const std::string activity_exe = i < slot_health.size() && !slot_health[i]["exe"].as_string().empty()
+                                           ? slot_health[i]["exe"].as_string() : exe;
+      // Keep the name and all three controls on the same 32-unit line, even when a state needs a second line.
+      const ImVec2 row = ImGui::GetCursorScreenPos();
+      const float width = ImGui::GetContentRegionAvail().x;
+      const float controls_x = row.x + width - px(90);
+      ImGui::SetCursorScreenPos(ImVec2(row.x, row.y + (px(32) - fonts().strong->LegacySize) / 2));
+      text_ellipsis(fonts().strong, pal().ink, name, std::max(px(20), controls_x - row.x - px(12)));
+      if (ImGui::IsItemHovered()) tooltip(name + (hint.empty() ? "" : "\n" + hint));
+      const ImVec2 mark(controls_x, row.y + px(9));
+      audio_speaker_icon(panel.audio_sessions, activity_exe, mark, px(14), env.now_ms, panel);
+      const float peak = program_peak(panel.audio_sessions, activity_exe);
+      tooltip_rect(ImVec2(mark.x - px(2), mark.y - px(2)), ImVec2(mark.x + px(16), mark.y + px(16)),
+                   peak < 0.0f ? "Audio activity is unavailable" : peak >= kAudiblePeak ? "Making sound now" : "No sound right now");
+      ImGui::SetCursorScreenPos(ImVec2(controls_x + px(22), row.y));
+      if (app_change_locked) ImGui::BeginDisabled();
+      if (icon_button(("##appreplace" + std::to_string(i)).c_str(), "edit",
+                      "Replace this app: one change, the slot keeps its track", false, 32, 15)) {
+        if (legacy_over == 0) {
+          panel.picking_audio_app = true;
+          panel.audio_replace_slot = static_cast<int>(i);
+          panel.audio_picked.clear();
+          panel.audio_search.clear();
+          panel.audio_programs_first = panel.audio_programs.is_null();
+        }
+      }
+      ImGui::SameLine(0, px(4));
+      if (icon_button(("##appremove" + std::to_string(i)).c_str(), "close", "Remove this app", false, 32, 15)) {
+        Json list = Json::array();
+        for (size_t n = 0; n < apps.items().size(); ++n) {
+          if (n != i) list.push(apps.items()[n]);
+        }
+        set_apps(list);
+      }
+      if (app_change_locked) ImGui::EndDisabled();
+      ImGui::SetCursorScreenPos(ImVec2(row.x, row.y + px(32)));
+      if (show_hint) text_wrapped(fonts().small, failed ? pal().danger : pal().muted, hint, width - px(90));
+      ImGui::Dummy(ImVec2(0, px(4)));
+    }
+    // The card is gone in seconds and notices can be off, so the standing fact stays here: one line while the
+    // engine's own policy (status.audio.problem) still says audio is missing. It clears on recovery, another
+    // mode, Performance mode and while nothing records, and waits out a game that is still starting.
+    if (audio_status["problem_steady"].as_bool()) {
+      const std::string problem = audio_status["problem"].as_string();
+      const std::string game_exe = audio_status["game_exe"].as_string();
+      const std::string game = game_exe.empty() ? std::string() : program_name(game_exe);
+      if (problem == "game_missing" && !game.empty()) {
+        begin_row("Game audio is not recorded",
+                  game + " is playing, but Selected apps records only the apps you add. Add " + game +
+                      " under Add app, or choose All desktop sound.",
+                  pal().danger);
+        end_row();
+      } else if (problem == "game_waiting") {
+        begin_row("Game audio is not connected",
+                  (game.empty() ? std::string("The captured game") : game) +
+                      " is selected for audio, but its capture has not connected. Its track stays empty until it does.",
+                  pal().danger);
+        end_row();
+      } else if (problem == "all_unavailable") {
+        begin_row("Selected app audio is not connected",
+                  "None of the apps you selected has connected for audio capture. Start them; their tracks stay empty until they connect.",
+                  pal().danger);
+        end_row();
+      }
+    }
+    if (legacy_over > 0) {
+      note("Only four apps can be recorded. The saved apps below are not recorded; remove them to free the "
+           "space, or replace one of the four above.", true);
+      for (size_t i = slot_limit; i < apps.items().size(); ++i) {
+        const Json& app = apps.items()[i];
+        const std::string exe = app["exe"].as_string();
+        const std::string legacy_name =
+            app["kind"].as_string() == kAudioGameKind ? std::string("Current game") : program_name(exe);
+        begin_row(legacy_name, "Saved, not recorded: four slots are in use");
+        if (app_change_locked) ImGui::BeginDisabled();
+        if (icon_button(("##applegacy" + std::to_string(i)).c_str(), "close", "Remove this saved app", false, 28, 15)) {
+          Json list = Json::array();
+          for (size_t n = 0; n < apps.items().size(); ++n) {
+            if (n != i) list.push(apps.items()[n]);
+          }
+          set_apps(list);
+        }
+        if (app_change_locked) ImGui::EndDisabled();
+        end_row();
+      }
+    }
+
+    // The list of programs is one way to add a source: the app the person picks, with one four-slot limit.
+
+    if (panel.picking_audio_app) {
+      // The picker draws in a fixed footprint: six rows whether it is loading, empty or full, so a refresh
+      // never moves the page under the pointer. Order is frozen while the pointer, a key or the wheel is in
+      // it, and re-sorted only after a short hold, loudest first.
+      const float row_h = px(36), row_gap = px(4), list_pad = px(6);
+      const float list_h = 6 * row_h + 5 * row_gap + list_pad * 2;
+      const bool replace = panel.audio_replace_slot >= 0;
+      begin_row(replace ? "Replace an application" : "Add an application",
+                replace ? "One entry per running program. The chosen app replaces this slot."
+                        : "One entry per running program. Apps playing audio appear first.",
+                0, px(34));
+      if (button("Cancel##appcancel", Variant::ghost, "close", false, 0, 34)) {
+        panel.picking_audio_app = false;
+      }
+      ImGui::SameLine();
+      if (!replace) {
+        const int picks = static_cast<int>(panel.audio_picked.size());
+        const bool can_add = picks > 0 && used + static_cast<size_t>(picks) <= slot_limit && legacy_over == 0;
+        if (button(("Add" + (picks > 1 ? " " + std::to_string(picks) + "##appadd" : std::string("##appadd"))).c_str(),
+                   Variant::primary, "plus", !can_add, 0, 34)) {
+          Json list = Json::array();
+          for (const Json& app : apps.items()) list.push(app);
+          for (const std::string& picked : panel.audio_picked) {
+            for (const Json& window : panel.audio_programs.items()) {
+              if (!same_program(window["exe"].as_string(), picked)) continue;
+              list.push(app_entry(window));
+              break;
+            }
+          }
+          set_apps(list);
+          panel.picking_audio_app = false;
+        }
+      }
+      end_row();
+      begin_row("Search", "Filter by program name or executable.");
+      if (text_field("##audiosearch", panel.audio_search, px(220), "Search apps", 64)) panel.audio_activity_at = env.now_ms;
+      ImGui::SameLine(0, px(8));
+      if (button("Refresh##apprefresh", Variant::ghost, "refresh", panel.audio_programs_loading, 0, 26)) {
+        panel.audio_programs_at = 0;  // the next frame asks again; the rows stay
+        panel.audio_activity_at = env.now_ms;
+      }
+      end_row();
+
+      // The order, rebuilt only when the pointer has left and nothing else is moving; the exes are the
+      // identity, because a window title changes and a window id is not stable across runs.
+      const bool frozen = env.now_ms - panel.audio_activity_at < 1500;
+      if (panel.audio_order.empty() || (!frozen && env.now_ms - panel.audio_order_at >= 1000)) {
+        std::vector<Json> choices = audio_program_choices(panel.audio_programs);
+        std::sort(choices.begin(), choices.end(), [&](const Json& left, const Json& right) {
+          const bool loud_left = program_sounding(panel.audio_sessions, left["exe"].as_string());
+          const bool loud_right = program_sounding(panel.audio_sessions, right["exe"].as_string());
+          if (loud_left != loud_right) return loud_left;
+          const bool run_left = program_active(panel.audio_sessions, left["exe"].as_string());
+          const bool run_right = program_active(panel.audio_sessions, right["exe"].as_string());
+          if (run_left != run_right) return run_left;
+          return lower_text(left["exe"].as_string()) < lower_text(right["exe"].as_string());
+        });
+        panel.audio_order.clear();
+        for (const Json& choice : choices) panel.audio_order.push_back(choice["exe"].as_string());
+        panel.audio_order_at = env.now_ms;
+      }
+
+      ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0, row_gap));
+      ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(px(8), list_pad));
+      // The list below always takes the same six-row footprint.
+      ImGui::BeginChild("##audioprograms", ImVec2(0, list_h), ImGuiChildFlags_None, ImGuiWindowFlags_None);
+      // The wheel is the list's own: the page around it does not glide while the pointer is here
+      // (smooth_scroll's wheel_owned_by_child), and the list reaches its end without moving the page.
+      wheel_owner_rect(ImGui::GetWindowPos(), ImVec2(ImGui::GetWindowPos().x + ImGui::GetWindowSize().x,
+                                                       ImGui::GetWindowPos().y + ImGui::GetWindowSize().y));
+      const bool pointer_in_list = ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows);
+      if (pointer_in_list) panel.audio_activity_at = env.now_ms;
+      const bool first_load = panel.audio_programs_first || (panel.audio_programs.is_null() && panel.audio_programs_loading);
+      if (first_load) {
+        const ImVec2 pos = ImGui::GetCursorScreenPos();
+        spinner(ImGui::GetWindowDrawList(),
+                ImVec2(pos.x + ImGui::GetContentRegionAvail().x / 2, pos.y + list_h / 2 - list_pad), px(8), pal().accent);
+      } else {
+        std::vector<std::string> problems;  // programs the snapshot names, for marking a chosen one
+        for (const Json& app : apps.items()) problems.push_back(app["exe"].as_string());
+        int drawn = 0;
+        const std::string search = lower_text(panel.audio_search);
+        // One compact row for every source. The details behind the pointer keep the row to a name; the
+        // marker says whether the source is already in the selection or only ticked for this add.
+        const auto picker_row = [&](const char* id, const std::string& name, const std::string& details, bool ticked,
+                                    bool in_use, bool selectable, bool activity) {
+          ImGui::PushID(id);
+          const ImVec2 min = ImGui::GetCursorScreenPos();
+          const float width = ImGui::GetContentRegionAvail().x;
+          const bool pressed = ImGui::InvisibleButton("program", ImVec2(width, row_h)) && selectable;
+          const bool hovered = ImGui::IsItemHovered();
+          if (hovered || ticked || ImGui::IsItemFocused() || ImGui::IsItemActive()) panel.audio_activity_at = env.now_ms;
+          ImDrawList* draw = ImGui::GetWindowDrawList();
+          const ImVec2 max(min.x + width, min.y + row_h);
+          if (hovered) draw->AddRectFilled(min, max, pal().raised);
+          draw->AddRect(min, max, ticked ? pal().accent : (hovered ? pal().line_strong : pal().line), 0, 0, 1.0f);
+          // The program's own speaker: waves only while its meter says it is making sound now, a still body for a
+          // measured silence, and a faint one when the meter is unknown. The row never claims a capture from sound.
+          audio_speaker_icon(panel.audio_sessions, id, ImVec2(min.x + px(7), min.y + (row_h - px(14)) / 2), px(14),
+                             env.now_ms, panel);
+          const ImVec2 name_min(min.x + px(24), min.y + (row_h - fonts().strong->LegacySize) / 2);
+          const float name_right = min.x + width - px(76);
+          ImGui::PushFont(fonts().strong);
+          ImGui::PushStyleColor(ImGuiCol_Text, pal().ink);
+          ImGui::RenderTextEllipsis(draw, name_min, ImVec2(name_right, name_min.y + fonts().strong->LegacySize),
+                                    name_right, name.c_str(), nullptr, nullptr);
+          ImGui::PopStyleColor();
+          ImGui::PopFont();
+          if (ticked) {
+            draw_icon(draw, "check", ImVec2(min.x + width - px(20), min.y + px(10)), px(13), pal().accent, 1.6f);
+          } else if (in_use) {
+            const std::string marker = "In use";
+            const float marker_w = text_width(fonts().small, marker);
+            draw->AddText(fonts().small, fonts().small->LegacySize,
+                          ImVec2(min.x + width - px(12) - marker_w, min.y + (row_h - fonts().small->LegacySize) / 2),
+                          pal().muted, marker.c_str());
+          }
+          if (hovered) {
+            // The speaker and this line never claim more than the meter says: an unavailable meter cannot
+            // prove that a running stream is silent.
+            const float peak = program_peak(panel.audio_sessions, id);
+            std::string tip = details;
+            if (!selectable) {
+              tip = "Already selected in another slot" + (tip.empty() ? "" : "\n" + tip);
+            } else if (activity) {
+              if (!tip.empty()) tip += "\n";
+              tip += peak < 0.0f ? "Audio activity is unavailable"
+                   : peak >= kAudiblePeak ? "Making sound now"
+                                          : "No sound right now";
+            }
+            tooltip_rect(min, max, tip);
+          }
+          ImGui::PopID();
+          return pressed;
+        };
+        for (const std::string& exe : panel.audio_order) {
+          if (!search.empty() && lower_text(exe).find(search) == std::string::npos &&
+              lower_text(program_name(exe)).find(search) == std::string::npos) {
+            continue;
+          }
+          Json window = Json::object();
+          for (const Json& choice : panel.audio_programs.items()) {
+            if (same_program(choice["exe"].as_string(), exe)) {
+              window = choice;
+              break;
+            }
+          }
+          if (window.is_null() || window["exe"].as_string().empty()) continue;
+          const bool chosen = std::any_of(problems.begin(), problems.end(),
+                                          [&](const std::string& other) { return same_program(other, exe); });
+          const bool ticked = std::find(panel.audio_picked.begin(), panel.audio_picked.end(), exe) != panel.audio_picked.end();
+          const bool ticked_here = replace ? false : ticked;
+          const bool replacing_this =
+              replace && static_cast<size_t>(panel.audio_replace_slot) < apps.items().size() &&
+              same_program(apps.items()[static_cast<size_t>(panel.audio_replace_slot)]["exe"].as_string(), exe);
+          const bool room = used + panel.audio_picked.size() < slot_limit;
+          const bool selectable = replace ? (!chosen || replacing_this) : (!chosen && (ticked || room));
+          if (picker_row(exe.c_str(), program_name(exe), exe + "\n" + window["name"].as_string(), ticked_here, chosen,
+                         selectable, true)) {
+            if (replace) {
+              Json list = Json::array();
+              for (size_t n = 0; n < apps.items().size(); ++n) {
+                if (n == static_cast<size_t>(panel.audio_replace_slot)) {
+                  list.push(app_entry(window));
+                } else {
+                  list.push(apps.items()[n]);
+                }
+              }
+              set_apps(list);
+              panel.picking_audio_app = false;
+            } else {
+              const auto found = std::find(panel.audio_picked.begin(), panel.audio_picked.end(), exe);
+              if (found != panel.audio_picked.end()) panel.audio_picked.erase(found);
+              else panel.audio_picked.push_back(exe);
+            }
+          }
+          ++drawn;
+        }
+        if (drawn == 0) {
+          text(fonts().small, pal().faint,
+               panel.audio_order.empty() ? "No application windows found. Open the app, then refresh."
+                                         : "No app matches that search.");
+        }
+      }
+      ImGui::EndChild();
+      ImGui::PopStyleVar(2);
+    }
+    // One plain warning, always visible in this mode: what is recorded, what is not, and whether the
+    // microphone is in it. The Windows reason for the limit is not repeated here, and Performance mode's
+    // one statement already sits under the mode choice: it is not said a second time here.
+    if (!performance_on) {
+      note(apps.items().empty()
+               ? (mic ? "No apps selected yet: only the microphone is recorded. Other apps and system sounds are left out."
+                      : "No apps selected yet, and the microphone is off. No audio is recorded; the picture still records.")
+               : (mic ? "Only the apps you add and the microphone are recorded. Other apps and system sounds are left out."
+                      : "Only the apps you add are recorded. Other apps and system sounds are left out, and the microphone is off."),
+           true);
+    }
+    // Holds belong to the rows on screen: a program that left the selection or the picker list drops its own.
+    std::vector<std::string> speaking;
+    for (size_t i = 0; i < used; ++i) {
+      speaking.push_back(i < slot_health.size() && !slot_health[i]["exe"].as_string().empty()
+                             ? slot_health[i]["exe"].as_string()
+                             : apps.items()[i]["exe"].as_string());
+    }
+    if (panel.picking_audio_app) speaking.insert(speaking.end(), panel.audio_order.begin(), panel.audio_order.end());
+    audio_speaker_prune(speaking);
+    end_section();
+  }
 
   ImGui::Dummy(ImVec2(0, px(6)));
-  const bool mic = config["mic_enabled"].as_bool(), mic_muted = config["mic_muted"].as_bool();
+  const bool mic_muted = config["mic_muted"].as_bool();
   begin_section("##mic", "Microphone", [&] {
     // Level on the switch's own line, a hand's width left of the switch, centred on it.
     ImGui::SetCursorPosX(ImGui::GetCursorPosX() + px(62));
@@ -592,33 +1169,27 @@ void audio_section(ViewEnv& env) {
   switch_row(env, "mic_enabled", "Record the microphone");
   device_row(env, "mic_device", "inputs", "Input device", "", !mic);
   volume_row(env, "mic_volume", "mic_muted", "mic", "micOff", "the microphone");
-  begin_row("Boost", "Raise a quiet microphone.");
-  {
-    int gain = static_cast<int>(std::lround(config["mic_gain_db"].as_double()));
-    if (slider_commit("##gain", gain, -12, 20, gain > 0 ? "+%d dB" : "%d dB", 182)) set(env, "mic_gain_db", Json(gain));
-    // The bare slider keeps the mute column's width, so Boost ends where the volume bars end.
-    ImGui::SameLine(0, px(10));
-    ImGui::Dummy(ImVec2(px(28), 0));
-  }
-  end_row();
-  switch_row(env, "mic_noise_suppress", "Noise suppression", "Removes fans, keyboards and hum (RNNoise).", !mic);
-  switch_row(env, "mic_noise_gate", "Noise gate", "Silences the mic between words.", !mic);
+  note("Boost and noise filters are under Advanced.");
   end_section();
 
   ImGui::Dummy(ImVec2(0, px(6)));
   if (advanced("##audioadvanced", "Advanced", panel.advanced.audio)) {
     begin_section("##audioadv", "");
-    begin_row("Audio tracks", "Separate tracks let an editor turn the mic or the game up or down afterwards. Track 1 is always the mix.");
+    // The microphone's own tuning: everything the section keeps out of the way, still one disclosure.
+    text(fonts().small, pal().muted, "Microphone");
+    begin_row("Boost", "Raise a quiet microphone.");
     {
-      int selected = config["audio_tracks"].as_int(1) > 1 ? 1 : 0;
-      if (select("##tracks", {"One mixed track", "Mix + desktop + mic"}, selected, 220)) {
-        Json patch = Json::object();
-        patch.set("audio_tracks", Json(selected ? 3 : 1));
-        patch.set("separate_tracks", Json(selected == 1));
-        env.store.set_config(patch);
-      }
+      int gain = static_cast<int>(std::lround(config["mic_gain_db"].as_double()));
+      if (slider_commit("##gain", gain, -12, 20, gain > 0 ? "+%d dB" : "%d dB", 182)) set(env, "mic_gain_db", Json(gain));
+      // The bare slider keeps the mute column's width, so Boost ends where the volume bars end.
+      ImGui::SameLine(0, px(10));
+      ImGui::Dummy(ImVec2(px(28), 0));
     }
     end_row();
+    switch_row(env, "mic_noise_suppress", "Noise suppression", "Removes fans, keyboards and hum (RNNoise).", !mic);
+    switch_row(env, "mic_noise_gate", "Noise gate", "Silences the mic between words.", !mic);
+    ImGui::Dummy(ImVec2(0, px(8)));
+    text(fonts().small, pal().muted, "Recording");
     begin_row("Audio quality");
     {
       int bitrate = static_cast<int>(config["audio_bitrate_kbps"].as_int(160));
@@ -627,7 +1198,7 @@ void audio_section(ViewEnv& env) {
       }
     }
     end_row();
-    note("Changing tracks or audio quality restarts the buffer.");
+    note("Changing audio quality restarts the buffer and is refused while a recording runs.");
     end_section();
   }
 }
@@ -721,6 +1292,22 @@ void ensure_encoder_properties(ViewEnv& env) {
     panel.encoder_failed = false;
   }
   if (!panel.encoder.is_null() || panel.encoder_loading || panel.encoder_failed) return;
+  // Test only: BUFFRX_TEST_UI_ENCODER=<file> shows a recorded encoder.properties reply (an AMD or Intel card's) in place of
+  // this PC's, so the page for a vendor this machine does not have can be seen and captured. The engine still runs its own.
+  if (const char* fake = std::getenv("BUFFRX_TEST_UI_ENCODER"); fake && *fake) {
+    std::string text, parse_error;
+    if (FILE* file = std::fopen(fake, "rb")) {
+      char buffer[4096];
+      size_t read = 0;
+      while ((read = std::fread(buffer, 1, sizeof(buffer), file)) > 0) text.append(buffer, read);
+      std::fclose(file);
+    }
+    Json reply;
+    if (Json::parse(text, reply, parse_error)) {
+      panel.encoder = reply;
+      return;
+    }
+  }
   panel.encoder_loading = true;
   Json args = Json::object();
   args.set("configured", Json(true));
@@ -740,23 +1327,39 @@ const Json* encoder_property(const PanelState& panel, const char* name) {
   return nullptr;
 }
 
-// The speed rows the page shows. Their live values are what Custom keeps: editing any one of them copies all of
-// them (as the encoder is running them now) into `encoder_options`, makes the mode Custom, and changes the one.
-const char* const kCuratedKeys[] = {"preset", "multipass", "lookahead", "adaptive_quantization", "target_usage"};
+// The Advanced rows that have a choice of their own. Each row shows and saves the person's choice: the engine's `base`,
+// with the speed relief left out. What the encoder runs can differ from it while the relief holds a setting down, and a
+// note under the rows says so; no row ever saves the running value.
+const std::vector<std::string> kCuratedKeys = {"preset", "multipass", "lookahead", "adaptive_quantization", "target_usage",
+                                               "pre_analysis"};
+
+// The person's choice for `key`, or null when the reply has no base or does not list it. A read of the running
+// encoder has no base, so nothing is drawn or saved from a relieved value.
+const Json* chosen_value(const PanelState& panel, const char* key) {
+  const Json& base = panel.encoder["base"];
+  return base.is_object() && base.has(key) ? &base[key] : nullptr;
+}
+
+// The running value of a row where the relief makes it differ from the person's choice, in plain words ("Speed p5 instead
+// of p7"). Empty when the two agree, or the row is not listed.
+std::string relief_difference(const PanelState& panel, const char* key, const char* label) {
+  const Json* property = encoder_property(panel, key);
+  const Json* chosen = chosen_value(panel, key);
+  if (!property || !chosen || (*property)["value"].dump() == chosen->dump()) return std::string();
+  const auto words = [](const Json& value) {
+    if (value.is_bool()) return std::string(value.as_bool() ? "on" : "off");
+    return value.is_string() ? value.as_string() : value.dump();
+  };
+  return std::string(label) + " " + words((*property)["value"]) + " instead of " + words(*chosen);
+}
 
 void curated_apply(ViewEnv& env, const std::string& name, Json value) {
-  Json options = Json::object();
-  for (const char* key : kCuratedKeys) {
-    if (const Json* property = encoder_property(env.panel, key)) options.set(key, (*property)["value"]);
-  }
-  // Anything else already in the options (a hand-edited file) is kept as it was.
-  const Json& stored = env.store.config["encoder_options"];
-  if (stored.is_object()) {
-    for (const auto& [key, existing] : stored.fields()) {
-      if (!options.has(key)) options.set(key, existing);
-    }
-  }
-  options.set(name, std::move(value));
+  // AMD's rate control is a row of its own (VBR or HQVBR) and is saved with the others. It is not a curated key on any other
+  // vendor: NVENC's rate control is set by the host, and snapshotting the encoder's default there would overwrite it.
+  std::vector<std::string> keys = kCuratedKeys;
+  if (std::as_const(env.panel.encoder)["family"].as_string() == "amf") keys.push_back("rate_control");
+  Json options = encoder_options_after_edit(env.store.config["encoder_options"], env.panel.encoder["base"], keys,
+                                            name, std::move(value));
   Json patch = Json::object();
   patch.set("encoder_options", options);
   patch.set("encoder_mode", Json("custom"));
@@ -813,7 +1416,8 @@ void encoder_section(ViewEnv& env) {
   encoder_size(config["output_width"].as_int(0), config["output_height"].as_int(0), capture_width > 0 ? capture_width : 1920,
                capture_height > 0 ? capture_height : 1080, width, height);
 
-  // Locked while Performance mode is on: the rows show the user's own values, which are not what is running.
+  // Locked while Performance mode is on: the rows show the choices Performance makes (its plan, encoder.properties), not the
+  // ones saved in the user's own settings. They come back when Performance is turned off.
   const bool locked_by_performance = status["performance"]["active"].as_bool(false);
   const std::string locked_hint = "Performance mode is on, so this is locked. Turn it off to change it.";
   // The Advanced rows belong to Custom. While a preset is chosen they are disabled, and each hint says why.
@@ -896,11 +1500,13 @@ void encoder_section(ViewEnv& env) {
       end_row();
     }
     // Plain words only: what happened, what it means, and one way back. No step counts.
-    const int speed_step = static_cast<int>(config["encoder_speed_step"].as_int(0));
+    // The controller's level (status.encoder_control, plan 008): 0 is the person's own settings.
+    const int speed_step = static_cast<int>(status["encoder_control"]["level"].as_int(0));
+    const int speed_levels = static_cast<int>(status["encoder_control"]["levels"].as_int(0));
     if (speed_step > 0) {
       // What is running, not what is stored: the capture rate the relief layer settled on, so a lowered frame rate is visible
       // instead of the page still promising 120.
-      const int running_fps = static_cast<int>(status["capture"]["fps"].as_int(fps));
+      const int running_fps = static_cast<int>(status["encoder_control"]["fps"].as_int(fps));
       note("BuffrX lowered quality to keep every frame. Your clips keep their resolution and length. Running at " +
            std::to_string(running_fps) + " fps now.");
       if (button("Try full quality again##resetstep", Variant::normal, nullptr, false, 0, 32)) {
@@ -921,7 +1527,7 @@ void encoder_section(ViewEnv& env) {
           panel.encoder = Json();
         }
       };
-      if (speed_step < 5) {
+      if (speed_step < speed_levels) {
         note(behind + "BuffrX is lowering quality by itself to fix it.", true);
       } else if (locked_by_performance) {
         note(behind + "Performance mode already uses the lightest settings, so the frame rate is what is left.", true);
@@ -988,28 +1594,74 @@ void encoder_section(ViewEnv& env) {
     for (int i = 0; i < 3; ++i) {
       if (codec == codecs[i]) selected = i;
     }
-    if (select("##codec", {"H.264", "HEVC", "AV1"}, selected, 200, false,
-               {"Most compatible", "Smaller files", "Smallest, RTX 40+"})) {
+    // A codec this PC has no hardware encoder for (H.264 always has the CPU one) is shown grey with the reason, never swapped silently.
+    const Json& hardware = std::as_const(panel.encoder)["hardware"];
+    std::vector<bool> unavailable(3, false);
+    std::vector<std::string> codec_hints = {"Most compatible", "Smaller files", "Smallest, RTX 40+"};
+    if (hardware["available_codecs"].is_array()) {
+      const std::string label[3] = {"H.264", "HEVC", "AV1"};
+      for (int i = 1; i < 3; ++i) {
+        bool present = false;
+        for (const Json& have : hardware["available_codecs"].items()) present = present || have.as_string() == codecs[i];
+        unavailable[static_cast<size_t>(i)] = !present;
+        if (!present) codec_hints[static_cast<size_t>(i)] = "This GPU has no " + label[i] + " encoder";
+      }
+    }
+    if (select("##codec", {"H.264", "HEVC", "AV1"}, selected, 200, false, codec_hints, false, {}, false, unavailable)) {
       set(env, "codec", Json(codecs[selected]));
       panel.encoder = Json();
     }
   }
   end_row();
-  begin_row("Encoder", lock_hint("Automatic picks your GPU's encoder and falls back to the CPU if it cannot start."));
+  {
+    // What runs and what this card can do (plan 009) sit under the label as the row's state lines, so the choice stands
+    // alone at the right like every other row's control.
+    // Read through a const view: the non-const Json::operator[] turns a null into an empty object, which made
+    // ensure_encoder_properties think the reply had arrived and never ask again (the Advanced rows vanished).
+    const std::string shown_encoder = std::as_const(panel.encoder)["id"].as_string(status["encoder"].as_string());
+    std::string state = std::string(status["asleep"].as_bool() ? "Next: " : "Running: ") + encoder_name(shown_encoder);
+    const Json& card = std::as_const(panel.encoder)["hardware"];
+    if (card.is_object() && !card["gpu"].as_string().empty()) {
+      std::string codecs_text;
+      for (const Json& have : card["codecs"].items()) {
+        const std::string id = have.as_string();
+        codecs_text += (codecs_text.empty() ? "" : " \xC2\xB7 ") + std::string(id == "av1" ? "AV1" : id == "hevc" ? "HEVC" : "H.264");
+      }
+      if (codecs_text.empty()) codecs_text = "no hardware encoder";
+      state += "\n" + card["gpu"].as_string() + ": " + codecs_text;
+      // AMD lowers the preset at init when its driver says the card cannot keep up, and says so only in its own log block.
+      const std::string asked = card["asked_preset"].as_string();
+      const std::string reported = card["reported_preset"].as_string();
+      if (std::as_const(panel.encoder)["family"].as_string() == "amf" && card["running_id"].as_string() == shown_encoder &&
+          !asked.empty() && !reported.empty() && lower_ascii(asked) != lower_ascii(reported)) {
+        state += "\nPreset " + reported + " (the driver lowered it from " + asked + ")";
+      }
+    }
+    begin_row("Encoder", state, pal().faint);
+  }
   {
     const char* encoders[5] = {"auto", "nvenc", "amf", "qsv", "software"};  // the engine's vendor names
     int selected = 0;
     for (int i = 0; i < 5; ++i) {
       if (config["encoder"].as_string("auto") == encoders[i]) selected = i;
     }
-    if (select("##encoderchoice", {"Automatic", "NVIDIA NVENC", "AMD AMF", "Intel Quick Sync", "CPU (x264)"}, selected, 200)) {
+    // Unavailable vendors stay grey; until the engine has said, nothing is greyed.
+    std::vector<bool> missing(5, false);
+    const Json& vendors = std::as_const(panel.encoder)["hardware"]["encoder_vendors"];
+    if (vendors.is_array()) {
+      for (int i = 1; i <= 3; ++i) {
+        bool present = false;
+        for (const Json& have : vendors.items()) present = present || have.as_string() == encoders[i];
+        // The one chosen stays selectable, so a config carried over from another PC can still be read and changed.
+        missing[static_cast<size_t>(i)] = !present && i != selected;
+      }
+    }
+    if (select("##encoderchoice", {"Automatic", "NVIDIA NVENC", "AMD AMF", "Intel Quick Sync", "CPU (x264)"}, selected, 260, false,
+               {}, false, {}, false, missing)) {
       set(env, "encoder", Json(encoders[selected]));
       panel.encoder = Json();
     }
-    // Read through a const view: the non-const Json::operator[] turns a null into an empty object, which made
-    // ensure_encoder_properties think the reply had arrived and never ask again (the Advanced rows vanished).
-    const std::string shown_encoder = std::as_const(panel.encoder)["id"].as_string(status["encoder"].as_string());
-    text(fonts().small, pal().faint, std::string(status["asleep"].as_bool() ? "Next encoder: " : "Running now: ") + encoder_name(shown_encoder));
+    tooltip(lock_hint("Automatic picks your GPU's encoder and falls back to the CPU if it cannot start."));
   }
   end_row();
   if (locked_by_performance) ImGui::EndDisabled();
@@ -1041,10 +1693,14 @@ void encoder_section(ViewEnv& env) {
                      "The most effort, for GPUs with room to spare. A busy game can make it drop frames.",
                      "Your own settings below. Pick another effort to go back."})) {
         if (selected == 4) {
-          // Custom starts from what is running now, so choosing it changes nothing until a row is edited.
+          // Custom starts from the values the mode chose (the person's choices, relief left out). Saving the speed row saves
+          // the other rows' choices with it.
           const Json* preset = encoder_property(panel, "preset");
           const Json* speed = preset ? preset : encoder_property(panel, "target_usage");
-          if (speed) curated_apply(env, (*speed)["name"].as_string(), (*speed)["value"]);
+          const std::string speed_name = speed ? (*speed)["name"].as_string() : std::string();
+          if (const Json* chosen = speed ? chosen_value(panel, speed_name.c_str()) : nullptr; chosen) {
+            curated_apply(env, speed_name, *chosen);
+          }
         } else {
           Json patch = Json::object();
           patch.set("encoder_mode", Json(modes[selected]));
@@ -1065,9 +1721,15 @@ void encoder_section(ViewEnv& env) {
       const std::string family = panel.encoder["family"].as_string();
       const Json* preset = encoder_property(panel, "preset");
       const Json* usage = encoder_property(panel, "target_usage");
-      if (const Json* speed = preset ? preset : usage; speed && (*speed)["options"].is_array()) {
+      // The lists and switches show the person's choice (chosen_value). Where the relief runs something else, the note
+      // under the switches says so once.
+      const Json* speed = preset ? preset : usage;
+      const Json* speed_choice = speed ? chosen_value(panel, (*speed)["name"].as_string().c_str()) : nullptr;
+      if (speed && speed_choice && (*speed)["options"].is_array()) {
+        Json shown = *speed;
+        shown.set("value", *speed_choice);
         begin_row("Speed", lock_hint("How hard the encoder works on each frame. Slower is a little sharper and uses more of the GPU."));
-        curated_list_row(env, *speed, [&](const std::string& value) {
+        curated_list_row(env, shown, [&](const std::string& value) {
           if (family == "nvenc") return preset_words(value);
           if (value == "speed") return std::string("Fast");
           if (value == "balanced") return std::string("Balanced");
@@ -1077,29 +1739,63 @@ void encoder_section(ViewEnv& env) {
         });
         end_row();
       }
-      if (const Json* multipass = encoder_property(panel, "multipass"); multipass && (*multipass)["options"].is_array()) {
+      const Json* multipass = encoder_property(panel, "multipass");
+      const Json* multipass_choice = chosen_value(panel, "multipass");
+      if (multipass && multipass_choice && (*multipass)["options"].is_array()) {
+        Json shown = *multipass;
+        shown.set("value", *multipass_choice);
         begin_row("Multipass", lock_hint("A second look at each frame: a little sharper for a little more GPU."));
-        curated_list_row(env, *multipass, [](const std::string& value) {
+        curated_list_row(env, shown, [](const std::string& value) {
           return value == "disabled" ? std::string("Off") : value == "qres" ? std::string("Quarter resolution")
                                      : value == "fullres" ? std::string("Full resolution") : std::string();
         });
         end_row();
       }
-      if (const Json* lookahead = encoder_property(panel, "lookahead"); lookahead && (*lookahead)["kind"].as_string() == "bool") {
-        begin_row("Look-ahead", lock_hint("Looks ahead to spend bits where the motion is. Costs GPU and adds a little delay."));
-        const bool on = (*lookahead)["value"].as_bool();
-        ImGui::PushID("lookahead");
-        if (toggle("##value", on)) curated_apply(env, "lookahead", Json(!on));
-        ImGui::PopID();
-        end_row();
+      // AMD's rate control: plain VBR, or HQVBR (two-pass) where this card lists it. Other rate controls are never offered.
+      const Json* rate = family == "amf" ? encoder_property(panel, "rate_control") : nullptr;
+      const Json* rate_choice = family == "amf" ? chosen_value(panel, "rate_control") : nullptr;
+      if (rate && rate_choice && (*rate)["options"].is_array()) {
+        bool has_hq = false;
+        for (const Json& option : (*rate)["options"].items()) has_hq = has_hq || option.as_string() == "HQVBR";
+        if (has_hq) {
+          Json shown = *rate;
+          shown.set("value", *rate_choice);
+          begin_row("Rate control", lock_hint("Two-pass rate control: a better picture for the same size. Costs extra GPU work."));
+          curated_list_row(env, shown,
+                           [](const std::string& value) { return value == "HQVBR" ? std::string("High quality") : std::string("Standard"); },
+                           [](const std::string& value) { return value == "VBR" || value == "HQVBR"; });
+          end_row();
+        }
       }
-      if (const Json* aq = encoder_property(panel, "adaptive_quantization"); aq && (*aq)["kind"].as_string() == "bool") {
-        begin_row("Adaptive quantization", lock_hint("Gives the hard parts of the picture more bits. Costs a little GPU."));
-        const bool on = (*aq)["value"].as_bool();
-        ImGui::PushID("adaptive_quantization");
-        if (toggle("##value", on)) curated_apply(env, "adaptive_quantization", Json(!on));
+      // A switch shows the person's choice, and a click saves its opposite. A row the encoder does not list is not drawn.
+      const auto choice_switch = [&](const char* key, const char* label, const std::string& hint) {
+        const Json* property = encoder_property(panel, key);
+        const Json* chosen = chosen_value(panel, key);
+        if (!property || !chosen || (*property)["kind"].as_string() != "bool") return;
+        begin_row(label, hint);
+        const bool on = chosen->as_bool();
+        ImGui::PushID(key);
+        if (toggle("##value", on)) curated_apply(env, key, Json(!on));
         ImGui::PopID();
         end_row();
+      };
+      choice_switch("lookahead", "Look-ahead", lock_hint("Looks ahead to spend bits where the motion is. Costs GPU and adds a little delay."));
+      choice_switch("adaptive_quantization", "Adaptive quantization", lock_hint("Gives the hard parts of the picture more bits. Costs a little GPU."));
+      // Where the encoder lists it (some AMD cards): extra GPU work per frame.
+      choice_switch("pre_analysis", "Pre-analysis", lock_hint("Looks at each frame before encoding it, for a sharper picture. Costs extra GPU work."));
+      // The rows that the speed relief runs lighter than the person chose, said once in plain words. Changing a row starts
+      // the relief from full speed again (commands.cpp), so this is what runs now, not a promise it keeps.
+      const std::pair<const char*, const char*> relief_rows[] = {
+          {"preset", "Speed"}, {"target_usage", "Speed"}, {"multipass", "Multipass"}, {"lookahead", "Look-ahead"},
+          {"adaptive_quantization", "Adaptive quantization"}, {"pre_analysis", "Pre-analysis"}};
+      std::string lighter;
+      for (const auto& [key, label] : relief_rows) {
+        const std::string difference = relief_difference(panel, key, label);
+        if (!difference.empty()) lighter += (lighter.empty() ? "" : ", ") + difference;
+      }
+      if (!lighter.empty()) {
+        note("While the GPU is behind, BuffrX runs lighter than your settings: " + lighter + ". Your settings stay saved. "
+             "Changing a row starts the relief again from your settings, and it steps down again if the GPU is still behind.");
       }
       // No Tuning row: NVENC always runs its high-quality tune (obs_host.cpp). Ultra high quality is far heavier and the
       // low-latency tunes cost 5-55% more bits for the same picture, so there is nothing to choose.
@@ -1185,7 +1881,7 @@ void encoder_section(ViewEnv& env) {
   else if (active && !detected_name.empty()) state.push_back("On now for " + detected_display + ".");
   else if (active) state.push_back("On now.");
   if (deferred) state.push_back("Turns off when the recording ends.");
-  if (mode_games && !auto_capture) state.push_back("Automatic mode needs Games + display in Capture.");
+  if (mode_games && !auto_capture) state.push_back("Automatic mode needs Games + display or Games only in Capture.");
 
   // Row 1 â€” When to use. The strip is the row's control; its seam hugs its own left edge. The pane's own
   // padding leaves less over the row than the gap under it, so one Dummy levels the two.
@@ -1791,6 +2487,13 @@ void hotkeys_section(ViewEnv& env) {
     key_column = std::max(key_column, chord_width(store.chord(row.action), 24));
     widest_chip = std::max(widest_chip, pad_chord_width(store.chord(row.action, true)));
   }
+  const QuickClipRow quick_row = quick_clip_row(static_cast<int>(store.config["quick_clip_seconds"].as_int(20)),
+                                                static_cast<int>(store.config["buffer_seconds"].as_int(60)));
+  const std::string quick_hint =
+      quick_row.selected >= 0
+          ? "Keeps only the last " + format_span(quick_row.values[static_cast<size_t>(quick_row.selected)])
+          : "Does nothing: the buffer must be longer than " +
+                std::to_string(kQuickClipChoices[0]) + " seconds";
   for (const HotkeyDefault& row : kHotkeyDefaults) {
     const char* action = row.action;
     const std::string problem = store.hotkeys["problems"][action].as_string();
@@ -1799,7 +2502,7 @@ void hotkeys_section(ViewEnv& env) {
     ImGui::PushID(action);
     // What each key does, so the page explains the difference between Save clip and Quick clip.
     const std::string what = std::string(action) == "save_replay" ? "Keeps the whole buffer, the last " + format_span(store.config["buffer_seconds"].as_double(60))
-                           : std::string(action) == "quick_clip" ? "Keeps only the last " + format_span(store.config["quick_clip_seconds"].as_double(20))
+                           : std::string(action) == "quick_clip" ? quick_hint
                            : std::string(action) == "screenshot" ? "A still of what is being captured"
                            : std::string(action) == "toggle_record" ? "A full recording, beside the buffer"
                            : std::string(action) == "toggle_ui" ? "Opens or hides this window"
@@ -2268,7 +2971,7 @@ void system_section(ViewEnv& env) {
   }
   end_section();
   ImGui::Dummy(ImVec2(0, px(6)));
-  begin_section("##files", "Files");
+  begin_section("##files", "Support");
   begin_row("Data folder", "Settings, profiles, the library and the logs live here.", pal().muted);
   if (button("Open##datadir", Variant::ghost, "folder", false, 0, 30)) {
     Json args = Json::object();
@@ -2281,6 +2984,30 @@ void system_section(ViewEnv& env) {
     Json args = Json::object();
     args.set("kind", Json("logs"));
     env.store.attempt("app.open_folder", args, "The folder did not open");
+  }
+  end_row();
+  begin_row("Compatibility report", "Describes this PC's graphics card and encoders. Copied, ready to paste into a bug report.", pal().muted);
+  if (button(panel.report_busy ? "Working##report" : "Copy report", Variant::ghost, "copy", panel.report_busy, 0, 30)) {
+    panel.report_busy = true;
+    // Nothing is sent: one file is written to the data folder and put on the clipboard as a file, so it pastes into Discord or GitHub.
+    Json args = Json::object();
+    args.set("copy", Json(true));
+    env.store.bridge_call("diagnostics.report", args, [&store = env.store, &panel](bool ok, const Json& reply, const std::string& error) {
+      panel.report_busy = false;
+      if (!ok) {
+        store.toast(UiToast::error, "The report could not be made", error);
+        return;
+      }
+      if (reply["copied"].as_bool(false)) {
+        store.toast(UiToast::success, "Report copied", "Paste it into your message with Ctrl+V.");
+      } else {
+        // The clipboard was busy: show the file instead, so it can still be dragged into the message.
+        Json open = Json::object();
+        open.set("kind", Json("data"));
+        store.attempt("app.open_folder", open, "The folder did not open");
+        store.toast(UiToast::success, "Report ready", "It is in the folder that opened.");
+      }
+    });
   }
   end_row();
   end_section();

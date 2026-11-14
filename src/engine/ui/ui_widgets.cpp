@@ -587,8 +587,12 @@ bool segmented(const char* id, const std::vector<std::string>& labels, int& sele
   const float h = px(height), inner = px(padding);
   const float fixed = cell > 0.0f ? px(cell) : 0.0f;
   const ImVec2 start = ImGui::GetCursorScreenPos();
+  std::vector<float> widths;
   float total = 0;
-  for (const std::string& item : labels) total += fixed > 0.0f ? fixed : text_width(font, item) + inner * 2;
+  for (const std::string& item : labels) {
+    widths.push_back(fixed > 0.0f ? fixed : text_width(font, item) + inner * 2);
+    total += widths.back();
+  }
   ImDrawList* draw = ImGui::GetWindowDrawList();
   const Palette& p = pal();
   // BeginDisabled only fades ImGui's own drawing; these cells are painted by hand, so they take the style's alpha
@@ -601,7 +605,7 @@ bool segmented(const char* id, const std::vector<std::string>& labels, int& sele
   int hovered_cell = -1;
   ImVec2 hovered_min, hovered_max;
   for (int i = 0; i < static_cast<int>(labels.size()); ++i) {
-    const float w = fixed > 0.0f ? fixed : text_width(font, labels[i]) + inner * 2;
+    const float w = widths[static_cast<size_t>(i)];
     ImGui::SetCursorScreenPos(ImVec2(x, start.y));
     ImGui::PushID(i);
     if (ImGui::InvisibleButton("seg", ImVec2(w, h), ImGuiButtonFlags_EnableNav) && selected != i) {
@@ -624,7 +628,7 @@ bool segmented(const char* id, const std::vector<std::string>& labels, int& sele
     if (hover > 0.0f && chosen < 1.0f)
       draw->AddRectFilled(ImVec2(x, start.y), ImVec2(x + w, start.y + h), dim(blend(0, p.raised, hover * (1.0f - chosen))));
     if (i > 0 && !on && selected != i - 1) draw->AddLine(ImVec2(x, start.y), ImVec2(x, start.y + h), dim(p.line));
-    draw->AddText(font, font->LegacySize, ImVec2(x + inner, start.y + (h - font->LegacySize) / 2),
+    draw->AddText(font, font->LegacySize, ImVec2(std::floor(x + (w - text_width(font, labels[i])) / 2), start.y + (h - font->LegacySize) / 2),
                   dim(blend(blend(p.muted, p.ink, hover), p.canvas, chosen)), labels[i].c_str());
     x += w;
   }
@@ -647,8 +651,16 @@ bool segmented(const char* id, const std::vector<std::string>& labels, int& sele
 }
 
 bool select(const char* id, const std::vector<std::string>& labels, int& selected, float width, bool disabled,
-            const std::vector<std::string>& hints, bool strong, const std::vector<std::string>& right, bool compact_rows) {
+            const std::vector<std::string>& hints, bool strong, const std::vector<std::string>& right, bool compact_rows,
+            const std::vector<bool>& unavailable, bool fit_choices) {
   bool changed = false;
+  if (g_row_width_id && fit_choices) {
+    // Fit this field's own choices, with room for padding and the chevron. A short
+    // setting never inherits the width of another control in its section.
+    float longest = 0.0f;
+    for (const std::string& label : labels) longest = std::max(longest, text_width(strong ? fonts().strong : fonts().body, label));
+    width = std::clamp(longest + px(44), px(80), px(320)) / px(1.0f);
+  }
   const std::string preview = selected >= 0 && selected < static_cast<int>(labels.size()) ? labels[selected] : std::string();
   const bool two_columns = right.size() == labels.size() && !right.empty();
   // Hints for every row are a right-hand column too, so a menu whose labels differ in width does not stagger them.
@@ -661,9 +673,11 @@ bool select(const char* id, const std::vector<std::string>& labels, int& selecte
   if (two_columns || hint_column) {
     float widest = 0.0f;
     for (size_t i = 0; i < labels.size(); ++i) {
-      widest = std::max(widest, text_width(fonts().body, labels[i]) + text_width(fonts().small, aside[i]));
+      widest = std::max(widest, std::ceil(text_width(fonts().body, labels[i])) + std::ceil(text_width(fonts().small, aside[i])));
     }
-    pop_width = std::min(px(compact_rows ? 220 : 320), std::max(pop_width, widest + px(36)));
+    // Name inset, inter-column gap, right inset, and the popup's own padding.
+    pop_width = std::min(px(compact_rows ? 220 : 320),
+                         std::max(pop_width, widest + px(36) + ImGui::GetStyle().FramePadding.x * 2));
   }
   ImGui::PushStyleColor(ImGuiCol_FrameBg, pal().canvas);
   ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, pal().raised);
@@ -682,12 +696,13 @@ bool select(const char* id, const std::vector<std::string>& labels, int& selecte
   ImDrawList* field_list = ImGui::GetWindowDrawList();
   const ImVec2 field_min = ImGui::GetCursorScreenPos();
   const ImVec2 field_max(field_min.x + px(width), field_min.y + ImGui::GetFrameHeight());
-  // The popup never runs past the window's right edge: it is only as wide as the room the field has from its left end.
-  const float space = ImGui::GetWindowPos().x + ImGui::GetWindowWidth() - field_min.x - px(8);
-  const float pop_max = std::clamp(space, px(160), px(320));
+  // A compact field at the right edge must not squeeze its menu into the space
+  // to its right. Fit the menu to the pane and let it expand toward the left.
+  const float pop_max = std::max(px(width), std::min(ImGui::GetWindowWidth() - px(16), px(320)));
   pop_width = std::min(pop_width, pop_max);
-  ImGui::SetNextWindowSizeConstraints(ImVec2(two_columns ? pop_width : 0, 0), ImVec2(pop_max, FLT_MAX));
-  const bool open = ImGui::BeginCombo(id, preview.c_str(), ImGuiComboFlags_HeightLarge | ImGuiComboFlags_NoArrowButton);
+  ImGui::SetNextWindowSizeConstraints(ImVec2(pop_width, 0), ImVec2(pop_max, FLT_MAX));
+  const bool open = ImGui::BeginCombo(id, preview.c_str(),
+                                    ImGuiComboFlags_HeightLarge | ImGuiComboFlags_NoArrowButton | ImGuiComboFlags_PopupAlignLeft);
   {
     // A6: the arrow turns with the list. The icon set has no rotated draw, so the down arrow gives way to the up arrow on the
     // state token (a cross-fade, not a turn).
@@ -707,13 +722,18 @@ bool select(const char* id, const std::vector<std::string>& labels, int& selecte
     const float row_height = px(compact_rows ? 22 : 26);
     for (int i = 0; i < static_cast<int>(labels.size()); ++i) {
       const bool on = i == selected;
+      // A row the caller cannot offer (a quick clip longer than the buffer): drawn grey and never pressed, clicked or
+      // reached with the keys.
+      const bool off = i < static_cast<int>(unavailable.size()) && unavailable[static_cast<size_t>(i)];
+      const ImU32 row_ink = off ? with_alpha(pal().muted, 0.45f) : on ? pal().accent : pal().ink;
       ImGui::PushID(i);
+      ImGui::BeginDisabled(off);
       if (two_columns || hint_column) {
         // Name on the left, its second column right-aligned, a hairline between rows: a dot between them read as part
         // of the name, and a hint that followed each label staggered down the list.
         const ImVec2 row_min = ImGui::GetCursorScreenPos();
-        const float row_w = std::max(ImGui::GetContentRegionAvail().x, pop_width - px(8));
-        if (ImGui::Selectable("##row", on, 0, ImVec2(row_w, row_height))) {
+        const float row_w = ImGui::GetContentRegionAvail().x;
+        if (ImGui::Selectable("##row", on, off ? ImGuiSelectableFlags_Disabled : 0, ImVec2(row_w, row_height))) {
           if (selected != i) changed = true;
           selected = i;
         }
@@ -724,8 +744,8 @@ bool select(const char* id, const std::vector<std::string>& labels, int& selecte
         const float count_width = text_width(fonts().small, aside[i]);
         const float name_end = two_columns ? row_max.x - px(18) - count_width : row_max.x - px(10);
         dl->PushClipRect(ImVec2(row_min.x, row_min.y), ImVec2(std::max(row_min.x, name_end), row_max.y), true);
-        dl->AddText(fonts().body, name_h, ImVec2(row_min.x + px(10), row_min.y + (row_height - name_h) / 2),
-                    on ? pal().accent : pal().ink, labels[i].c_str());
+        dl->AddText(fonts().body, name_h, ImVec2(row_min.x + px(10), row_min.y + (row_height - name_h) / 2), row_ink,
+                    labels[i].c_str());
         dl->PopClipRect();
         if (compact_rows && ImGui::IsItemHovered() && text_width(fonts().body, labels[i]) > name_end - row_min.x - px(10)) {
           ImGui::SetTooltip("%s", labels[i].c_str());
@@ -735,17 +755,24 @@ bool select(const char* id, const std::vector<std::string>& labels, int& selecte
           // running back over the name.
           const float text_x = two_columns ? row_max.x - px(10) - count_width
                                            : row_min.x + px(10) + text_width(fonts().body, labels[i]) + px(12);
-          dl->PushClipRect(ImVec2(text_x, row_min.y), ImVec2(row_max.x - px(10), row_max.y), true);
-          dl->AddText(fonts().small, right_h,
-                      ImVec2(row_max.x - px(10) - text_width(fonts().small, aside[i]),
-                             row_min.y + (row_height - right_h) / 2),
-                      on && two_columns ? pal().accent : pal().muted, aside[i].c_str());
-          dl->PopClipRect();
+          const float text_right = row_max.x - px(10);
+          // RenderTextEllipsis rounds text widths up; reserve whole pixels too,
+          // or a fully fitting hint can lose its last letters to an ellipsis.
+          const float text_left = std::min(text_right, std::floor(std::max(text_x, text_right - std::ceil(count_width))));
+          const float text_top = row_min.y + (row_height - right_h) / 2;
+          ImGui::PushFont(fonts().small);
+          ImGui::PushStyleColor(ImGuiCol_Text,
+                               off ? with_alpha(pal().muted, 0.45f) : on && two_columns ? pal().accent : pal().muted);
+          ImGui::RenderTextEllipsis(dl, ImVec2(text_left, text_top), ImVec2(text_right, text_top + right_h),
+                                   text_right, aside[i].c_str(), nullptr, nullptr);
+          ImGui::PopStyleColor();
+          ImGui::PopFont();
+          if (count_width > text_right - text_left) tooltip(aside[i]);
         }
         if (i > 0 && two_columns) dl->AddLine(ImVec2(row_min.x, row_min.y), ImVec2(row_max.x, row_min.y), pal().line);
       } else {
-        ImGui::PushStyleColor(ImGuiCol_Text, on ? pal().accent : pal().ink);
-        if (ImGui::Selectable(labels[i].c_str(), on, 0, ImVec2(0, px(26)))) {
+        ImGui::PushStyleColor(ImGuiCol_Text, row_ink);
+        if (ImGui::Selectable(labels[i].c_str(), on, off ? ImGuiSelectableFlags_Disabled : 0, ImVec2(0, px(26)))) {
           if (selected != i) changed = true;
           selected = i;
         }
@@ -756,6 +783,7 @@ bool select(const char* id, const std::vector<std::string>& labels, int& selecte
         }
       }
       if (on) ImGui::SetItemDefaultFocus();
+      ImGui::EndDisabled();
       ImGui::PopID();
     }
     if (compact_rows) ImGui::PopStyleVar();
@@ -987,8 +1015,11 @@ bool timeline(const char* id, const std::string& state, double filled, double se
   const bool pressed = ImGui::InvisibleButton(id, ImVec2(w, h), ImGuiButtonFlags_EnableNav);
   const bool hovered = ImGui::IsItemHovered();
   ImGui::EndDisabled();
+  // "waiting": games only holds the buffer for the next game. It reads as off, with the reason beside it.
+  const bool waiting = state == "waiting";
   tooltip(state == "disconnected" ? "Connecting to the engine"
           : on                    ? "Stop the buffer"
+          : waiting               ? "Waiting for a game. Press to stop waiting"
           : busy                  ? "Working\xE2\x80\xA6"
                                   : "Start the buffer");
   ImDrawList* draw = ImGui::GetWindowDrawList();
@@ -1003,7 +1034,7 @@ bool timeline(const char* id, const std::string& state, double filled, double se
   } else {
     draw->AddText(big, big->LegacySize, ImVec2(x, pos.y), on ? p.ink : p.muted, held.c_str());
     x += text_width(big, held) + px(10);
-    const std::string of = on ? "/ " + format_duration(seconds) : "keeps the last moments";
+    const std::string of = on ? "/ " + format_duration(seconds) : waiting ? "waiting for a game" : "keeps the last moments";
     // Off, the line gives way to the start button rather than run under it.
     const float chip_left = pos.x + w;
     if (on || x + text_width(fonts().body, of) <= chip_left)

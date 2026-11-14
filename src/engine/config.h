@@ -5,11 +5,13 @@
 // failing to load.
 #pragma once
 
+#include <cstdint>
 #include <map>
 #include <string>
 #include <vector>
 
 #include "../shared/json.h"
+#include "audio_auto.h"
 #include "hotkey_defaults.h"
 
 namespace bx {
@@ -21,6 +23,24 @@ inline constexpr char kDefaultLinkPage[] = "https://buffrx.app/l/";
 // always = the user's manual switch. Replaces the old performance_mode boolean; older files are
 // migrated in config_from_json. Not a profile key.
 enum class PerformanceWhen { off, games, always };
+
+// One selected application slot (audio_routing.h). `window` is the win-capture id
+// ("title:class:exe") at the moment it was picked; `exe` is the stable part a restart or a retitled
+// window is matched on. `kind` is empty for a named program and "game" for the Current game slot, whose
+// window and executable follow what BuffrX is capturing. `track` is written for older builds; the plan
+// assigns tracks by slot position (3..6) and never reads it.
+struct AudioApp {
+  std::string window;
+  std::string exe;
+  std::string title;
+  std::string kind;
+  int track = 2;
+  // The program's own live gain, 0..1, and whether its capture is muted. audio.set writes them beside
+  // the route; they change the running source in place and are not part of the routing identity
+  // (audio_routing.h), so a fader never rebuilds the encoders or clears the ring.
+  double volume = 1.0;
+  bool muted = false;
+};
 
 struct Config {
   std::string capture_mode = "display";  // display | window | game
@@ -51,8 +71,8 @@ struct Config {
   // (encoder_settings.h video_preset_patch). "custom" means the rate and effort are the user's own.
   std::string video_preset = "standard";
   int keyframe_seconds = 2;
-  // How many steps the encoder governor (encoder_governor.h) has lowered the encoder's speed settings because
-  // it could not keep up, 0..3. The engine writes it; changing the settings that cause it resets it to 0.
+  // Read from an older config as the level the encoder controller (encoder_controller.h) starts at, once; never written. The Video page's
+  // "Try full quality again" sends 0 as a trigger. The memory is capacity.json, keyed by GPU and driver.
   int encoder_speed_step = 0;
   // auto | fast | balanced | quality | custom. Fast, Balanced and Quality are the speed tiers whatever the quality
   // level; Auto follows the level; Custom is `encoder_options` on top of Auto. Editing a speed row on the page
@@ -106,6 +126,33 @@ struct Config {
   bool separate_tracks = false;     // deprecated alias: on means "three tracks" unless audio_tracks says otherwise
   int audio_tracks = 1;             // 1..6 mixer tracks / audio encoders (OBS's track 1..6)
   int audio_bitrate_kbps = 192;
+  // What the audio encoders capture: "auto" is the normal mode (audio_auto.h: the programs Windows says
+  // are playing, three isolated lanes and Other audio), "desktop" is the output loopback and the
+  // microphone, "apps" is only the selected programs and the microphone. The saved routes below are kept
+  // in every mode and are only recorded in "apps", so switching modes never loses a selection
+  // (audio_routing.h). A directly constructed Config still says "desktop"; the first run and every file
+  // written before version 13 move to "auto".
+  std::string audio_capture_mode = "desktop";
+  // Applications on their own tracks (Discord, a game), recorded only while audio_capture_mode is
+  // "apps". Four slots at most; each slot's track follows its position (3..6). While they record the
+  // desktop loopback is off, because Windows cannot record the desktop without the app that is also
+  // recorded on its own track (audio_routing.h). A file written by an older build may hold more than four:
+  // they are kept as written and the extra ones are reported as not recorded, never silently dropped.
+  std::vector<AudioApp> audio_apps;
+  // Whether the application selection has ever been written, including an intentionally empty one. Kept for
+  // compatibility with older files; it no longer seeds a list.
+  bool audio_apps_chosen = false;
+  // Automatic mode's per-program controls, keyed by the lower-case executable name (audio_auto.h). A
+  // fader, mute or exclude change is applied live and is never part of the routing identity: it does
+  // not rebuild the encoders or clear the ring. Unknown keys are kept, so a newer build's preferences
+  // survive a save by this one.
+  std::map<std::string, AutoAudioPref> audio_app_prefs;
+  // The Other audio group's own controls, applied on top of each member's saved gain/mute.
+  double audio_other_volume = 1.0;
+  bool audio_other_muted = false;
+  // The mode a file recorded with before automatic mode became the normal one ("desktop" or "apps"). It
+  // is read for compatibility and never used to pick a route again; the saved routes stay in audio_apps.
+  std::string audio_capture_legacy_mode;
 
   // Rewind's bindings, carried over: Alt+1 saves, Ctrl+Alt+1 saves a quick clip, Alt+2 screenshots,
   // Alt+3 records. Every default comes from hotkey_defaults.h, the table Settings' Default and Reset
@@ -182,6 +229,8 @@ struct Config {
   // (recovery_policy.h).
   bool crash_recovery = true;
   bool codec_auto_picked = false;  // the first start chose a codec from the hardware; a later choice is the person's
+  // The one-time move of an auto-picked AV1 on a machine whose AV1 encoder is not NVENC to H.264 has been looked at (2026-11-14).
+  bool codec_h264_default_migrated = false;
 
   int chunk_seconds = 30;
   int recordings_budget_gb = 0;          // 0 = unlimited
@@ -189,11 +238,14 @@ struct Config {
   // Focus-based game capture: switch the capture target to the game the user has focused (fullscreen,
   // not in the exclusion list) and back when it leaves. On by default, as Rewind's detector is.
   bool auto_game_capture = true;
+  // With detection on: capture only while a game is on screen. The buffer pauses when the game is gone and starts on
+  // the next one (game_only.h). Off by default: the display stays the fallback, and a press outside a game still saves.
+  bool game_only = false;
   std::vector<std::string> game_exclusions;  // extra process names never treated as games
 
   int active_profile = -1;  // the profile applied last (index into profiles.json), -1 none
   int config_version = kConfigVersion;
-  static constexpr int kConfigVersion = 8;
+  static constexpr int kConfigVersion = 13;
 };
 
 // What a settings change does to the running pipeline. One table, so the refusal that protects a
@@ -207,11 +259,34 @@ unsigned config_change_bits(const Config& before, const Config& after);
 inline constexpr int kBufferSecondsMin = 5;
 inline constexpr int kBufferSecondsMax = 1800;
 
+// The lengths the Quick clip row offers, smallest first. One list, read by the engine's fallback and by the interface's
+// row, so neither can offer a length the other does not know.
+inline constexpr int kQuickClipChoices[] = {10, 15, 20, 30, 45, 60, 90};
+
+// The quick clip length to keep with this buffer: the chosen one when it is a listed length the buffer can keep, else
+// the closest listed length at or below the buffer. 0 only when the buffer is shorter than every listed length (5 s).
+// A caller must never hand that 0 to ObsHost::save_clip: there 0 means the whole buffer, which is Save clip's job. A
+// press refuses it and explains instead (ui::quick_clip_press).
+int quick_clip_for_buffer(int chosen_seconds, int buffer_seconds);
+
 // Mixer tracks actually built: 1..6, with the older `separate_tracks` alias meaning three when the
 // explicit count does not ask for more. The spill reservation and the encoders must agree on this.
 inline int audio_track_count(const Config& config) {
+  // Automatic capture always builds six: the mix, the microphone, three isolated lanes and Other audio.
+  // They are made once and never rebuilt because a program arrived or left, so a lane keeps its encoder
+  // through a whole recording.
+  if (config.audio_capture_mode == "auto") return 6;
   int tracks = config.audio_tracks >= 1 && config.audio_tracks <= 6 ? config.audio_tracks : 1;
   if (config.separate_tracks && tracks < 2) tracks = 3;
+  if (config.separate_tracks && config.mic_enabled && tracks < 3) tracks = 3;
+  // An app slot needs its own encoder even when the explicit count says one: the plan puts slot i on
+  // track 3 + i (audio_routing.h), so the plan and the spill reservation must agree on every track the
+  // mixer writes to. Saved routes count only while the app mode records them; a route kept for later must
+  // not build encoders in desktop mode.
+  if (config.audio_capture_mode == "apps") {
+    const size_t slots = config.audio_apps.size() < 4 ? config.audio_apps.size() : 4;  // kAudioAppMax
+    if (slots > 0 && tracks < static_cast<int>(slots) + 2) tracks = static_cast<int>(slots) + 2;
+  }
   return tracks;
 }
 
@@ -228,7 +303,24 @@ inline int audio_track_count(const Config& config) {
 // Version 8 fixes the shipped pad bindings: the old defaults had Record unbound and the panel on
 // View+Menu, while four actions are meant to ship bound (Record on View+Menu, panel on View+Y). A file
 // still carrying that exact pair moves; a chord the person chose is kept.
-void migrate_config(Config& config);
+// Version 9 adds application audio routes (`audio_apps`), empty in every file written before it: no
+// desktop loopback is lost and no existing recording's layout changes.
+// Version 10 adds `audio_capture_mode` ("desktop" or "apps"). A file that already has routes reads as
+// "apps", because that is what it recorded until now; a file without them reads as "desktop". The routes
+// are kept either way, so switching back to "apps" restores them. A file that already carries a valid mode
+// chose it, whatever its version says, so `mode_stored` keeps that value (config_from_json has parsed it).
+// Version 11 makes the application selection four slots whose tracks follow their position (3..6) and adds
+// the optional Current game slot (`kind`). A version 10 file's stored `track` numbers are ignored from now
+// on: its first four apps still record, each on its own track, and entries past the fourth are kept in the
+// file and reported as not recorded (status.audio.legacy_over) instead of being silently dropped.
+// Version 12 adds `audio_apps_chosen`: whether the application selection was ever written. It is kept for
+// compatibility with files that carry it; a selection is never seeded from it, so a new switch to Selected
+// apps starts empty and the person adds the programs to record.
+// Version 13 makes automatic capture the normal mode. A file that recorded desktop or selected apps moves to
+// "auto"; its old mode is kept in `audio_capture_legacy_mode`, its routes stay in `audio_apps` untouched, and
+// each route's gain and mute seed an automatic preference for the same executable. Files already written by
+// older builds keep their tracks: nothing reads the mode when a recorded file is opened.
+void migrate_config(Config& config, bool mode_stored = false);
 
 // Whether a Timeline window is one the engine offers: 0 (off), 30, 60 or 120 minutes.
 bool timeline_minutes_allowed(int minutes);
@@ -251,11 +343,55 @@ struct CanvasPlan {
   int output_height = 0;
 };
 
+// Whether two picture sizes have the same shape, within a rounding tolerance: 1366x768 and 1280x720 are the same
+// 16:9 (0.03% apart), 16:9 and 21:9 are not (31% apart). Integer math, so a caller (and a test) needs nothing else.
+inline bool same_picture_shape(int width_a, int height_a, int width_b, int height_b) {
+  if (width_a <= 0 || height_a <= 0 || width_b <= 0 || height_b <= 0) return false;
+  const int64_t left = static_cast<int64_t>(width_a) * height_b;
+  const int64_t right = static_cast<int64_t>(height_a) * width_b;
+  const int64_t difference = left > right ? left - right : right - left;
+  return difference * 200 <= (left < right ? left : right);  // 0.5%: a pixel of rounding is not a different shape
+}
+
+// Whether the canvas has to take the configured output's shape instead of the capture's.
+// libobs scales the finished canvas straight to the output, so a canvas of another shape is squeezed there, and no
+// scene bounds can undo it: a 21:9 display recorded at a configured 1920x1080 was stretched to 16:9 by the output
+// scale. With the canvas at the output's shape the source is fitted inside it (bars) and the output scale is even.
+// Only when the output is configured and the target's size is known. A Stretch choice still fills the canvas.
+inline bool canvas_takes_output_shape(const Config& config, int target_width, int target_height) {
+  if (config.output_width <= 0 || config.output_height <= 0) return false;
+  if (target_width <= 0 || target_height <= 0) return false;
+  return !same_picture_shape(target_width, target_height, config.output_width, config.output_height);
+}
+
 // The canvas follows the capture target's native size and the output is what the user asked to record
 // at, so the frame is scaled once, by the video thread, and never inside the scene. `target_width`
 // and `target_height` come from Win32 before the first obs_reset_video (0 when the target is not
 // known yet); a configured size of 0 means "the same as the canvas".
-CanvasPlan plan_canvas(const Config& config, int target_width, int target_height);
+// One exception: a configured output of another shape takes the canvas (canvas_takes_output_shape), because the
+// output scale would squeeze the picture otherwise. A target whose size is not known cannot offer a shape to keep.
+inline CanvasPlan plan_canvas(const Config& config, int target_width, int target_height) {
+  // A size counts only as a complete pair of positive dimensions: half a size is a mistake, not a
+  // request for the other half to be guessed.
+  const bool target_known = target_width > 0 && target_height > 0;
+  const bool configured = config.output_width > 0 && config.output_height > 0;
+  const bool output_shape = canvas_takes_output_shape(config, target_width, target_height);
+
+  CanvasPlan plan;
+  if (target_known && !output_shape) {
+    plan.canvas_width = target_width;
+    plan.canvas_height = target_height;
+  } else if (configured) {
+    plan.canvas_width = config.output_width;
+    plan.canvas_height = config.output_height;
+  } else {
+    plan.canvas_width = 1920;
+    plan.canvas_height = 1080;
+  }
+  plan.output_width = configured ? config.output_width : plan.canvas_width;
+  plan.output_height = configured ? config.output_height : plan.canvas_height;
+  return plan;
+}
 
 // The size the video encoder actually receives: the configured output when there is one, else the
 // canvas. Both configured halves must be present to count — half a size is not a size, and asking
@@ -311,6 +447,9 @@ void config_from_json(const Json& json, Config& config);
 // would build encoders libobs has no track for, and a hand-edited volume would reach obs_source_set_volume
 // as inf and blast the track.
 void config_apply_audio(const Json& json, Config& config);
+// The automatic preferences as the pipe and the config file carry them: one object keyed by the lower-case
+// executable, each with volume, muted and excluded. A patch merges fields; this writes them all.
+Json auto_audio_prefs_json(const std::map<std::string, AutoAudioPref>& prefs);
 
 // A profile's patch with the machine-wide settings taken out: game switching and its bindings, the
 // library folders and retention. A profile is a saved config, and applying one must only change how a

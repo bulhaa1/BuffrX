@@ -187,7 +187,8 @@ bool RingFile::read_block(int64_t logical_offset, uint8_t* destination) { return
 
 void RingFile::cancel() {
   cancelled_ = true;
-  if (handle_) CancelIoEx(handle_, nullptr);
+  // The worker may still be opening (or closing a failed open's) handle. Only the
+  // transfer that owns the OVERLAPPED touches it; its bounded poll cancels the I/O.
 }
 
 void RingFile::close() {

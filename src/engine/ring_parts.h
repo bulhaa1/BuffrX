@@ -66,6 +66,59 @@ inline bool snapshot_has_chunks(const std::vector<RingEntry>& entries) {
   return false;
 }
 
+// A save that crosses an encoder swap (plan 008): one packet part per epoch, each with its own header, joined later on keyframes. A new encoder
+// starts on a keyframe, so every seam is one. Empty when every entry is of one epoch, which is today's single pipe, untouched. Otherwise the
+// parts, oldest first: a video packet goes to its own epoch's part; a sound packet goes to the part of its own epoch too, and in a part that
+// is not the oldest the sound from before that part's first picture is left out (the clip's sound and picture start together, as they do at
+// the ring's front). An epoch whose pictures are all gone (purged) leaves no part, and its sound with it. A part that does not begin on a
+// keyframe loses its first pictures up to one. (Packets of the same epoch come in arrival order, so the part's entries keep it.)
+struct EpochPart {
+  uint16_t epoch = 0;
+  std::vector<uint32_t> entries;  // indices into the snapshot, in arrival order
+};
+
+inline std::vector<EpochPart> epoch_parts(const std::vector<RingEntry>& entries) {
+  bool mixed = false;
+  for (const RingEntry& entry : entries) {
+    if (entry.epoch != entries.front().epoch) {
+      mixed = true;
+      break;
+    }
+  }
+  std::vector<EpochPart> parts;
+  if (!mixed) return parts;
+  std::vector<uint16_t> order;  // the epochs that still hold a picture, in the order their pictures arrive
+  for (const RingEntry& entry : entries) {
+    if (entry.video && std::find(order.begin(), order.end(), entry.epoch) == order.end()) order.push_back(entry.epoch);
+  }
+  for (size_t p = 0; p < order.size(); ++p) {
+    EpochPart part;
+    part.epoch = order[p];
+    int64_t first_video_us = INT64_MAX;  // the first keyframe of the epoch: its picture begins the part
+    for (const RingEntry& entry : entries) {
+      if (entry.epoch == part.epoch && entry.video && entry.video_keyframe) {
+        first_video_us = entry.dts_usec;
+        break;
+      }
+    }
+    if (first_video_us == INT64_MAX) continue;
+    bool started = false;
+    for (uint32_t i = 0; i < entries.size(); ++i) {
+      const RingEntry& entry = entries[i];
+      if (entry.epoch != part.epoch) continue;
+      if (entry.video) {
+        if (!started && !entry.video_keyframe) continue;
+        started = true;
+      } else if (p > 0 && entry.dts_usec < first_video_us) {
+        continue;
+      }
+      part.entries.push_back(i);
+    }
+    parts.push_back(std::move(part));
+  }
+  return parts;
+}
+
 // `available(id)`: the chunk file can be used (it exists). An unavailable chunk's window is planned as ordinary records.
 inline SavePlan plan_save_parts(const std::vector<RingEntry>& entries, const std::map<uint32_t, ChunkRec>& chunks,
                                 const std::function<bool(const ChunkRec&)>& available) {

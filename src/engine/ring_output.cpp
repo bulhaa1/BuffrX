@@ -71,6 +71,7 @@ struct ObsPacketOps {
     fields.pts = packet.pts;
     fields.dts = packet.dts;
     fields.dts_usec = packet.dts_usec;
+    fields.sys_dts_usec = packet.sys_dts_usec;
     fields.timebase_num = packet.timebase_num;
     fields.timebase_den = packet.timebase_den;
     fields.track = static_cast<uint32_t>(packet.track_idx);
@@ -82,6 +83,30 @@ struct ObsPacketOps {
   }
 };
 using Store = ReplayStore<ObsPacketOps>;
+
+// Everything a save needs to know about the encoders that made one epoch's packets, copied when the epoch's first picture arrives (the encoder is
+// certainly running then). A save used to ask the live encoders when it wrote, which is wrong after an encoder swap (the old encoder is gone) and
+// was fragile before it (a stopped audio encoder gives no header). For an epoch that is the only one, the values are what the live encoder gave.
+struct AudioEpoch {
+  std::string name;
+  std::vector<uint8_t> extra;
+  int bitrate = 0;
+  int sample_rate = 0;
+  int frame_size = 0;
+  int priming = 0;
+  int channels = 0;
+};
+struct EpochInfo {
+  uint16_t id = 0;
+  bool ok = false;
+  std::string codec;
+  std::string audio_codec;
+  std::vector<uint8_t> video_extra;
+  int bitrate = 0, codec_tag = 0, width = 0, height = 0;
+  int pri = 0, trc = 0, spc = 0, range = 0, chroma = 0, max_luminance = 0;
+  int fps_num = 0, fps_den = 1;  // the picture rate the packets' time base counts in: the canvas rate times the encoder's divisor
+  std::vector<AudioEpoch> audio;
+};
 
 struct Ring {
   obs_output_t* output = nullptr;
@@ -112,6 +137,19 @@ struct Ring {
   os_process_pipe_t* pipe = nullptr;
   std::atomic<int> last_skipped{0};  // packets the last save left out because the disk part could not be read
 
+  // Encoder swaps (plan 008). `keep_store` is set by the host just before it stops the output for a swap: the stop then leaves the footage, the
+  // disk part and the spill thread alone, and the next start continues them as a new epoch. It is cleared by the start, or by the host when the
+  // swap is given up, so that a later ordinary stop tears everything down as it always did.
+  std::atomic<bool> keep_store{false};
+  std::atomic<int64_t> keep_until_ms{0};  // the flag is good for this long only: a stop nobody restarts must not resume stale footage much later
+  std::mutex epoch_mutex;
+  std::vector<EpochInfo> epochs;  // every epoch since the ring started (a few hundred bytes each)
+  uint16_t epoch_id = 0;          // the current one
+  std::atomic<bool> epoch_pending{true};  // the next picture must capture the epoch's header
+  std::atomic<int> epoch_swaps{0};
+  std::atomic<int64_t> last_swap_gap_us{0};
+  std::atomic<int64_t> last_swap_shift_us{0};
+
   // A probe of the Timeline dedupe spike (docs/review-timeline-mux-2026-11-02.md), off unless BUFFRX_RING_KEYLOG=<file> is set: one line a packet with the
   // hash packet_hash.h computes, so a Timeline chunk's packets can be matched to the ring's. Not used by the product.
   FILE* keylog = nullptr;
@@ -132,6 +170,9 @@ struct Ring {
   std::condition_variable spill_cv;
   std::atomic<bool> spill_run{false};
 };
+
+// A swap asked the ring to keep its footage and the moment has not passed.
+bool keeping(const Ring& ring) { return ring.keep_store.load() && static_cast<int64_t>(GetTickCount64()) <= ring.keep_until_ms.load(); }
 
 void join_mux(Ring& ring) {
   if (ring.mux_thread.joinable()) ring.mux_thread.join();
@@ -161,7 +202,9 @@ void spill_main(Ring* ring) {
       free_aligned_block(block);
       block = nullptr;
     }
-    ring->file.reset();
+    // stop_spill may cancel this object concurrently. Keep its lifetime stable until
+    // that thread has joined; the failed tier still gives back its file handle now.
+    if (ring->file) ring->file->close();
     BX_LOG_WARN("the replay ring has no disk part (%s); it holds the footage in memory only", error.c_str());
     return;
   }
@@ -215,6 +258,13 @@ void teardown(Ring& ring) {
   }
   ring.spill_state = 0;
   ring.save_ts = 0;
+  {
+    std::lock_guard<std::mutex> epochs(ring.epoch_mutex);
+    ring.epochs.clear();
+    ring.epoch_id = 0;
+    ring.epoch_pending = true;
+  }
+  ring.epoch_swaps = 0;
 }
 
 int chroma_location(video_format format, int spc) {
@@ -239,7 +289,9 @@ int chroma_location(video_format format, int spc) {
   }
 }
 
-void add_video_params(os_process_args_t* args, Ring& ring, obs_encoder_t* encoder) {
+// Reads the live encoders into an epoch record: the same values the muxer's command line took from them at save time, now taken once when the
+// epoch begins. Packet thread, on the epoch's first picture.
+void capture_video_params(EpochInfo& epoch, Ring& ring, obs_encoder_t* encoder) {
   obs_data_t* settings = obs_encoder_get_settings(encoder);
   const int bitrate = static_cast<int>(obs_data_get_int(settings, "bitrate"));
   int codec_tag = static_cast<int>(obs_data_get_int(settings, "codec_type"));
@@ -281,53 +333,134 @@ void add_video_params(os_process_args_t* args, Ring& ring, obs_encoder_t* encode
   const int range = info->range == VIDEO_RANGE_FULL ? kRangeJpeg : kRangeMpeg;
   const int max_luminance = trc == kTrcPq ? static_cast<int>(obs_get_video_hdr_nominal_peak_level()) : (trc == kTrcHlg ? 1000 : 0);
 
-  os_process_args_add_arg(args, obs_encoder_get_codec(encoder));
-  os_process_args_add_argf(args, "%d", bitrate);
-  os_process_args_add_argf(args, "%d", static_cast<int>(obs_output_get_width(ring.output)));
-  os_process_args_add_argf(args, "%d", static_cast<int>(obs_output_get_height(ring.output)));
-  os_process_args_add_argf(args, "%d", pri);
-  os_process_args_add_argf(args, "%d", trc);
-  os_process_args_add_argf(args, "%d", spc);
-  os_process_args_add_argf(args, "%d", range);
-  os_process_args_add_argf(args, "%d", chroma_location(info->format, spc));
-  os_process_args_add_argf(args, "%d", max_luminance);
-  os_process_args_add_argf(args, "%d", static_cast<int>(info->fps_num));
-  os_process_args_add_argf(args, "%d", static_cast<int>(info->fps_den));
-  os_process_args_add_argf(args, "%d", codec_tag);
+  epoch.codec = obs_encoder_get_codec(encoder) ? obs_encoder_get_codec(encoder) : "";
+  epoch.bitrate = bitrate;
+  epoch.width = static_cast<int>(obs_output_get_width(ring.output));
+  epoch.height = static_cast<int>(obs_output_get_height(ring.output));
+  epoch.pri = pri;
+  epoch.trc = trc;
+  epoch.spc = spc;
+  epoch.range = range;
+  epoch.chroma = chroma_location(info->format, spc);
+  epoch.max_luminance = max_luminance;
+  // The packets count in the encoder's own time base: one tick a picture it keeps, so a divisor widens the tick.
+  epoch.fps_num = static_cast<int>(info->fps_num);
+  epoch.fps_den = static_cast<int>(info->fps_den) * static_cast<int>(std::max<uint32_t>(1, obs_encoder_get_frame_rate_divisor(encoder)));
+  epoch.codec_tag = codec_tag;
+  uint8_t* data = nullptr;
+  size_t size = 0;
+  if (obs_encoder_get_extra_data(encoder, &data, &size) && data && size) epoch.video_extra.assign(data, data + size);
 }
 
-void add_audio_params(os_process_args_t* args, obs_encoder_t* encoder) {
-  obs_data_t* settings = obs_encoder_get_settings(encoder);
-  const int bitrate = static_cast<int>(obs_data_get_int(settings, "bitrate"));
-  obs_data_release(settings);
-  os_process_args_add_arg(args, obs_encoder_get_name(encoder));
-  os_process_args_add_argf(args, "%d", bitrate);
-  os_process_args_add_argf(args, "%d", static_cast<int>(obs_encoder_get_sample_rate(encoder)));
-  os_process_args_add_argf(args, "%d", static_cast<int>(obs_encoder_get_frame_size(encoder)));
-  os_process_args_add_argf(args, "%d", static_cast<int>(obs_encoder_get_priming_samples(encoder)));
-  os_process_args_add_argf(args, "%d", static_cast<int>(audio_output_get_channels(obs_get_audio())));
-}
-
-// The muxer process for one save: its command line is what OBS's own muxer builds (path, which streams, the codec parameters, the
-// muxer settings), and the packets follow on its stdin.
-os_process_pipe_t* start_muxer(Ring& ring, const std::string& path) {
-  obs_encoder_t* video = obs_output_get_video_encoder(ring.output);
-  std::vector<obs_encoder_t*> audio;
+void capture_audio_params(EpochInfo& epoch, Ring& ring) {
   for (int track = 0; track < kMaxTracks; ++track) {
     obs_encoder_t* encoder = obs_output_get_audio_encoder(ring.output, static_cast<size_t>(track));
     if (!encoder) break;
-    audio.push_back(encoder);
+    AudioEpoch audio;
+    obs_data_t* settings = obs_encoder_get_settings(encoder);
+    audio.bitrate = static_cast<int>(obs_data_get_int(settings, "bitrate"));
+    obs_data_release(settings);
+    audio.name = obs_encoder_get_name(encoder) ? obs_encoder_get_name(encoder) : "";
+    audio.sample_rate = static_cast<int>(obs_encoder_get_sample_rate(encoder));
+    audio.frame_size = static_cast<int>(obs_encoder_get_frame_size(encoder));
+    audio.priming = static_cast<int>(obs_encoder_get_priming_samples(encoder));
+    audio.channels = static_cast<int>(audio_output_get_channels(obs_get_audio()));
+    uint8_t* data = nullptr;
+    size_t size = 0;
+    if (obs_encoder_get_extra_data(encoder, &data, &size) && data && size) audio.extra.assign(data, data + size);
+    if (track == 0) epoch.audio_codec = obs_encoder_get_codec(encoder) ? obs_encoder_get_codec(encoder) : "";
+    epoch.audio.push_back(std::move(audio));
   }
+}
+
+// The epoch the ring is in, recorded when its first picture arrives. Packet thread.
+void begin_epoch_record(Ring& ring) {
+  obs_encoder_t* video = obs_output_get_video_encoder(ring.output);
+  EpochInfo epoch;
+  {
+    std::lock_guard<std::mutex> lock(ring.epoch_mutex);
+    epoch.id = ring.epoch_id;
+  }
+  if (video) capture_video_params(epoch, ring, video);
+  capture_audio_params(epoch, ring);
+  epoch.ok = video != nullptr;
+  std::lock_guard<std::mutex> lock(ring.epoch_mutex);
+  ring.epochs.push_back(std::move(epoch));
+}
+
+bool find_epoch(Ring& ring, uint16_t id, EpochInfo& out) {
+  std::lock_guard<std::mutex> lock(ring.epoch_mutex);
+  for (const EpochInfo& epoch : ring.epochs) {
+    if (epoch.id == id) {
+      out = epoch;
+      return true;
+    }
+  }
+  return false;
+}
+
+// What an epoch began with, in the log: whether its header equals the one before (a join of parts wants it so), and how the clock joined.
+void log_epoch_start(Ring& ring, const encoder_packet& packet) {
+  EpochInfo now, before;
+  uint16_t id = 0;
+  {
+    std::lock_guard<std::mutex> lock(ring.epoch_mutex);
+    id = ring.epoch_id;
+  }
+  if (!find_epoch(ring, id, now)) return;
+  if (id == 0) {
+    BX_LOG_NOTE("ring epoch 0: %s %dx%d, time base %d/%d, header %zu bytes, first dts %lld us", now.codec.c_str(), now.width, now.height, now.fps_den, now.fps_num,
+                now.video_extra.size(), static_cast<long long>(packet.dts_usec));
+    return;
+  }
+  const bool had = find_epoch(ring, static_cast<uint16_t>(id - 1), before);
+  const Store::EpochJoin join = ring.store.last_epoch_join();
+  ring.last_swap_gap_us = join.gap_us;
+  ring.last_swap_shift_us = join.shift_us;
+  BX_LOG_NOTE("ring epoch %u: %s %dx%d, time base %d/%d, header %zu bytes (%s the one before), first dts %lld us, last dts before %lld us, clock shift %lld us, swap gap %lld us",
+              static_cast<unsigned>(id), now.codec.c_str(), now.width, now.height, now.fps_den, now.fps_num, now.video_extra.size(),
+              had && before.video_extra == now.video_extra ? "same as" : "differs from", static_cast<long long>(join.first_dts_us),
+              static_cast<long long>(join.prev_last_dts_us), static_cast<long long>(join.shift_us), static_cast<long long>(join.gap_us));
+}
+
+void add_video_params(os_process_args_t* args, const EpochInfo& epoch) {
+  os_process_args_add_arg(args, epoch.codec.c_str());
+  os_process_args_add_argf(args, "%d", epoch.bitrate);
+  os_process_args_add_argf(args, "%d", epoch.width);
+  os_process_args_add_argf(args, "%d", epoch.height);
+  os_process_args_add_argf(args, "%d", epoch.pri);
+  os_process_args_add_argf(args, "%d", epoch.trc);
+  os_process_args_add_argf(args, "%d", epoch.spc);
+  os_process_args_add_argf(args, "%d", epoch.range);
+  os_process_args_add_argf(args, "%d", epoch.chroma);
+  os_process_args_add_argf(args, "%d", epoch.max_luminance);
+  os_process_args_add_argf(args, "%d", epoch.fps_num);
+  os_process_args_add_argf(args, "%d", epoch.fps_den);
+  os_process_args_add_argf(args, "%d", epoch.codec_tag);
+}
+
+void add_audio_params(os_process_args_t* args, const AudioEpoch& audio) {
+  os_process_args_add_arg(args, audio.name.c_str());
+  os_process_args_add_argf(args, "%d", audio.bitrate);
+  os_process_args_add_argf(args, "%d", audio.sample_rate);
+  os_process_args_add_argf(args, "%d", audio.frame_size);
+  os_process_args_add_argf(args, "%d", audio.priming);
+  os_process_args_add_argf(args, "%d", audio.channels);
+}
+
+// The muxer process for one save: its command line is what OBS's own muxer builds (path, which streams, the codec parameters, the
+// muxer settings), and the packets follow on its stdin. The codec parameters are the epoch's own (see EpochInfo).
+os_process_pipe_t* start_muxer(Ring& ring, const std::string& path, const EpochInfo& epoch) {
   char* exe = os_get_executable_path_ptr("obs-ffmpeg-mux.exe");
   os_process_args_t* args = os_process_args_create(exe);
   bfree(exe);
   os_process_args_add_arg(args, path.c_str());
-  os_process_args_add_argf(args, "%d", video ? 1 : 0);
-  os_process_args_add_argf(args, "%d", static_cast<int>(audio.size()));
-  if (video) add_video_params(args, ring, video);
-  if (!audio.empty()) {
-    os_process_args_add_arg(args, obs_encoder_get_codec(audio[0]));
-    for (obs_encoder_t* encoder : audio) add_audio_params(args, encoder);
+  os_process_args_add_argf(args, "%d", epoch.ok ? 1 : 0);
+  os_process_args_add_argf(args, "%d", static_cast<int>(epoch.audio.size()));
+  if (epoch.ok) add_video_params(args, epoch);
+  if (!epoch.audio.empty()) {
+    os_process_args_add_arg(args, epoch.audio_codec.c_str());
+    for (const AudioEpoch& audio : epoch.audio) add_audio_params(args, audio);
   }
   os_process_args_add_arg(args, "");  // the stream key: none for a file
   obs_data_t* settings = obs_output_get_settings(ring.output);
@@ -352,25 +485,21 @@ bool write_packet(Ring& ring, const PacketFields& packet) {
   return true;
 }
 
-bool write_headers(Ring& ring) {
-  obs_encoder_t* video = obs_output_get_video_encoder(ring.output);
+bool write_headers(Ring& ring, const EpochInfo& epoch) {
+  if (!epoch.ok || epoch.video_extra.empty()) return false;
   PacketFields header;
   header.video = true;
-  uint8_t* data = nullptr;
-  size_t size = 0;
-  if (!obs_encoder_get_extra_data(video, &data, &size)) return false;
-  header.data = data;
-  header.size = static_cast<uint32_t>(size);
+  header.data = epoch.video_extra.data();
+  header.size = static_cast<uint32_t>(epoch.video_extra.size());
   if (!write_packet(ring, header)) return false;
-  for (size_t track = 0;; ++track) {
-    obs_encoder_t* encoder = obs_output_get_audio_encoder(ring.output, track);
-    if (!encoder) break;
+  for (size_t track = 0; track < epoch.audio.size(); ++track) {
+    const AudioEpoch& audio = epoch.audio[track];
+    if (audio.extra.empty()) return false;
     PacketFields audio_header;
     audio_header.video = false;
     audio_header.track = static_cast<uint32_t>(track);
-    if (!obs_encoder_get_extra_data(encoder, &data, &size)) return false;
-    audio_header.data = data;
-    audio_header.size = static_cast<uint32_t>(size);
+    audio_header.data = audio.extra.data();
+    audio_header.size = static_cast<uint32_t>(audio.extra.size());
     if (!write_packet(ring, audio_header)) return false;
   }
   return true;
@@ -512,14 +641,14 @@ struct PartsOutcome {
 // the muxer's own exit code failed; `outcome.wrote` says a process was created and `outcome.muxer_exit` carries its
 // verdict (0 clean).
 bool write_packet_part(Ring& ring, Store::SaveJob& job, const std::vector<uint32_t>& entries, const std::string& path,
-                       PartsOutcome& outcome) {
-  ring.pipe = start_muxer(ring, path);
+                       PartsOutcome& outcome, const EpochInfo& epoch) {
+  ring.pipe = start_muxer(ring, path, epoch);
   if (!ring.pipe) {
     BX_LOG_WARN("the ring could not start its muxer process for %s", path.c_str());
     return false;
   }
   outcome.wrote = true;
-  bool ok = write_headers(ring);
+  bool ok = write_headers(ring, epoch);
   if (ok) {
     const SaveReport report = ring.store.run_part(job, entries, [&](const PacketFields& packet) { return write_packet(ring, packet); });
     outcome.skipped += report.skipped;
@@ -558,7 +687,7 @@ bool publish_newest_part(Ring& ring, std::string& source, const SaveName& name, 
 // count of records left out; parts that are not adjacent are never glued together. Everything is written at `staged`,
 // this save's own name in the destination folder, and published only once the writer is done, so the name the person
 // asked for never holds a half-made clip.
-PartsOutcome save_in_parts(Ring& ring, Store::SaveJob& job, const SaveName& name, const std::string& staged) {
+PartsOutcome save_in_parts(Ring& ring, Store::SaveJob& job, const SaveName& name, const std::string& staged, const EpochInfo& epoch) {
   PartsOutcome outcome;
   outcome.path = staged;
   // What was written at the staging name becomes the clip when the writer finished. A writer that failed never publishes:
@@ -600,7 +729,7 @@ PartsOutcome save_in_parts(Ring& ring, Store::SaveJob& job, const SaveName& name
   for (uint32_t i = 0; i < all.size(); ++i) all[i] = i;
   if (!plan.valid) {
     BX_LOG_WARN("the ring's chunk records do not fit its chunk files; saving what the ring holds");
-    const bool wrote = write_packet_part(ring, job, all, staged, outcome);
+    const bool wrote = write_packet_part(ring, job, all, staged, outcome, epoch);
     outcome.partial = outcome.skipped > 0 || outcome.unreadable;
     settle(wrote);
     return outcome;
@@ -617,7 +746,7 @@ PartsOutcome save_in_parts(Ring& ring, Store::SaveJob& job, const SaveName& name
     return outcome;
   }
   if (plan.parts.size() == 1 && !plan.parts[0].file) {
-    const bool wrote = write_packet_part(ring, job, plan.parts[0].entries, staged, outcome);
+    const bool wrote = write_packet_part(ring, job, plan.parts[0].entries, staged, outcome, epoch);
     outcome.partial = outcome.skipped > 0 || outcome.unreadable;
     settle(wrote);
     return outcome;
@@ -639,7 +768,7 @@ PartsOutcome save_in_parts(Ring& ring, Store::SaveJob& job, const SaveName& name
       continue;
     }
     temps[i] = folder + "/part-" + std::to_string(GetCurrentProcessId()) + "-" + std::to_string(name.id) + "-" + std::to_string(i) + extension;
-    if (!write_packet_part(ring, job, part.entries, temps[i], outcome)) outcome.failed = true;
+    if (!write_packet_part(ring, job, part.entries, temps[i], outcome, epoch)) outcome.failed = true;
     files.push_back(temps[i]);
   }
   if (!outcome.failed) {
@@ -700,6 +829,82 @@ PartsOutcome save_in_parts(Ring& ring, Store::SaveJob& job, const SaveName& name
   return outcome;
 }
 
+// A save whose footage crosses encoder swaps (plan 008): one packet part per epoch, each through the muxer with its own epoch's header and
+// codec parameters, joined by stream copy on the keyframes every part starts with. A part's streams start at zero on their own, so the swap's
+// gap is not in the clip: the join continues where the previous part ended. When the join is refused the clip is the newest part, said in the
+// verdict like every other short clip. `partial_input` marks footage that was already left out before this point (an older epoch, or chunk
+// files, which cannot be planned across a swap).
+PartsOutcome save_epochs(Ring& ring, Store::SaveJob& job, const SaveName& name, const std::string& staged, const std::vector<EpochPart>& parts,
+                         bool partial_input) {
+  PartsOutcome outcome;
+  outcome.path = staged;
+  outcome.partial = partial_input;
+  BX_LOG_NOTE("a replay save crosses %zu encoder epochs (the first is epoch %u)", parts.size(), static_cast<unsigned>(parts.front().epoch));
+  std::vector<EpochInfo> infos(parts.size());
+  for (size_t i = 0; i < parts.size(); ++i) {
+    if (!find_epoch(ring, parts[i].epoch, infos[i]) || !infos[i].ok) {
+      BX_LOG_ERROR("the ring has no record of encoder epoch %u: its footage cannot be written", static_cast<unsigned>(parts[i].epoch));
+      outcome.failed = true;
+      publish_or_keep(ring, staged, name, false, outcome.path);
+      return outcome;
+    }
+  }
+  if (parts.size() == 1) {
+    const bool wrote = write_packet_part(ring, job, parts[0].entries, staged, outcome, infos[0]);
+    outcome.partial = outcome.partial || outcome.skipped > 0 || outcome.unreadable;
+    if (!publish_or_keep(ring, staged, name, wrote, outcome.path)) outcome.failed = true;
+    return outcome;
+  }
+  std::string folder = ring.spill_path;
+  const size_t folder_end = folder.find_last_of("/\\");
+  folder = folder_end == std::string::npos ? std::string() : folder.substr(0, folder_end);
+  if (folder.empty()) folder = staged.substr(0, staged.find_last_of('/')) + "/.buffrx";
+  os_mkdirs(folder.c_str());
+  const size_t dot = staged.find_last_of('.');
+  const std::string extension = dot == std::string::npos ? std::string(".mp4") : staged.substr(dot);
+  std::vector<std::string> temps(parts.size());
+  for (size_t i = 0; i < parts.size() && !outcome.failed; ++i) {
+    temps[i] = folder + "/part-" + std::to_string(GetCurrentProcessId()) + "-" + std::to_string(name.id) + "-e" + std::to_string(parts[i].epoch) + extension;
+    if (!write_packet_part(ring, job, parts[i].entries, temps[i], outcome, infos[i])) outcome.failed = true;
+  }
+  bool settled = false;
+  if (!outcome.failed) {
+    std::string error;
+    if (media_concat(temps, staged, 0.0, 1e9, error, nullptr, nullptr, true)) {
+      outcome.wrote = true;
+      settled = true;
+      if (!publish_or_keep(ring, staged, name, true, outcome.path)) outcome.failed = true;
+    } else {
+      BX_LOG_ERROR("the replay ring could not join its encoder epochs (%s)", error.c_str());
+      if (publish_newest_part(ring, temps.back(), name, outcome.path)) {
+        settled = true;
+        outcome.skipped = job.entries.size() - parts.back().entries.size();
+        outcome.partial = true;
+        BX_LOG_ERROR("the clip %s holds only the newest %zu records of the ring", outcome.path.c_str(), parts.back().entries.size());
+      } else {
+        outcome.failed = true;
+        temps.back().clear();  // the verdict's path names where it stays
+      }
+    }
+  }
+  // As in save_in_parts: a save that reached its staging file deletes its parts; a failed one keeps those with bytes in them.
+  std::string newest_kept;
+  for (const std::string& temp : temps) {
+    if (temp.empty()) continue;
+    if (!outcome.failed || settled) DeleteFileA(temp.c_str());
+    else if (file_has_bytes(temp)) newest_kept = temp;
+    else remove_empty_staged(temp);
+  }
+  if (outcome.failed && !settled) {
+    std::string kept_stage;
+    publish_or_keep(ring, staged, name, false, kept_stage);
+    if (outcome.path.empty() || !file_has_bytes(outcome.path)) outcome.path = kept_stage.empty() ? newest_kept : kept_stage;
+    if (!newest_kept.empty()) BX_LOG_ERROR("the save failed; its packet parts are kept beside the ring's file for recovery, such as %s", newest_kept.c_str());
+  }
+  if (outcome.skipped > 0 || outcome.unreadable) outcome.partial = true;
+  return outcome;
+}
+
 // The verdict of a save is kept before the signal, so the host reads this save's result and never an older one's.
 void finish_save(Ring& ring, const SaveOutcome& result) {
   {
@@ -739,12 +944,46 @@ void mux_thread_main(Ring* ring, const SaveName& name, int seconds) {
     job.reset();
     ring->muxing = false;
     finish_save(*ring, save_result(name.id, std::string(), false, false, 0, 0, false, false));
-    if (!ring->active) teardown(*ring);  // the ring went down under this save: its memory goes now, and nothing may start another
+    if (!ring->active && !keeping(*ring)) teardown(*ring);  // the ring went down under this save: its memory goes now, and nothing may start another
     return;
   }
   ring->last_skipped = 0;
+  // A snapshot of one epoch is today's save exactly. One that crosses an encoder swap is written a part per epoch (save_epochs); with chunk
+  // files in it (the opt-in dedupe) only the newest epoch is, because a chunk plan across a swap is not built: said in the verdict.
+  std::vector<EpochPart> eparts = epoch_parts(job->entries);
+  bool epochs_cut_chunks = false;
+  if (!eparts.empty() && snapshot_has_chunks(job->entries)) {
+    BX_LOG_WARN("a replay save crosses an encoder swap with Timeline chunk files in it: only the newest encoder's footage is saved");
+    eparts.erase(eparts.begin(), eparts.end() - 1);
+    epochs_cut_chunks = true;
+  }
+  if (!eparts.empty()) {
+    PartsOutcome outcome = save_epochs(*ring, *job, name, staged, eparts, epochs_cut_chunks);
+    {
+      std::lock_guard<std::mutex> lock(ring->path_mutex);
+      ring->path = outcome.path;
+    }
+    ring->last_skipped = static_cast<int>(std::min<size_t>(outcome.skipped, 1000000));
+    const SaveOutcome result = save_parts_result(name.id, outcome.path, outcome.wrote, outcome.failed, outcome.muxer_exit,
+                                                 outcome.skipped, outcome.unreadable, outcome.partial);
+    job.reset();
+    ring->muxing = false;
+    finish_save(*ring, result);
+    if (!ring->active && !keeping(*ring)) teardown(*ring);
+    return;
+  }
+  EpochInfo epoch;
+  const uint16_t snapshot_epoch = job->entries.empty() ? 0 : job->entries.front().epoch;
+  if (!find_epoch(*ring, snapshot_epoch, epoch)) {
+    BX_LOG_ERROR("the ring has no record of encoder epoch %u: nothing can be written", static_cast<unsigned>(snapshot_epoch));
+    job.reset();
+    ring->muxing = false;
+    finish_save(*ring, save_result(name.id, std::string(), false, false, 0, 0, false, false));
+    if (!ring->active && !keeping(*ring)) teardown(*ring);
+    return;
+  }
   if (snapshot_has_chunks(job->entries)) {
-    PartsOutcome outcome = save_in_parts(*ring, *job, name, staged);
+    PartsOutcome outcome = save_in_parts(*ring, *job, name, staged, epoch);
     {
       std::lock_guard<std::mutex> lock(ring->path_mutex);
       // The published name, or the staging name the footage stayed at when no name could be freed.
@@ -756,19 +995,19 @@ void mux_thread_main(Ring* ring, const SaveName& name, int seconds) {
     job.reset();
     ring->muxing = false;
     finish_save(*ring, result);
-    if (!ring->active) teardown(*ring);  // the ring went down under this save: its memory goes now, and nothing may start another
+    if (!ring->active && !keeping(*ring)) teardown(*ring);  // the ring went down under this save: its memory goes now, and nothing may start another
     return;
   }
   bool wrote_every_packet = true;
   bool unreadable = false;
   size_t skipped = 0;
   int muxer_exit = 0;
-  ring->pipe = start_muxer(*ring, staged);
+  ring->pipe = start_muxer(*ring, staged, epoch);
   if (!ring->pipe) {
     BX_LOG_WARN("the ring could not start its muxer process for %s", staged.c_str());
     wrote_every_packet = false;
   } else {
-    if (!write_headers(*ring)) {
+    if (!write_headers(*ring, epoch)) {
       BX_LOG_WARN("the ring could not write the headers of %s", staged.c_str());
       wrote_every_packet = false;
     } else {
@@ -804,7 +1043,7 @@ void mux_thread_main(Ring* ring, const SaveName& name, int seconds) {
   ring->muxing = false;
   finish_save(*ring, save_result(name.id, kept, !kept.empty(), published, muxer_exit, skipped, unreadable, false));
 
-  if (!ring->active) teardown(*ring);  // the ring went down under this save: its memory goes now, and nothing may start another
+  if (!ring->active && !keeping(*ring)) teardown(*ring);  // the ring went down under this save: its memory goes now, and nothing may start another
 }
 
 // A save: a thread of its own takes the view of the ring and writes it out. The snapshot used to be taken on the
@@ -814,7 +1053,7 @@ void mux_thread_main(Ring* ring, const SaveName& name, int seconds) {
 // name is made here, at the second the save was asked for, and the folder and the names already in it are asked on the
 // save's own thread.
 void start_save(Ring& ring) {
-  if (!ring.active) return;  // deactivated under the ask: a save must never start after the ring is down
+  if (!ring.active && !keeping(ring)) return;  // deactivated under the ask: a save must never start after the ring is down
   obs_data_t* settings = obs_output_get_settings(ring.output);
   const char* directory_setting = obs_data_get_string(settings, "directory");
   const char* format = obs_data_get_string(settings, "format");
@@ -877,6 +1116,10 @@ void deactivate(Ring& ring, int code) {
     ring.active = false;
   }
   ring.stopping = false;
+  // An encoder swap (plan 008) stops the output to give it another encoder and starts it again, and the footage must stay for that. An error
+  // stop is never a swap.
+  if (keeping(ring) && code == 0) return;
+  ring.keep_store = false;
   // A save in flight is reading the ring, so its end waits for the muxer's thread, which tears the ring down itself when it sees the
   // ring is no longer active; otherwise memory goes back at once.
   if (ring.muxing) ring.save_ts = 0;
@@ -903,7 +1146,8 @@ void save_proc(void* data, calldata_t*) {
 // already the length the person chose. A trim afterwards is then the exception (a keyframe a little early), not the rule.
 void save_seconds_proc(void* data, calldata_t* call) {
   auto* ring = static_cast<Ring*>(data);
-  if (!ring->active) return;
+  // A swap that failed twice writes the ring out while its output is down (keep_store): the footage is all there.
+  if (!ring->active && !keeping(*ring)) return;
   obs_encoder_t* video = obs_output_get_video_encoder(ring->output);
   if (video && obs_encoder_paused(video)) {
     BX_LOG_INFO("the ring was not saved: the encoders are paused");
@@ -964,6 +1208,13 @@ void info_proc(void* data, calldata_t* call) {
   calldata_set_int(call, "deduped_bytes", info.deduped_total);
   calldata_set_int(call, "chunks_linked", info.chunks_linked);
   calldata_set_int(call, "chunks_waiting", info.chunks_waiting);
+  {
+    std::lock_guard<std::mutex> lock(ring->epoch_mutex);
+    calldata_set_int(call, "epoch", ring->epoch_id);
+  }
+  calldata_set_int(call, "swaps", ring->epoch_swaps.load());
+  calldata_set_int(call, "swap_gap_us", ring->last_swap_gap_us.load());
+  calldata_set_int(call, "swap_shift_us", ring->last_swap_shift_us.load());
 }
 
 // The Timeline dedupe's three calls (obs_host_dedupe.cpp): hand over a probed chunk, say whether the spill may rely on one, and list what the ring knows.
@@ -991,6 +1242,28 @@ void chunk_states_proc(void* data, calldata_t* call) {
   for (const Store::ChunkState& state : ring->store.chunk_states()) states.push_back(RingChunkState{state.id, state.file, state.linked, state.usable, state.at, state.count});
 }
 
+// The host's first move in an encoder swap (plan 008): asks the ring to keep its footage through the next stop. Refused (ok=false) while a save
+// is being written or waits to start, and when the ring is not running: the host then does not stop it.
+void swap_prepare_proc(void* data, calldata_t* call) {
+  auto* ring = static_cast<Ring*>(data);
+  std::lock_guard<std::mutex> lock(ring->save_mutex);
+  // A chunk-backed save does not yet have a planner that spans encoder epochs.
+  // Keep the footage intact by refusing swaps while the experimental tier is on.
+  const bool ok = ring->active && !ring->muxing && !ring->save_ts && !ring->stopping && !ring->store.dedupe_enabled();
+  if (ok) {
+    ring->keep_until_ms = static_cast<int64_t>(GetTickCount64()) + 20000;
+    ring->keep_store = true;
+  }
+  calldata_set_bool(call, "ok", ok);
+}
+
+// The host gave the swap up: the next stop is an ordinary one again, and a ring that is already down lets its memory go.
+void swap_cancel_proc(void* data, calldata_t*) {
+  auto* ring = static_cast<Ring*>(data);
+  ring->keep_store = false;
+  if (!ring->active && !ring->muxing) teardown(*ring);
+}
+
 // Why the disk part is unavailable, once it is (empty otherwise).
 void problem_proc(void* data, calldata_t* call) {
   auto* ring = static_cast<Ring*>(data);
@@ -1012,9 +1285,12 @@ void* ring_create(obs_data_t*, obs_output_t* output) {
   proc_handler_add(procs,
                    "void ring_info(out int bytes, out int packets, out int span_ms, out int total_bytes, out int ram_bytes, out int disk_bytes, "
                    "out int spilled_bytes, out int state, out int stalled, out int backstop, out int skipped, "
-                   "out int chunk_bytes, out int deduped_bytes, out int chunks_linked, out int chunks_waiting)",
+                   "out int chunk_bytes, out int deduped_bytes, out int chunks_linked, out int chunks_waiting, out int epoch, out int swaps, "
+                   "out int swap_gap_us, out int swap_shift_us)",
                    info_proc, ring);
   proc_handler_add(procs, "void spill_problem(out string text)", problem_proc, ring);
+  proc_handler_add(procs, "void swap_prepare(out bool ok)", swap_prepare_proc, ring);
+  proc_handler_add(procs, "void swap_cancel()", swap_cancel_proc, ring);
   proc_handler_add(procs, "void link_chunk(ptr probe, out int id)", link_chunk_proc, ring);
   proc_handler_add(procs, "void chunk_usable(int id, int usable)", chunk_usable_proc, ring);
   proc_handler_add(procs, "void chunk_states(ptr states)", chunk_states_proc, ring);
@@ -1033,6 +1309,30 @@ bool ring_start(void* data) {
   auto* ring = static_cast<Ring*>(data);
   if (!obs_output_can_begin_data_capture(ring->output, 0)) return false;
   if (!obs_output_initialize_encoders(ring->output, 0)) return false;
+  if (keeping(*ring)) {
+    // The restart of an encoder swap: the footage, the disk part and its thread carry on, and what follows is a new epoch. A failure above
+    // leaves the flag set so the host can start the old encoder again; the host clears it when it gives the swap up.
+    {
+      std::lock_guard<std::mutex> lock(ring->epoch_mutex);
+      // No save is running during a prepared swap. Headers older than the ring's
+      // oldest packet are no longer needed; prune in arrival order so uint16 wrap
+      // does not accumulate stale records with the same id.
+      const uint16_t oldest = ring->store.oldest_epoch();
+      const auto first = std::find_if(ring->epochs.begin(), ring->epochs.end(),
+                                      [oldest](const EpochInfo& epoch) { return epoch.id == oldest; });
+      ring->epochs.erase(ring->epochs.begin(), first);
+      ++ring->epoch_id;
+      ring->epoch_pending = true;
+      ring->store.begin_epoch(ring->epoch_id);
+    }
+    ring->epoch_swaps.fetch_add(1);
+    ring->keep_store = false;
+    ring->active = true;
+    ring->capturing = true;
+    obs_output_begin_data_capture(ring->output, 0);
+    return true;
+  }
+  ring->keep_store = false;  // an ask that ran out of time is not a swap: this is a fresh buffer
   join_mux(*ring);  // a save from before a restart
   teardown(*ring);
   {
@@ -1079,7 +1379,9 @@ bool ring_start(void* data) {
 void ring_stop(void* data, uint64_t ts) {
   auto* ring = static_cast<Ring*>(data);
   if (ring->capturing || ts == 0) {
-    ring->stop_ts = static_cast<int64_t>(ts) / 1000;
+    // A swap's stop does not wait for a picture made after the ask: an encoder that is behind (the case a swap is for) hands over pictures that
+    // are seconds old, and waiting for a new one kept the output up past the swap's patience. The next packet ends it.
+    ring->stop_ts = keeping(*ring) ? 0 : static_cast<int64_t>(ts) / 1000;
     ring->stopping = true;
     ring->capturing = false;
   }
@@ -1107,9 +1409,14 @@ void ring_packet(void* data, encoder_packet* packet) {
     }
     std::fflush(ring->keylog);  // a probe: the file must be whole when the engine is stopped in a hurry
   }
+  // The first picture of an epoch records the encoders' header and parameters (EpochInfo), before the packet is in the ring: a save that
+  // sees the packet finds its epoch.
+  const bool epoch_first = packet->type == OBS_ENCODER_VIDEO && ring->epoch_pending.exchange(false);
+  if (epoch_first) begin_epoch_record(*ring);
   encoder_packet kept;
   obs_encoder_packet_ref(&kept, packet);
   ring->store.push(kept);
+  if (epoch_first) log_epoch_start(*ring, *packet);
   if (ring->store.spill_due()) ring->spill_cv.notify_one();
   // While the last save is still being written this one waits for it.
   if (ring->save_ts && packet->sys_dts_usec >= ring->save_ts && !ring->muxing) begin_asked_save(*ring);

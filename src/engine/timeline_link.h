@@ -20,7 +20,7 @@ namespace bx {
 // A video keyframe the ring holds.
 struct RingKey {
   uint64_t seq = 0;      // the video packet's ordinal since the ring started
-  int64_t dts_usec = 0;  // on the encoder's clock
+  int64_t dts_usec = 0;  // on the ring index's clock
   uint64_t hash = 0;     // vcl_digest of the packet
   uint32_t vcl_bytes = 0;
 };

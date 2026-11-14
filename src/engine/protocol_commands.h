@@ -11,8 +11,8 @@ namespace bx {
 
 struct CommandSpec {
   const char* name;
-  // Slow file work that must not hold the engine lock (command_policy.h): the library, Timeline and sharing
-  // families. Everything else runs under it.
+  // Slow external reads and file work that must not hold the engine lock (command_policy.h): audio sessions,
+  // the library, Timeline and sharing families. Everything else runs under it.
   bool lock_free;
 };
 
@@ -48,6 +48,7 @@ inline constexpr CommandSpec kProtocolCommands[] = {
     {"hotkeys.set", false},
     {"devices.list", false},
     {"audio.get", false},
+    {"audio.sessions", true},
     {"audio.set", false},
     {"profiles.list", false},
     {"profiles.add", false},
@@ -84,6 +85,7 @@ inline constexpr CommandSpec kProtocolCommands[] = {
     {"timeline.edit", true},
     {"timeline.edit_source", true},
     {"encoder.properties", false},
+    {"diagnostics.report", true},
     {"encoder.set", false},
     {"ui.show", false},
     {"ui.share", false},

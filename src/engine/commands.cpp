@@ -26,6 +26,9 @@
 
 #include "../shared/files.h"
 #include "../shared/log.h"
+#include "audio_layout.h"
+#include "audio_routing.h"
+#include "audio_sessions.h"
 #include "gpu.h"
 #include "capture_follow.h"
 #include "capacity_memory.h"
@@ -162,7 +165,93 @@ Json audio_json(const Config& c) {
   audio.set("mic_noise_suppress", Json(c.mic_noise_suppress));
   audio.set("mic_noise_gate", Json(c.mic_noise_gate));
   audio.set("audio_bitrate_kbps", Json(c.audio_bitrate_kbps));
+  audio.set("audio_capture_mode", Json(c.audio_capture_mode));
+  audio.set("audio_capture_legacy_mode", Json(c.audio_capture_legacy_mode));
+  audio.set("apps", audio_apps_json(c.audio_apps));
+  audio.set("audio_app_prefs", auto_audio_prefs_json(c.audio_app_prefs));
+  audio.set("audio_other_volume", Json(auto_volume(c.audio_other_volume)));
+  audio.set("audio_other_muted", Json(c.audio_other_muted));
   return audio;
+}
+
+// The wire shape of one automatic lane (audio_auto.h). The group's own gain and mute are in `volume` and
+// `muted`; each Other audio member carries its effective values in `apps`.
+Json auto_lane_json(const AutoAudioLane& lane) {
+  Json entry = Json::object();
+  entry.set("track", Json(lane.track));
+  entry.set("exe", Json(lane.exe));
+  entry.set("name", Json(lane.name));
+  entry.set("state", Json(lane.state));
+  entry.set("volume", Json(auto_volume(lane.volume)));
+  entry.set("muted", Json(lane.muted));
+  entry.set("other", Json(lane.other));
+  Json apps = Json::array();
+  for (const AutoAudioApp& app : lane.apps) {
+    Json item = Json::object();
+    item.set("exe", Json(app.exe));
+    item.set("name", Json(app.name));
+    item.set("state", Json(app.state));
+    item.set("volume", Json(auto_volume(app.volume)));
+    item.set("muted", Json(app.muted));
+    apps.push(item);
+  }
+  entry.set("apps", apps);
+  return entry;
+}
+
+// A watcher that was never started (a quiet engine) says "not running"; that is not an error to show. A
+// watcher that tried and failed has a real reason, and it rides on the status even while watching is false.
+std::string auto_watch_error(const AudioSessionWatcher& watcher) {
+  const std::string error = watcher.error();
+  return error == "the audio session watcher is not running" ? std::string() : error;
+}
+
+Json auto_audio_json(const ObsHost::AutoAudioView& view, bool watching, const std::string& watch_error,
+                     bool performance_override) {  Json json = Json::object();
+  json.set("on", Json(view.on));
+  json.set("watching", Json(watching));
+  json.set("unsupported", Json(view.unsupported));
+  json.set("error", Json(!view.error.empty() ? view.error : watch_error));
+  json.set("sources", Json(view.sources));
+  json.set("performance_override", Json(performance_override));
+  Json lanes = Json::array();
+  for (const AutoAudioLane& lane : view.lanes) lanes.push(auto_lane_json(lane));
+  json.set("lanes", lanes);
+  Json uncaptured = Json::array();
+  for (const AutoAudioUncaptured& one : view.uncaptured) {
+    Json item = Json::object();
+    item.set("exe", Json(one.exe));
+    item.set("name", Json(one.name));
+    item.set("state", Json(one.state));
+    item.set("error", Json(one.error));
+    uncaptured.push(item);
+  }
+  json.set("uncaptured", uncaptured);
+  return json;
+}
+
+// The facts the missed-audio card judges in automatic mode: the lanes that are on, never a game named
+// because the manual selection is empty. A quiet desktop has no lanes and therefore nothing to say.
+AudioHealthFacts auto_health_facts(const ObsHost::AutoAudioView& view, bool capture_active) {
+  AudioHealthFacts facts;
+  facts.apps_mode = true;
+  facts.capture_active = capture_active;
+  for (const AutoAudioLane& lane : view.lanes) {
+    if (lane.other) {
+      for (const AutoAudioApp& app : lane.apps) {
+        AudioHealthSlot slot;
+        slot.exe = app.exe;
+        slot.connected = app.state == "connected";
+        facts.slots.push_back(std::move(slot));
+      }
+    } else {
+      AudioHealthSlot slot;
+      slot.exe = lane.exe;
+      slot.connected = lane.state == "connected";
+      facts.slots.push_back(std::move(slot));
+    }
+  }
+  return facts;
 }
 
 // The graphics vendor and adapter name, read once: hello is answered many times, DXGI is not asked
@@ -302,7 +391,10 @@ Protocol::Protocol(ObsHost& host, PlatformWindow& window, std::string data_root,
   }
 }
 
-Protocol::~Protocol() { stop_update_download(); }
+Protocol::~Protocol() {
+  auto_watcher_.stop();
+  stop_update_download();
+}
 
 void Protocol::stop_update_download() {
   update_stop_.store(true, std::memory_order_relaxed);
@@ -623,6 +715,7 @@ Json Protocol::status_json() {
   Json json = Json::object();
   json.set("buffering", Json(stats.buffer_active));
   json.set("buffer_state", Json(stats.buffer_state));
+  json.set("game_wait", Json(game_wait_));
   json.set("asleep", Json(stats.asleep));
   json.set("recording", Json(stats.recording));
   json.set("recording_pending", Json(stats.recording_pending));
@@ -637,6 +730,11 @@ Json Protocol::status_json() {
   Json capture = Json::object();
   capture.set("mode", Json(stats.capture_mode));
   capture.set("target", Json(stats.capture_target));
+  // The display actually captured, the one saved, and whether the primary stood in: the saved index is never
+  // reported as the target after a rearrange, and a reconnect follows the saved device.
+  capture.set("display", Json(stats.capture_display));
+  capture.set("display_requested", Json(stats.capture_display_requested));
+  capture.set("display_fallback", Json(stats.capture_display_fallback));
   capture.set("width", Json(stats.width));
   capture.set("height", Json(stats.height));
   capture.set("fps", Json(stats.fps));
@@ -677,6 +775,8 @@ Json Protocol::status_json() {
   ring.set("deduped_bytes", Json(static_cast<int64_t>(stats.ring_deduped_bytes)));
   ring.set("chunks_linked", Json(stats.ring_chunks_linked));
   ring.set("chunks_waiting", Json(stats.ring_chunks_waiting));
+  ring.set("epoch", Json(stats.ring_epoch));  // the encoder the newest footage came from: 0 until the first swap (plan 008)
+  ring.set("swaps", Json(stats.ring_swaps));
   ring.set("disk", Json(stats.ring_disk_state == 1 ? "on" : (stats.ring_disk_state == 2 ? "unavailable" : "off")));
   ring.set("stalled", Json(stats.ring_stalled));
   ring.set("filled", Json(stats.ring_filled));
@@ -689,6 +789,20 @@ Json Protocol::status_json() {
   samples.set("levels", levels);
   json.set("stats", samples);
   json.set("encoder", Json(stats.encoder_id));
+  {
+    // The dynamic controller (plan 008): what level the encoder runs at, and what that means for the clips (the rate the encoder keeps).
+    const ObsHost::ControllerStatus control = host_.controller_status();
+    Json encoder_control = Json::object();
+    encoder_control.set("enabled", Json(control.enabled));
+    encoder_control.set("level", Json(control.level));
+    encoder_control.set("levels", Json(control.levels));
+    encoder_control.set("effort", Json(control.effort));
+    encoder_control.set("divisor", Json(control.divisor));
+    encoder_control.set("canvas_fps", Json(control.canvas_fps));
+    encoder_control.set("fps", Json(control.fps));
+    encoder_control.set("label", Json(control.label));
+    json.set("encoder_control", encoder_control);
+  }
   Json performance = Json::object();
   performance.set("active", Json(host_.performance_active()));
   performance.set("reason", Json(std::string(host_.performance_reason())));
@@ -711,6 +825,88 @@ Json Protocol::status_json() {
   game.set("capturing_game", Json(game_capture_.capturing));
   game.set("auto_capture", Json(config_.auto_game_capture));
   json.set("game", game);
+  // The selected audio slots as they really are, per slot: the page says "Recording now", "Waiting for
+  // Discord to start" or "Could not capture", never that a route records because it is saved. `recorded`
+  // is false in desktop mode and while Performance mode's own mix runs: the saved selection is kept but
+  // is not what is being written.
+  {
+    Json audio = Json::object();
+    audio.set("mode", Json(config_.audio_capture_mode));
+    const bool auto_mode = config_.audio_capture_mode == "auto";
+    const bool capturing = host_.buffer_wanted() || host_.recording_busy() || host_.timeline_writer_active();
+    const ObsHost::AutoAudioView auto_view = host_.auto_audio_view();
+    // Automatic mode is on even while the desktop is quiet: `on` is the setting, `watching` is the event
+    // watcher that runs only while something is capturing, and `lanes` is what is audible right now.
+    audio.set("auto", auto_audio_json(auto_view, auto_watcher_.ready(), auto_watch_error(auto_watcher_), false));
+    const bool recorded = config_.audio_capture_mode == "apps" && !host_.performance_active();
+    const std::vector<ObsHost::AudioSlotHealth> health = host_.audio_slot_health();
+    const std::vector<AudioApp> selected = effective_audio_apps(config_);
+    // The same facts the card's policy uses (audio_health.h), built from what is already on hand: the game the
+    // capture covers comes from the last poll, the tracks' own hook state from the host. Nothing here samples
+    // a meter, lists a window or starts a thread.
+    AudioHealthFacts facts;
+    facts.apps_mode = recorded;
+    facts.capture_active = host_.buffer_wanted() || host_.recording_busy() || host_.timeline_writer_active();
+    facts.captured_game_exe = audio_warning_game_;
+    Json slots = Json::array();
+    int connected = 0;
+    for (size_t i = 0; i < selected.size(); ++i) {
+      const AudioApp& app = selected[i];
+      ObsHost::AudioSlotHealth slot_health;
+      if (i < health.size()) slot_health = health[i];
+      const bool is_game = audio_app_is_game(app);
+      AudioHealthSlot fact;
+      fact.game = is_game;
+      fact.exe = !slot_health.exe.empty() ? slot_health.exe : app.exe;
+      fact.connected = slot_health.connected;
+      facts.slots.push_back(std::move(fact));
+      Json slot = Json::object();
+      slot.set("game", Json(is_game));
+      slot.set("covered", Json(slot_health.covered));
+      slot.set("track", Json(kAudioAppFirstTrack + static_cast<int>(i)));
+      slot.set("exe", Json(is_game ? slot_health.exe : app.exe));
+      slot.set("title", Json(is_game ? std::string("Current game") : app.title));
+      slot.set("volume", Json(audio_app_volume(app.volume)));
+      slot.set("muted", Json(app.muted));
+      std::string state;
+      if (!recorded) state = "off";
+      else if (slot_health.covered) state = "covered";
+      else if (slot_health.failed) state = "failed";
+      else if (slot_health.connected) state = "connected";
+      else state = "waiting";
+      if (state == "connected") ++connected;
+      slot.set("state", Json(state));
+      slot.set("allocated", Json(slot_health.allocated));
+      slots.push(slot);
+    }
+    (void)capturing;
+    if (auto_mode) {
+      facts = auto_health_facts(auto_view, capturing);
+      connected = 0;
+      for (const AutoAudioLane& lane : auto_view.lanes) {
+        if (lane.state == "connected") ++connected;
+      }
+    }
+    const AudioProblem problem = audio_health_problem(facts);
+    const std::string problem_key = audio_health_key(facts, problem);
+    uint32_t problem_ms = 0;
+    if (problem != AudioProblem::none && problem_key == audio_notice_.key && audio_poll_ms_ != 0)
+      problem_ms = audio_poll_ms_ - audio_notice_.first_seen_ms;
+    // What the card would say, kept on the wire after it is gone: a game that is playing and not recorded is
+    // a standing fact, not a toast. `problem_steady` hides the moment a game is still starting or a route is
+    // still connecting, so the line under the slots never flashes.
+    audio.set("problem", Json(std::string(audio_problem_name(problem))));
+    audio.set("problem_ms", Json(static_cast<int>(problem_ms)));
+    audio.set("problem_steady", Json(audio_problem_steady(problem, problem_ms)));
+    audio.set("game_exe", Json(facts.captured_game_exe));
+    audio.set("slots", slots);
+    audio.set("slots_used", Json(static_cast<int>(selected.size())));
+    audio.set("slot_limit", Json(kAudioAppMax));
+    audio.set("legacy_over", Json(static_cast<int>(over_limit_audio_apps(config_).size())));
+    audio.set("connected", Json(connected));
+    audio.set("recorded", Json(recorded));
+    json.set("audio", audio);
+  }
   // The exclusion list (about 110 fixed names) is not here: it is read once by `game.exclusions` when the page that shows it
   // opens, instead of riding on a status that is built twice a second.
   // True while the pipeline is being torn down and rebuilt (a resolution, codec or encoder change).
@@ -731,17 +927,38 @@ Json Protocol::apply_patch(const Json& patch, std::string& error) {
   if (!patch.has("video_preset") && !patch.has("quality") && !patch.has("quality_tier") && !patch.has("peak_mode"))
     config_.video_preset = before.video_preset;
   if (patch.has("audio")) config_apply_audio(patch["audio"], config_);
+  // Four selected slots, enforced here and not only by the page: a client cannot hand the engine a fifth
+  // route. A file that already holds more than four (written when eight were allowed) may still be edited
+  // or shrunk: only a selection larger than what is stored is refused.
+  if (patch.has("audio_apps") || (patch.has("audio") && patch["audio"].has("apps"))) {
+    const std::vector<AudioApp> patched = normalize_audio_apps(config_.audio_apps);
+    const std::vector<AudioApp> stored = normalize_audio_apps(before.audio_apps);
+    if (patched.size() > static_cast<size_t>(kAudioAppMax) && patched.size() > stored.size()) {
+      config_ = before;
+      error = "Four apps at most can be recorded. Remove one first.";
+      return Json::object();
+    }
+  }
   apply_path_defaults(config_, data_root_);
   // The monitor is saved by its Windows device name, because the index in EnumDisplayMonitors order
   // moves when a display is unplugged, replugged or rearranged: a stale index can point at another
-  // screen without anyone noticing. The name is what the capture source matches on.
-  // The index is resolved only while capturing a display, but a changed index must clear the old name
-  // in every mode: pick_display prefers the name, so a stale one sent a later display switch to the
-  // monitor that used to hold that index.
-  const bool display_id_changed = patch.has("display_id") && config_.display_id != before.display_id;
-  if (display_id_changed) config_.display_name.clear();
+  // screen without anyone noticing. The name is what the capture source matches on; the index is kept
+  // for older clients and for configs that never saved a name.
+  const std::vector<DisplayInfo> displays = host_.displays();
+  // A picker sends the card's index and device together. Between drawing the cards and the click the
+  // desktop can change, and that pair then names a display nobody chose: refuse it, so the client
+  // redraws, instead of capturing another monitor.
+  if (patch.has("display_id") && patch.has("display_name") && !config_.display_name.empty() &&
+      !display_selection_current(displays, config_.display_id, config_.display_name)) {
+    config_ = before;
+    error = "The display list changed. Choose the display again.";
+    return Json::object();
+  }
+  // An index-only client means "the display at this position now", even when the number is the one
+  // already stored: an explicit index must not be overruled by an older saved name.
+  if (patch.has("display_id") && !patch.has("display_name")) config_.display_name.clear();
   if (config_.capture_mode == "display") {
-    config_.display_name = resolved_display_name(host_.displays(), config_.display_id, config_.display_name);
+    config_.display_name = resolved_display_name(displays, config_.display_id, config_.display_name);
   }
   // A custom rate was chosen for the picture it gave in the codec in use. Moving from H.264 to AV1 at
   // the same 60 Mbps would spend twice what AV1 needs for that picture, so the rate is carried across
@@ -753,16 +970,16 @@ Json Protocol::apply_patch(const Json& patch, std::string& error) {
                 config_.codec.c_str(), config_.custom_kbps, carried);
     config_.custom_kbps = carried;
   }
+  // A codec the person picks is theirs: the start-up move off an auto-picked AV1 must never apply to it.
+  if (before.codec != config_.codec) config_.codec_h264_default_migrated = true;
   // Capture target changes are deliberately absent: the host swaps the source under a running ring
   // (ObsHost::apply), and asking for an output restart here is what used to empty the buffer on every
   // capture switch, game detection included.
-  // What the governor settled on belongs to the settings that made the encoder slow. Change them (a lighter
-  // preset, a lower frame rate, another codec) and it starts again from what was chosen. One table also
-  // decides whether the pipeline is rebuilt; the field lists used to be written twice and drifted.
+  // What the encoder controller settled on belongs to the settings that made the encoder slow: the rebuild a change of them causes starts it
+  // again from what was chosen (ObsHost::controller_prepare, memory keyed by the GPU and the settings). One table also decides whether the
+  // pipeline is rebuilt; the field lists used to be written twice and drifted.
   const unsigned changed = config_change_bits(before, config_);
-  const bool speed_inputs_changed = (changed & kConfigSpeedInput) != 0;
   const bool restart = (changed & kConfigRebuilds) != 0;
-  if (speed_inputs_changed && !patch.has("encoder_speed_step")) config_.encoder_speed_step = 0;
   if (bx::config_change_waits_for_recording(restart, before.performance_when != config_.performance_when,
                                             host_.recording_busy())) {
     config_ = before;
@@ -775,15 +992,13 @@ Json Protocol::apply_patch(const Json& patch, std::string& error) {
     config_ = before;
     return Json::object();
   }
-  // A step this machine settled on is remembered between launches, so the patch that puts it back to full
-  // speed must also drop the record for these settings: otherwise the next launch reads it and steps down
-  // again, and "Start from full speed again" looks like it did nothing. Done after apply, so a patch the
+  // "Start from full speed again" (the Video page's button sends encoder_speed_step: 0, a trigger that is never stored): the level the controller
+  // settled at is forgotten, for this GPU and these settings, and the encoder goes back to the person's own. Done after apply, so a patch the
   // running recording refused leaves the memory alone.
-  if (config_.encoder_speed_step == 0 && (speed_inputs_changed || patch.has("encoder_speed_step"))) {
-    bx::capacity_forget_key(
-        data_root_ + "\\capacity.json",
-        bx::capacity_key(config_.codec, config_.encoder, config_.output_width, config_.output_height,
-                         config_.capture_fps, config_.video_preset));
+  if (patch.has("encoder_speed_step")) {
+    host_.clear_encoder_ladder();
+    host_.controller_reset();
+    config_.encoder_speed_step = 0;
   }
   follow_library_paths(before);
   if (links_ && (before.share_link_page != config_.share_link_page || before.share_sender_name != config_.share_sender_name ||
@@ -802,19 +1017,15 @@ Json Protocol::apply_patch(const Json& patch, std::string& error) {
   return config_json();
 }
 
-void Protocol::note_governor_step(int step) {
-  config_.encoder_speed_step = step;
-  std::string error;
-  if (!persist(error)) BX_LOG_WARN("settings could not be written: %s", error.c_str());
-  if (broadcaster) broadcaster(make_event("config.changed", Json::object()));
-}
-
 void Protocol::check_capture_target() {
   // Only a pinned target can go away: "any fullscreen game" has no window to close, and the display
   // is always there.
   const bool pinned = config_.capture_mode == "window" ||
                       (config_.capture_mode == "game" && !config_.game_title.empty());
   if (!pinned) return;
+  // Games only never puts the desktop under the ring: a game that closed leaves its capture as it is (a black frame at
+  // worst) and the policy pauses the buffer a few seconds later, which is when the target goes back to the display.
+  if (config_.game_only && config_.auto_game_capture && config_.capture_mode == "game") return;
   const std::string& target = config_.capture_mode == "game" ? config_.game_title : config_.window_id;
   if (capture_target_alive(target, config_.capture_mode == "game")) return;
   // The same fallback the launch path uses (validate_capture_target): the dead id is kept, so the
@@ -1059,6 +1270,9 @@ void Protocol::poll_timeline(uint32_t now_ms) {
     timeline_windowed_hwnd_ = 0;
     timeline_windowed_exe_.clear();
   }
+  // The game the detectors call running, kept for the audio warning: the same fact Timeline's own gate uses, so a
+  // game that is detected without being captured still counts, and nothing is sampled a second time for it.
+  detected_game_exe_ = facts.enabled && facts.buffer_on && facts.game_running ? facts.game_exe : std::string();
   host_.poll_timeline(now_ms, facts);
   // `timeline.changed` marks a state change - waiting, writing, paused, off - never one event per chunk:
   // the preview polls `timeline.get` for new footage, which costs a bounded disk read and wakes nobody.
@@ -1072,6 +1286,162 @@ void Protocol::poll_timeline(uint32_t now_ms) {
 }
 
 TimelineState Protocol::timeline_state() const { return host_.timeline_state(); }
+
+void Protocol::poll_auto_audio(uint32_t now_ms) {
+  const bool wanted = config_.audio_capture_mode == "auto" &&
+                      (host_.buffer_wanted() || host_.recording_busy() || host_.timeline_writer_active());
+  if (!wanted || config_.audio_capture_mode != "auto") {
+    if (auto_watcher_.running()) auto_watcher_.stop();
+    host_.stop_auto_audio();
+    auto_generation_ = ~0ull;
+    auto_apply_ms_ = 0;
+    return;
+  }
+  if (!auto_watcher_.running()) {
+    if (auto_apply_ms_ != 0 && now_ms - auto_apply_ms_ < 5000) return;
+    auto_apply_ms_ = now_ms;
+    if (!auto_watcher_.begin({})) {
+      if (!auto_failed_reported_) {
+        BX_LOG_WARN("the automatic audio watcher could not start: %s", auto_watcher_.error().c_str());
+        auto_failed_reported_ = true;
+      }
+      return;
+    }
+  }
+  if (!auto_watcher_.ready()) return;
+  const uint64_t generation = auto_watcher_.generation();
+  if (generation == auto_generation_ && now_ms - auto_apply_ms_ < 2000) return;
+  auto_generation_ = generation;
+  auto_apply_ms_ = now_ms;
+  // The watcher and the journal run on GetTickCount64: a 32-bit tick here would place every session and
+  // span on a clock that wrapped after 49 days and no longer matched the entries it is compared with.
+  const uint64_t now64 = GetTickCount64();
+  const std::vector<WatchedSession> watched = auto_watcher_.sessions(now64, 1500);
+  std::vector<AutoAudioSession> sessions;
+  sessions.reserve(watched.size());
+  for (const WatchedSession& one : watched) {
+    AutoAudioSession session;
+    session.key = one.key;
+    session.pid = one.pid;
+    session.exe = one.exe;
+    session.active = one.active;
+    session.system_sounds = one.system_sounds;
+    session.changed_ms = one.changed_ms;
+    sessions.push_back(std::move(session));
+  }
+  const std::string captured_game =
+      game_capture_.capturing ? game_capture_.active_exe : detected_game_exe_;
+  host_.set_auto_audio_sessions(sessions, now64, captured_game);
+}
+
+void Protocol::poll_audio(uint32_t now_ms) {
+  // The automatic lanes follow Windows' session events, not a meter. This runs first so the game target
+  // this function resolves is the same one the lanes give priority to.
+  poll_auto_audio(now_ms);
+  // What the Current game slot follows: the game BuffrX is actually capturing, never a fullscreen
+  // candidate or the detector's list. A display capture with no game behind it, a window capture or a
+  // pinned target that is no longer running leaves the slot waiting - it is never handed the desktop or
+  // an unrelated program.
+  GameAudioTarget target;
+  if (config_.capture_mode == "game") {
+    std::string exe, title;
+    if (game_capture_.capturing) {
+      if (active_game_alive(now_ms)) {
+        exe = game_capture_.active_exe;
+        title = game_capture_.active_title;
+      }
+    } else {
+      // A game chosen by hand (or one whose detection is off): its executable is the last part of the
+      // saved "title:class:exe" id, and its window must still exist. A stale saved target is not evidence.
+      const size_t colon = config_.game_title.find_last_of(':');
+      if (colon != std::string::npos) exe = decode_window_part(config_.game_title.substr(colon + 1));
+      if (!exe.empty()) {
+        if (game_audio_checked_ms_ == 0 || now_ms - game_audio_checked_ms_ >= 1000) {
+          game_audio_checked_ms_ = now_ms;
+          game_audio_alive_ = window_still_exists(active_game_hwnd_) || game_window_alive(exe);
+        }
+        if (!game_audio_alive_) exe.clear();
+      }
+    }
+    // win-wasapi resolves a process capture from a window id: without the class in it, no window is ever
+    // found. An id that is not addressable leaves the slot waiting instead of binding another window.
+    if (!exe.empty() && config_.game_title.find(':') != std::string::npos) {
+      target.active = true;
+      target.exe = exe;
+      target.window = config_.game_title;
+      target.title = title;
+    }
+  }
+  host_.set_game_audio_target(target);
+
+  // The game whose picture the recording covers, which is the only game a card may name. The routing target above
+  // is not it: it exists only while game capture is the mode, and the gap this closes is the display capture that
+  // is missing the sound of the game it shows. The detectors' own state is the evidence (detected_game_exe_ is the
+  // tick's Timeline gate; game_capture_ is the automatic detector, which keeps its game while the user pins the
+  // display or a window), and a window capture covers a game only when that window is the game's program.
+  AudioCoverage coverage;
+  coverage.capture_mode = host_.capture_mode_now();
+  coverage.captured_game_exe = target.active ? target.exe : std::string();
+  std::string detected = detected_game_exe_;
+  if (detected.empty() && game_capture_.capturing) detected = game_capture_.active_exe;
+  coverage.detected_game_exe = detected;
+  if (config_.capture_mode == "window") {
+    // A saved window target is win-capture's "title:class:exe" id; its program is the part after the last colon.
+    const size_t colon = config_.window_id.find_last_of(':');
+    if (colon != std::string::npos) coverage.window_exe = decode_window_part(config_.window_id.substr(colon + 1));
+  }
+  const std::string game_exe = audio_warning_game(coverage);
+
+  // One card per unresolved problem, and the page keeps saying it after the card is gone. A slot waiting
+  // for a program that is simply closed is quiet: it is not a failure.
+  AudioHealthFacts facts;
+  facts.apps_mode = config_.audio_capture_mode == "apps" && !host_.performance_active();
+  facts.capture_active = host_.buffer_wanted() || host_.recording_busy() || host_.timeline_writer_active();
+  facts.captured_game_exe = game_exe;
+  const std::vector<ObsHost::AudioSlotHealth> health = host_.audio_slot_health();
+  const std::vector<AudioApp> selected = effective_audio_apps(config_);
+  for (size_t i = 0; i < selected.size(); ++i) {
+    AudioHealthSlot slot;
+    slot.game = audio_app_is_game(selected[i]);
+    slot.exe = i < health.size() && !health[i].exe.empty() ? health[i].exe : selected[i].exe;
+    slot.connected = i < health.size() && health[i].connected;
+    facts.slots.push_back(std::move(slot));
+  }
+  const bool auto_mode = config_.audio_capture_mode == "auto";
+  if (auto_mode) {
+    // Automatic capture is judged by the lanes that are actually on. An empty desktop is quiet, not a
+    // missing game: no card says the game is unrecorded because no manual selection exists.
+    facts = auto_health_facts(host_.auto_audio_view(), facts.capture_active);
+  }
+  const AudioProblem problem = audio_health_problem(facts);
+  const std::string key = audio_health_key(facts, problem);
+  // The policy's own result and the game it judged ride on status.audio, so the page can keep saying what the
+  // one card said after the card is gone (and while notices are off). No second window or meter read: the
+  // identity is the coverage resolved just above.
+  audio_warning_game_ = game_exe;
+  audio_poll_ms_ = now_ms;
+  const bool due = audio_notice_due(audio_notice_, problem, key, now_ms);
+  if (!due || !notifier) return;
+  const std::string game = game_exe.empty() ? std::string() : media_folder_name(game_exe);
+  switch (problem) {
+    case AudioProblem::game_missing:
+      notifier("GAME AUDIO IS NOT RECORDED",
+               game + " is playing, but Selected apps records only the apps you chose. Add it in Settings > Audio.");
+      break;
+    case AudioProblem::game_waiting:
+      notifier("GAME AUDIO IS NOT CONNECTED",
+               game + " is selected for audio, but its capture has not connected. Its track stays empty until it does.");
+      break;
+    case AudioProblem::all_unavailable:
+      notifier("APP AUDIO IS NOT CONNECTED",
+               auto_mode ? "None of the apps making sound has connected for automatic capture. Their tracks stay "
+                           "empty; the picture still records."
+                         : "None of the selected apps has connected for audio capture. Their tracks stay empty; the picture still records.");
+      break;
+    case AudioProblem::none:
+      break;
+  }
+}
 
 // The preview's process id is 0 until Task 10 launches it, so nothing is exempt yet. Compared by process,
 // not by window title: a title is the game's or the preview's to change.
@@ -1155,6 +1525,23 @@ std::string reserve_staging_path(const std::string& directory, const std::string
         return staging_file_set(copy, join_sidecars);
       },
       create_new_file, [](const std::string& path) { DeleteFileA(path.c_str()); });
+}
+
+// The labels a join wrote beside this save's staged copy follow it to the name the library lists. The
+// sidecar is bound to the copy's bytes, which the rename keeps; it is bound again at its new name so the
+// file it describes and the file beside it cannot disagree. A file this product did not write already at
+// the published name stays - the video name was free, so it is not this save's to replace - and the staged
+// sidecar goes with the staging name.
+void move_staged_audio_layout(const std::string& staged, const std::string& published) {
+  const std::string from = staged + kAudioLayoutSuffix;
+  if (GetFileAttributesA(from.c_str()) == INVALID_FILE_ATTRIBUTES || !audio_sidecar_is_ours(staged)) return;
+  const std::string to = published + kAudioLayoutSuffix;
+  if (MoveFileExA(from.c_str(), to.c_str(), MOVEFILE_WRITE_THROUGH)) {
+    bind_audio_layout(published);
+    return;
+  }
+  BX_LOG_WARN("the audio track labels for %s did not follow it; a file is already at %s", published.c_str(), to.c_str());
+  remove_audio_layout(staged);
 }
 
 }  // namespace
@@ -1335,8 +1722,14 @@ bool Protocol::timeline_save(const Json& args, Json& out, std::string& error) {
   join.output = staged;
   join.start_in_first_seconds = static_cast<double>(plan.start_in_first_ms) / 1000.0;
   join.end_in_last_seconds = static_cast<double>(plan.end_in_last_ms) / 1000.0;
+  // The child decides the copy's labels from the chunks it really copies - after a settings change it keeps
+  // the run that holds the range's end and drops the rest, so a dropped chunk's labels are never read - and
+  // refuses a join whose sound cannot be described before it writes a byte (audio_layout.h). It writes them
+  // beside the staged copy, bound to its final bytes; they follow the copy when it is published.
+  join.carry_audio_labels = true;
   MediaJoinResult joined;
   if (!media_join_process(join, joined, error)) {
+    remove_audio_layout(staged);
     BX_LOG_WARN("timeline save of %s failed: %s", session_id.c_str(), error.c_str());
     return false;
   }
@@ -1350,6 +1743,7 @@ bool Protocol::timeline_save(const Json& args, Json& out, std::string& error) {
   const ClipCheck verified = check_clip_file(staged);
   if (!verified.ok) {
     DeleteFileA(staged.c_str());
+    remove_audio_layout(staged);
     error = "the saved clip did not verify: " + verified.reason;
     BX_LOG_WARN("%s", error.c_str());
     return false;
@@ -1376,6 +1770,10 @@ bool Protocol::timeline_save(const Json& args, Json& out, std::string& error) {
     return false;
   }
   const std::string path = published.path;
+  // The saved clip's track labels describe the chunks the child copied and only those: they were decided
+  // from the run that holds the range's end, never from every planned chunk or from this moment's settings
+  // (audio_layout.h). They sat beside the staged copy and move to the name the library lists.
+  move_staged_audio_layout(staged, path);
   BX_LOG_INFO("timeline save of %s: %s (%lld bytes, %zu chunks)", session_id.c_str(), path.c_str(),
               static_cast<long long>(verified.bytes), plan.files.size());
   if (broadcaster) broadcaster(make_event("library.changed", Json::object()));
@@ -1410,6 +1808,7 @@ buffrx::RecordAction Protocol::record_pressed(std::string& error) {
       if (broadcaster) broadcaster(make_event("recording.changed", Json(false)));
       break;
     case buffrx::RecordAction::ManualStart:
+      host_.allow_video_init_now();  // a press may try the graphics device once, even inside the backoff
       if (!host_.start_recording(error)) break;
       mark("recording.start", "start");
       if (broadcaster) broadcaster(make_event("recording.changed", Json(true)));
@@ -1534,10 +1933,11 @@ void Protocol::poll_game_capture(uint32_t now_ms) {
   if (decision == GameCaptureDecision::enter) {
     // A hand-over (another game while one is captured) keeps the target that was there before the first one. The follow swap
     // never touched the config, so the snapshot is the user's own target.
-    if (!was_capturing) {
+    if (!was_capturing && !game_only_held_) {
       before_capture_mode_ = config_.capture_mode;
       before_capture_title_ = config_.game_title;
     }
+    game_only_held_ = false;  // this game replaces the one that was held
     Json patch = Json::object();
     patch.set("capture_mode", Json("game"));
     // The full "title:class:exe" id: game capture resolves its target by class and exe, so a bare
@@ -1556,6 +1956,12 @@ void Protocol::poll_game_capture(uint32_t now_ms) {
       mark("game.capture", sample.title);
       if (notifier) notifier("Capturing " + media_folder_name(sample.title), "Clips go to its own folder");
     }
+  } else if (config_.game_only) {
+    // Games only: the desktop is never captured, not even for the few seconds before the pause. The capture stays on the
+    // game that closed; pause_for_game_wait puts the target back once the buffer has stopped.
+    game_only_held_ = true;
+    active_game_hwnd_ = 0;
+    BX_LOG_INFO("game left: games only keeps the capture off the desktop until the buffer pauses");
   } else {
     Json patch = Json::object();
     const std::string mode = before_capture_mode_.empty() ? "display" : before_capture_mode_;
@@ -1743,11 +2149,15 @@ void stop_buffer_with_timeline(ObsHost& host) {
 }  // namespace
 
 bool Protocol::toggle_buffer(std::string& error) {
-  if (host_.buffer_wanted()) {
+  if (host_.buffer_wanted() || game_wait_) {
+    // Waiting for a game is a buffer that is on, in games only: the switch turns it off.
+    game_wait_ = false;
     stop_buffer_with_timeline(host_);
     return true;
   }
-  start_on_running_game();
+  if (wait_for_game_instead(start_on_running_game())) return true;
+  poll_audio(GetTickCount());  // the Current game slot's target is ready when the pipeline is built
+  host_.allow_video_init_now();  // a press may try the graphics device once, even inside the backoff
   std::string start_error;
   // A start only waiting for its first frame is accepted, as buffer.start does.
   if (!host_.start_buffer(start_error) && host_.stats().buffer_state != "starting") {
@@ -1773,11 +2183,11 @@ void Protocol::update_performance_for_game() {
   if (!host_.set_performance_game(listed, error)) BX_LOG_WARN("Performance mode could not be switched: %s", error.c_str());
 }
 
-void Protocol::start_on_running_game() {
-  if (!config_.auto_game_capture) return;
+bool Protocol::start_on_running_game() {
+  if (!config_.auto_game_capture) return false;
   const uint32_t now = GetTickCount();
   if (game_capture_.capturing) {
-    if (active_game_alive(now)) return;  // already on a game that runs
+    if (active_game_alive(now)) return true;  // already on a game that runs
     game_capture_ = GameCaptureState{};  // it closed while the buffer was off
   }
   std::string id, exe, title;
@@ -1803,7 +2213,7 @@ void Protocol::start_on_running_game() {
       break;
     }
   }
-  if (id.empty()) return;
+  if (id.empty()) return false;
   if (!(config_.capture_mode == "game" && config_.game_title == id)) {
     before_capture_mode_ = config_.capture_mode;
     before_capture_title_ = config_.game_title;
@@ -1814,7 +2224,7 @@ void Protocol::start_on_running_game() {
     apply_patch(patch, patch_error);
     if (!patch_error.empty()) {
       BX_LOG_WARN("could not start on the game: %s", patch_error.c_str());
-      return;
+      return false;
     }
   } else {
     before_capture_mode_ = "display";  // already on it (a pinned game): leaving goes back to the display
@@ -1839,6 +2249,75 @@ void Protocol::start_on_running_game() {
     host_.set_performance_game(game_is_performance_listed(exe), performance_error);
   }
   BX_LOG_INFO("the buffer starts on the game \"%s\" (%s)", title.c_str(), exe.c_str());
+  return true;
+}
+
+bool Protocol::wait_for_game_instead(bool game_found) {
+  if (!config_.game_only || !config_.auto_game_capture || game_found) return false;
+  game_wait_ = true;
+  game_gone_since_ms_ = 0;
+  BX_LOG_INFO("games only: the buffer waits for a game");
+  return true;
+}
+
+buffrx::GameOnlyAction Protocol::game_only_tick(uint32_t now_ms) {
+  if (game_only_pending_) {
+    if (now_ms - game_only_asked_ms_ < 10000) return buffrx::GameOnlyAction::none;
+    game_only_pending_ = false;  // the action never ran (the queue was full): ask again
+  }
+  // A game is here while one is captured and alive, or one filled the screen a moment ago (the foreground poll runs
+  // every second while the buffer waits, and every tick while it runs).
+  const bool here = (game_capture_.capturing && active_game_alive(now_ms)) ||
+                    (last_game_seen_ms_ != 0 && GetTickCount() - last_game_seen_ms_ < 2000);
+  if (here) game_gone_since_ms_ = 0;
+  else if (game_gone_since_ms_ == 0) game_gone_since_ms_ = now_ms;
+  buffrx::GameOnlyView view;
+  view.enabled = config_.game_only && config_.auto_game_capture;
+  view.buffer_wanted = host_.buffer_wanted();
+  view.waiting = game_wait_;
+  view.game_here = here;
+  view.recording_busy = host_.recording_busy();
+  view.no_game_ms = game_gone_since_ms_ == 0 ? 0 : now_ms - game_gone_since_ms_;
+  const buffrx::GameOnlyAction action = buffrx::game_only_decide(view);
+  if (action != buffrx::GameOnlyAction::none) {
+    game_only_pending_ = true;
+    game_only_asked_ms_ = now_ms;
+  }
+  return action;
+}
+
+void Protocol::pause_for_game_wait() {
+  game_only_pending_ = false;
+  // Stops the output only: the Timeline session keeps its place, as any internal stop does.
+  host_.stop_buffer();
+  game_wait_ = true;
+  // The buffer is stopped, so putting the target back costs nothing and records nothing.
+  if (game_only_held_ || (game_capture_.capturing == false && config_.capture_mode == "game")) {
+    game_only_held_ = false;
+    Json patch = Json::object();
+    const std::string mode = before_capture_mode_.empty() || before_capture_mode_ == "game" ? "display" : before_capture_mode_;
+    patch.set("capture_mode", Json(mode));
+    std::string patch_error;
+    apply_patch(patch, patch_error);
+    if (!patch_error.empty()) BX_LOG_WARN("capture not restored when games only paused: %s", patch_error.c_str());
+  }
+  BX_LOG_INFO("games only: no game for %u s, the buffer is paused", buffrx::kGameOnlyPauseMs / 1000);
+  if (broadcaster) broadcaster(make_event("status", status_json()));
+}
+
+bool Protocol::resume_for_game(std::string& error) {
+  game_only_pending_ = false;
+  game_wait_ = false;
+  game_gone_since_ms_ = 0;
+  start_on_running_game();
+  poll_audio(GetTickCount());
+  host_.allow_video_init_now();
+  std::string start_error;
+  const bool ok = host_.start_buffer(start_error) || host_.stats().buffer_state == "starting";
+  if (!ok) error = start_error;
+  BX_LOG_INFO("games only: a game is on screen, the buffer starts");
+  if (broadcaster) broadcaster(make_event("status", status_json()));
+  return ok;
 }
 
 Json Protocol::game_state_json() {
@@ -2064,6 +2543,34 @@ std::string Protocol::handle(const std::string& payload) {
   return response.dump();
 }
 
+bool Protocol::diagnostics_report(Json& data, std::string& error) {
+  CompatFacts facts;
+  ObsHost::EncodeCounters before;
+  {
+    std::lock_guard<std::mutex> lock(engine_mutex_);
+    host_.compat_fill(facts);
+    facts.buffrx_version = kEngineVersion;
+    before = host_.encode_counters();
+  }
+  facts.hags = facts.hags.empty() ? "unknown" : facts.hags;
+  // Read the watcher's last completed window without making the report wait for a sample.
+  if (before.active && before.rendered > 0) {
+    facts.speed_measured = true;
+    facts.speed_rendered = before.rendered;
+    facts.speed_encoded = std::min(before.encoded, before.rendered);
+  } else {
+    facts.speed_note = before.active ? "not measured: waiting for an encoder sample" : "not measured: start the buffer first";
+  }
+  std::string file;
+  std::string summary;
+  if (!write_compat_report(data_root_, facts, file, summary, error)) return false;
+  BX_LOG_NOTE("compatibility report written");
+  data = Json::object();
+  data.set("file", Json(file));
+  data.set("summary", Json(summary));
+  return true;
+}
+
 Json Protocol::handle_command(const std::string& command, const Json& args, std::string& error) {
   BX_LOG_INFO("command: %s", command.c_str());
   if (command == "hello") {
@@ -2085,6 +2592,15 @@ Json Protocol::handle_command(const std::string& command, const Json& args, std:
   // clients and the acceptance harness send that).
   if (command == "config.set") return apply_patch(args["patch"].is_object() ? args["patch"] : args, error);
   if (command == "encoder.properties") return host_.encoder_properties(args["configured"].as_bool(false));
+  if (command == "diagnostics.report") {
+    Json report = Json::object();
+    if (!diagnostics_report(report, error)) return Json::object();
+    // The panel's button asks for the file on the clipboard, so it pastes straight into a chat or an issue.
+    if (args["copy"].as_bool(false)) {
+      report.set("copied", Json(copy_files_to_clipboard({report["file"].as_string()})));
+    }
+    return report;
+  }
   if (command == "encoder.set") {
     // One advanced encoder knob, by its libobs setting name: exactly what encoder.properties listed.
     const std::string name = args["name"].as_string();
@@ -2148,16 +2664,26 @@ Json Protocol::handle_command(const std::string& command, const Json& args, std:
     Json patch = Json::object();
     if (args.has("mode")) patch.set("capture_mode", Json(args["mode"].as_string("display")));
     if (args.has("display_id")) patch.set("display_id", Json(static_cast<int64_t>(args["display_id"].as_int(0))));
+    if (args.has("display_name")) patch.set("display_name", Json(args["display_name"].as_string()));
     if (args.has("window_id")) patch.set("window_id", Json(args["window_id"].as_string()));
     if (args.has("window_name")) patch.set("window_name", Json(args["window_name"].as_string()));
     if (args.has("game_title")) patch.set("game_title", Json(args["game_title"].as_string()));
+    // An explicit choice is a fresh ask: a display the device refused before must not be suppressed by the retry
+    // cap, even when the card clicked is the one already saved.
+    if (args.has("display_id") || args.has("display_name")) host_.reset_display_replan();
     apply_patch(patch, error);
     if (!error.empty()) return Json::object();
     return status_json();
   }
 
   if (command == "buffer.start") {
-    start_on_running_game();
+    // Games only with no game on screen: the start is armed, and the buffer begins on the next game.
+    if (game_wait_ || wait_for_game_instead(start_on_running_game())) {
+      if (broadcaster) broadcaster(make_event("status", status_json()));
+      return status_json();
+    }
+    poll_audio(GetTickCount());  // the Current game slot's target is ready when the pipeline is built
+    host_.allow_video_init_now();  // a press may try the graphics device once, even inside the backoff
     // A start that is only waiting for its first frame is accepted: the intent is recorded and the
     // watchdog starts the ring when the source has a frame (status reads buffer_state "starting").
     std::string start_error;
@@ -2169,6 +2695,7 @@ Json Protocol::handle_command(const std::string& command, const Json& args, std:
     return status_json();
   }
   if (command == "buffer.stop") {
+    game_wait_ = false;
     stop_buffer_with_timeline(host_);
     if (broadcaster) broadcaster(make_event("status", status_json()));
     return status_json();
@@ -3100,6 +3627,28 @@ Json Protocol::handle_command(const std::string& command, const Json& args, std:
     const std::string extension = dot == std::string::npos ? "." + container : first.substr(dot);
     const std::string stem = args.has("name") && !args["name"].as_string().empty() ? args["name"].as_string()
                                                                                     : "BuffrX " + id.substr(id.find(' ') + 1);
+    // What the output's sound can honestly be is decided from the chunks this export will really join, each
+    // read with its own audio stream count - never the output's - and before a copy or an encode starts. A
+    // chunk holding a full mix joined with one holding only independent tracks cannot be described by any
+    // one sidecar and is refused here, before anything is written, exactly as a Timeline save's join child
+    // refuses it (audio_layout.h). The same decision labels the published file below.
+    std::vector<AudioLayout> layouts;
+    layouts.reserve(plan.files.size());
+    for (const std::string& file : plan.files) {
+      const MediaDetails details = media_details(file);
+      if (!details.ok) {
+        error = "a clip in the range could not be read: " + file + " (" + details.reason + ")";
+        BX_LOG_WARN("range export from %s refused: %s", id.c_str(), error.c_str());
+        return Json::object();
+      }
+      layouts.push_back(details.layout);
+    }
+    const JoinAudioLayout joined = join_audio_layout(layouts);
+    if (!joined.error.empty()) {
+      error = joined.error;
+      BX_LOG_WARN("range export from %s refused: %s", id.c_str(), error.c_str());
+      return Json::object();
+    }
     // Two workers can export at once, so the staged copy is this export's own name, claimed by creating it: a
     // name another writer made in between is refused and the attempt moves on, never truncated. The join writes
     // under a name the library never lists, and only a verified file takes the name a person sees: a crash
@@ -3139,11 +3688,12 @@ Json Protocol::handle_command(const std::string& command, const Json& args, std:
       }
       return true;
     };
-    if (!media_concat(plan.files, staged, plan.start_in_first, plan.end_in_last, error)) {
+    if (!media_concat(plan.files, staged, plan.start_in_first, plan.end_in_last, error, nullptr, nullptr, true)) {
       BX_LOG_WARN("range export from %s failed: %s; re-encoding the range", id.c_str(), error.c_str());
       error.clear();
       if (!reencode_range()) {
         DeleteFileA(staged.c_str());
+        remove_audio_layout(staged);
         BX_LOG_WARN("range export from %s could not be re-encoded: %s", id.c_str(), error.c_str());
         return Json::object();
       }
@@ -3155,6 +3705,7 @@ Json Protocol::handle_command(const std::string& command, const Json& args, std:
       error.clear();
       if (!reencode_range()) {
         DeleteFileA(staged.c_str());
+        remove_audio_layout(staged);
         BX_LOG_WARN("range export from %s could not be re-encoded: %s", id.c_str(), error.c_str());
         return Json::object();
       }
@@ -3162,9 +3713,20 @@ Json Protocol::handle_command(const std::string& command, const Json& args, std:
     }
     if (!verified.ok) {
       DeleteFileA(staged.c_str());
+      remove_audio_layout(staged);
       error = "the exported clip did not verify: " + verified.reason;
       BX_LOG_WARN("%s (file: %s)", error.c_str(), staged.c_str());
       return Json::object();
+    }
+    // The labels describe the chunks this export really copied, and only those. A re-encoded range already
+    // wrote them beside its staging name; a stream copy did not. Writing them here, once, from the same
+    // decision that refused an undescribable join above, is the one rule for both paths.
+    if (joined.carries) {
+      if (!write_audio_layout(staged, joined.layout)) {
+        BX_LOG_WARN("the audio track labels for the range export from %s were not written", id.c_str());
+      }
+    } else {
+      remove_audio_layout(staged);
     }
     // Verified whole: only now does it take the name the library lists. The name is claimed at the moment of the move,
     // not before a join that can take minutes, because a replay save or another export can take a name meanwhile: the
@@ -3186,6 +3748,10 @@ Json Protocol::handle_command(const std::string& command, const Json& args, std:
       return Json::object();
     }
     const std::string path = published.path;
+    // The range's labels describe the chunks it was copied from, decided above from those chunks' own
+    // layouts: a re-encoded range rewrote them beside its staging name, and they follow the copy to the name
+    // the library lists. Nothing here re-reads the output's stream count as if it described its inputs.
+    move_staged_audio_layout(staged, path);
     BX_LOG_INFO("range export from %s: %s (%lld bytes, %zu chunks)", id.c_str(), path.c_str(),
                 static_cast<long long>(verified.bytes), plan.files.size());
     if (broadcaster) broadcaster(make_event("library.changed", Json::object()));
@@ -3520,7 +4086,32 @@ Json Protocol::handle_command(const std::string& command, const Json& args, std:
     data.set("inputs", inputs);
     return data;
   }
-  if (command == "audio.get") return audio_json(config_);
+  if (command == "audio.get") {
+    Json data = audio_json(config_);
+    data.set("auto", auto_audio_json(host_.auto_audio_view(), auto_watcher_.ready(),
+                                     auto_watch_error(auto_watcher_), false));
+    return data;
+  }
+  if (command == "audio.sessions") {
+    // The picker's evidence: every render output's sessions, with each program's own peak so "making
+    // sound" is measured rather than guessed from a running stream. Read only while a page asks.
+    std::string probe_error;
+    const std::vector<AudioSessionEntry> sessions = audio_session_snapshot(probe_error);
+    Json data = Json::object();
+    Json list = Json::array();
+    for (const AudioSessionEntry& session : sessions) {
+      Json entry = Json::object();
+      entry.set("pid", Json(static_cast<int64_t>(session.pid)));
+      entry.set("exe", Json(session.exe));
+      entry.set("active", Json(session.active));
+      entry.set("system", Json(session.system_sounds));
+      entry.set("peak", Json(static_cast<double>(session.peak)));
+      list.push(entry);
+    }
+    data.set("sessions", list);
+    if (!probe_error.empty()) data.set("error", Json(probe_error));
+    return data;
+  }
   if (command == "audio.set") {
     Json patch = Json::object();
     patch.set("audio", args);

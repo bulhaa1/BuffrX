@@ -9,6 +9,7 @@
 #include <wtsapi32.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <memory>
 #include <cstdio>
@@ -46,7 +47,8 @@ UINT virtual_key_from_name(const std::string& name, bool& ok) {
     ok = false;
     return 0;
   }
-  if (name.size() >= 2 && (name[0] == 'F' || name[0] == 'f')) {
+  if (name.size() >= 2 && name.size() <= 3 && (name[0] == 'F' || name[0] == 'f') &&
+      std::all_of(name.begin() + 1, name.end(), [](unsigned char c) { return std::isdigit(c) != 0; })) {
     int number = std::atoi(name.c_str() + 1);
     if (number >= 1 && number <= 24) return static_cast<UINT>(VK_F1 + number - 1);
   }
@@ -61,6 +63,8 @@ UINT virtual_key_from_name(const std::string& name, bool& ok) {
       {"UP", VK_UP},             {"DOWN", VK_DOWN},       {"LEFT", VK_LEFT},       {"RIGHT", VK_RIGHT},
       {"PRINTSCREEN", VK_SNAPSHOT}, {"SCROLLLOCK", VK_SCROLL}, {"PAUSE", VK_PAUSE},
       {"NUM0", VK_NUMPAD0}, {"NUM1", VK_NUMPAD1}, {"NUM2", VK_NUMPAD2}, {"NUM3", VK_NUMPAD3}, {"NUM4", VK_NUMPAD4},
+      {"NUMMUL", VK_MULTIPLY}, {"NUMDIV", VK_DIVIDE}, {"NUMADD", VK_ADD}, {"NUMSUB", VK_SUBTRACT}, {"NUMDOT", VK_DECIMAL},
+      {"PERIOD", VK_OEM_PERIOD}, {"COMMA", VK_OEM_COMMA}, {"LBRACKET", VK_OEM_4}, {"RBRACKET", VK_OEM_6},
       {"NUM5", VK_NUMPAD5}, {"NUM6", VK_NUMPAD6}, {"NUM7", VK_NUMPAD7}, {"NUM8", VK_NUMPAD8}, {"NUM9", VK_NUMPAD9},
   };
   std::string upper;
@@ -97,6 +101,15 @@ std::string key_name_from_virtual(UINT key) {
     case VK_DOWN: return "Down";
     case VK_LEFT: return "Left";
     case VK_RIGHT: return "Right";
+    case VK_MULTIPLY: return "NumMul";
+    case VK_DIVIDE: return "NumDiv";
+    case VK_ADD: return "NumAdd";
+    case VK_SUBTRACT: return "NumSub";
+    case VK_DECIMAL: return "NumDot";
+    case VK_OEM_PERIOD: return "Period";
+    case VK_OEM_COMMA: return "Comma";
+    case VK_OEM_4: return "LBracket";
+    case VK_OEM_6: return "RBracket";
     default: return "?";
   }
 }
@@ -118,8 +131,13 @@ bool parse_chord(const std::string& chord, UINT& modifiers, UINT& virtual_key, s
     }
   }
   if (!current.empty()) tokens.push_back(current);
-  if (tokens.size() < 2) {
-    problem = "a chord needs a modifier and a key";
+  else if (!tokens.empty()) {
+    problem = "a hotkey needs a key after the separator";
+    return false;
+  }
+  // One token is a key on its own: allowed only for the keys lone_key_allowed names, judged below.
+  if (tokens.empty()) {
+    problem = "a hotkey needs a key";
     return false;
   }
   for (size_t i = 0; i < tokens.size() - 1; ++i) {
@@ -140,12 +158,34 @@ bool parse_chord(const std::string& chord, UINT& modifiers, UINT& virtual_key, s
     problem = "unknown key: " + tokens.back();
     return false;
   }
-  if (modifiers == 0 && (virtual_key < VK_F13 || virtual_key > VK_F24)) {
-    problem = "a lone key would fire while typing";
+  if (modifiers == 0 && !lone_key_allowed(virtual_key)) {
+    problem = "a lone key needs Ctrl, Alt or Shift";
     return false;
   }
   modifiers |= MOD_NOREPEAT;
   return true;
+}
+
+LoneKeyKind lone_key_kind(UINT virtual_key) {
+  if (virtual_key >= VK_F1 && virtual_key <= VK_F24) return LoneKeyKind::function;
+  if (virtual_key == VK_PAUSE || virtual_key == VK_SCROLL) return LoneKeyKind::idle;
+  if (virtual_key == VK_INSERT) return LoneKeyKind::insert;
+  switch (virtual_key) {
+    case VK_HOME: case VK_END: case VK_PRIOR: case VK_NEXT: case VK_DELETE: return LoneKeyKind::editing;
+    case VK_MULTIPLY: case VK_DIVIDE: case VK_ADD: case VK_SUBTRACT: case VK_DECIMAL: return LoneKeyKind::keypad;
+    case VK_OEM_PERIOD: case VK_OEM_COMMA: case VK_OEM_4: case VK_OEM_6: return LoneKeyKind::character;
+    default: break;
+  }
+  if (virtual_key >= VK_NUMPAD0 && virtual_key <= VK_NUMPAD9) return LoneKeyKind::keypad;
+  return LoneKeyKind::none;
+}
+
+bool lone_key_allowed(UINT virtual_key) {
+  // Letters, digits, Space, Tab, Enter, Esc, Backspace and the arrows stay out: they belong to every chat box. What
+  // stands alone is chosen by the owner (2026-11-15): the F-keys, Pause, Scroll Lock, Insert, the editing keys (Home,
+  // End, PageUp, PageDown, Delete), the numpad's digits and operators, and . , [ ]. Numpad Enter is not here:
+  // RegisterHotKey cannot tell it from Enter. `lone_key_kind` says what each one costs.
+  return lone_key_kind(virtual_key) != LoneKeyKind::none;
 }
 
 std::string format_chord(UINT modifiers, UINT virtual_key) {
@@ -711,7 +751,10 @@ void PlatformWindow::show_tray_menu() {
   menu_entries_.push_back(entry(kMenuOpenEditor, "Open editor"));
   menu_entries_.push_back(separator());
   menu_entries_.push_back(entry(kMenuSaveClip, "Save clip"));
-  menu_entries_.push_back(entry(kMenuQuickClip, "Quick clip \xC2\xB7 " + std::to_string(state.quick_seconds) + "s"));
+  // No row at all when the buffer is too short for the shortest quick clip: a length it cannot keep would be a lie.
+  if (state.quick_seconds > 0) {
+    menu_entries_.push_back(entry(kMenuQuickClip, "Quick clip \xC2\xB7 " + std::to_string(state.quick_seconds) + "s"));
+  }
   menu_entries_.push_back(entry(kMenuScreenshot, "Screenshot"));
   MenuEntry record = entry(kMenuToggleRecording, running ? "Stop recording" : "Record");
   record.live = true;  // the red square

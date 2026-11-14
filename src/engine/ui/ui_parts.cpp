@@ -3,9 +3,12 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <ctime>
+#include <unordered_map>
 
+#include "../audio_routing.h"
 #include "../config.h"
 #include "../encoder_settings.h"
 #include "../gamepad.h"
@@ -16,6 +19,7 @@
 #include "../update_policy.h"
 #include "../../version.h"
 #include "../../shared/log.h"
+#include "audio_speaker.h"
 #include "imgui_internal.h"
 #include "misc/cpp/imgui_stdlib.h"
 
@@ -32,11 +36,135 @@ std::string hotkey_label(const std::string& action) {
   return action;
 }
 
+// ---------------------------------------------------------------- audio programs
+
+std::string lower_text(std::string text) {
+  for (char& c : text) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  return text;
+}
+
+bool same_program(const std::string& left, const std::string& right) {
+  return left.size() == right.size() && lower_text(left) == lower_text(right);
+}
+
+// The product's own processes (engine, launcher, share helper, a probe build) are never programs to record:
+// their desktop loopback session shows a peak that belongs to the device, not to them.
+bool own_audio_program(const std::string& exe) { return lower_text(exe).rfind("buffrx", 0) == 0; }
+
+std::string program_name(const std::string& exe) {
+  std::string name = exe;
+  const std::string lower = lower_text(name);
+  if (lower.size() > 4 && lower.compare(lower.size() - 4, 4, ".exe") == 0) name.resize(name.size() - 4);
+  return name.empty() ? std::string("Application") : name;
+}
+
+std::vector<Json> audio_program_choices(const Json& windows) {
+  std::vector<Json> choices;
+  std::vector<std::string> seen;
+  for (const Json& window : windows.items()) {
+    const std::string exe = window["exe"].as_string();
+    if (exe.empty() || exe == "unknown" || own_audio_program(exe)) continue;
+    const std::string key = lower_text(exe);
+    if (std::find(seen.begin(), seen.end(), key) != seen.end()) continue;
+    seen.push_back(key);
+    choices.push_back(window);
+  }
+  return choices;
+}
+
+// The measured peak of a program's sessions, -1 when no session exposes a meter. AudioSessionStateActive
+// alone only means a stream is running, so "making sound" is never inferred from it.
+float program_peak(const Json& sessions, const std::string& exe) {
+  for (const Json& session : sessions["sessions"].items()) {
+    if (same_program(session["exe"].as_string(), exe)) return static_cast<float>(session["peak"].as_double(-1.0));
+  }
+  return -1.0f;
+}
+
+bool program_sounding(const Json& sessions, const std::string& exe) {
+  return program_peak(sessions, exe) >= kAudiblePeak;
+}
+
+// A speaker for a program's row: its measured peak, held for a moment through one silent sample so the
+// 250-500 ms poll cannot blink the waves off between two loud ones. An unknown meter is not silence.
+std::unordered_map<std::string, uint32_t>& audio_holds() {
+  static std::unordered_map<std::string, uint32_t> holds;
+  return holds;
+}
+
+AudioSpeakerState audio_speaker_state(const Json& sessions, const std::string& exe, uint32_t now_ms) {
+  uint32_t& hold = audio_holds()[lower_text(exe)];
+  return audio_speaker_sample(program_peak(sessions, exe), hold, now_ms);
+}
+
+// A picker refresh or a removed slot is a list change: a hold kept for a row that is gone would grow the map.
+void audio_speaker_prune(const std::vector<std::string>& keep) {
+  for (auto it = audio_holds().begin(); it != audio_holds().end();) {
+    const bool kept = std::any_of(keep.begin(), keep.end(),
+                                  [&](const std::string& exe) { return lower_text(exe) == it->first; });
+    if (kept) ++it;
+    else it = audio_holds().erase(it);
+  }
+}
+
+// The speaker glyph whose waves move only while it sounds. With Windows' animations off it rests on the
+// full speaker, and no frame is asked for: a still panel costs nothing.
+void audio_speaker_icon(const Json& sessions, const std::string& exe, ImVec2 at, float size, uint32_t now_ms,
+                        PanelState& panel) {
+  ImDrawList* draw = ImGui::GetWindowDrawList();
+  // A row scrolled out of its list, or under a sheet, still draws (ImGui clips it) but must not ask the panel for
+  // the next frame: the waves only move where someone can see them. The meter itself is still sampled, so the
+  // reading is right the moment the row comes back.
+  const ImVec2 clip_min = draw->GetClipRectMin();
+  const ImVec2 clip_max = draw->GetClipRectMax();
+  const bool seen = audio_speaker_visible(at.x, at.y, size, clip_min.x, clip_min.y, clip_max.x, clip_max.y);
+  const AudioSpeakerState state = audio_speaker_state(sessions, exe, now_ms);
+  const char* icon = "speakerBody";
+  ImU32 color = state.peak < 0.0f ? pal().faint : pal().muted;
+  if (state.sounding) {
+    color = pal().accent;
+    if (anim_enabled()) {
+      icon = audio_speaker_frame(now_ms) ? "speakerWave1" : "speaker";
+      if (seen) panel.audio_meter_until = now_ms + kAudioHoldMs;
+    } else {
+      icon = "speaker";
+    }
+  }
+  draw_icon(draw, icon, at, size, color, 1.4f);
+}
+
+// How a selected slot really is (status.audio.slots): "Recording now" only when win-wasapi is hooked and a
+// capture is running, "Waiting" for a program that is not running, and "Could not capture" only for a real
+// failure. A connected source while the buffer is stopped is ready, not recording.
+std::string audio_slot_hint(const Json& status, size_t index, bool game, const std::string& name) {
+  const Json& audio = status["audio"];
+  if (!audio["recorded"].as_bool(true)) {
+    return status["performance"]["active"].as_bool() ? "Not recorded while Performance mode runs"
+                                                     : "Saved; not recorded while Desktop audio is chosen";
+  }
+  Json slot = Json::object();
+  const std::vector<Json>& slots = audio["slots"].items();
+  if (index < slots.size()) slot = slots[index];
+  const std::string state = slot["state"].as_string("waiting");
+  const bool recording = status["buffering"].as_bool() || status["recording"].as_bool();
+  if (state == "covered") {
+    if (!recording) return "Ready with the selected app when recording starts";
+    const std::string exe = slot["exe"].as_string();
+    return exe.empty() ? "Recorded with a selected app (one capture)"
+                       : "Recorded with " + program_name(exe) + " (one capture)";
+  }
+  if (state == "connected") return recording ? "Recording now" : "Ready when recording starts";
+  if (state == "failed") return "Could not capture this app's audio";
+  if (game) return slot["exe"].as_string().empty() ? "No game captured yet" : "Connecting to the game";
+  return "Waiting for " + name + " to start";
+}
+
 // ---------------------------------------------------------------- actions
 
 void toggle_buffer(ViewEnv& env) {
   const std::string state = env.store.status["buffer_state"].as_string();
-  const bool on = state == "on" || state == "starting";
+  // In games only, waiting for a game is a buffer that is on: the switch turns it off.
+  const bool on = state == "on" || state == "starting" || env.store.status["game_wait"].as_bool();
   if (on && (env.store.status["timeline"]["enabled"].as_bool() || env.store.config["timeline_minutes"].as_int(0) > 0)) {
     env.panel.buffer_stop_open = true;
     return;
@@ -55,7 +183,9 @@ void save_clip(ViewEnv& env) {
     // off: a buffer still waiting for its first frame is starting, and being told it was off sent the
     // reader looking for a switch that was already on.
     const std::string state = env.store.status["buffer_state"].as_string("off");
-    const char* why = state == "starting"    ? "The buffer is still starting: its first frame has not arrived yet."
+    const char* why = env.store.status["game_wait"].as_bool()
+                          ? "Waiting for a game. The buffer starts when one fills the screen."
+                      : state == "starting"    ? "The buffer is still starting: its first frame has not arrived yet."
                       : state == "stopping" ? "The buffer is still stopping. Try again in a moment."
                                             : "The buffer is off. Start it and the last moments are kept.";
     env.store.toast(UiToast::error, "Clip not saved", why);
@@ -82,8 +212,16 @@ bool draw_save_feedback(ViewEnv& env, ImDrawList* draw, ImVec2 icon, float size,
 }
 
 void quick_clip(ViewEnv& env) {
+  // A quick clip is always a listed length no longer than the buffer. With a buffer shorter than every one there is
+  // nothing to save: 0 would keep the whole buffer, which is Save clip's job, so say so instead of saving silently.
+  const QuickClipPress press = quick_clip_press(static_cast<int>(env.store.config["quick_clip_seconds"].as_int(20)),
+                                                static_cast<int>(env.store.config["buffer_seconds"].as_int(60)));
+  if (press.seconds <= 0) {
+    env.store.toast(UiToast::error, "Quick clip not saved", press.refusal);
+    return;
+  }
   Json args = Json::object();
-  args.set("seconds", Json(static_cast<int>(env.store.config["quick_clip_seconds"].as_int(20))));
+  args.set("seconds", Json(press.seconds));
   env.store.attempt("buffer.save", args, "Clip not saved");
 }
 
@@ -1146,8 +1284,18 @@ void hotkey_recorder(ViewEnv& env) {
                   ImVec2(pos.x + w - limits_w - px(10), pos.y + h - fonts().small->LegacySize - px(6)), pal().faint,
                   limits.c_str());
     const std::string current = env.store.chord(panel.recording, controller);
-    if (!panel.recorded_problem.empty()) text(fonts().small, pal().warn, panel.recorded_problem);
+    if (!panel.recorded_problem.empty()) text_wrapped(fonts().small, pal().warn, panel.recorded_problem, ImGui::GetContentRegionAvail().x);
     else text(fonts().small, pal().faint, "Now: " + (current.empty() ? std::string("not set") : current));
+    // A lone key is allowed only for the keys lone_key_allowed names, and is saved only after the row says what it
+    // costs: it fires in every app, the game included, and can take another app's own shortcut with it.
+    UINT lone_modifiers = 0, lone_key = 0;
+    std::string lone_problem;
+    const bool lone = !controller && !panel.recorded_chord.empty() && panel.recorded_problem.empty() &&
+                      parse_chord(panel.recorded_chord, lone_modifiers, lone_key, lone_problem) &&
+                      (lone_modifiers & ~MOD_NOREPEAT) == 0;
+    if (lone) {
+      text_wrapped(fonts().small, pal().warn, lone_key_warning(lone_key), ImGui::GetContentRegionAvail().x);
+    }
     align_right(px(268));
     // Default puts this action's shipped chord back on this input and stays here, the way Clear does.
     if (dialog_button("Default##recorder", Variant::ghost, nullptr, panel.recorder_saving)) {

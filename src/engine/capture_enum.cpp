@@ -343,6 +343,21 @@ bool find_window_size(const std::string& wanted_id, int& width, int& height) {
   return width > 0 && height > 0;
 }
 
+// The monitor a configured window sits on, as its GDI device name. Read for the log alone: which card a window
+// capture's picture has to travel from is the first question a black picture raises, and nothing else answers it.
+bool window_monitor_device(const std::string& wanted_id, std::string& device) {
+  device.clear();
+  WindowIdentity wanted;
+  if (!split_window_key(wanted_id, wanted)) return false;
+  const HWND window = best_window_match(wanted);
+  if (!window) return false;
+  MONITORINFOEXW info{};
+  info.cbSize = sizeof(info);
+  if (!GetMonitorInfoW(MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST), reinterpret_cast<MONITORINFO*>(&info))) return false;
+  device = utf8(info.szDevice);
+  return !device.empty();
+}
+
 bool validate_capture_target(Config& config, std::string& reason) {
   const std::string saved_id = config.capture_mode == "game" ? config.game_title : config.window_id;
   if (config.capture_mode != "window" && config.capture_mode != "game") return true;

@@ -38,9 +38,13 @@ const char* tier_name(const std::string& tier) {
 
 }  // namespace
 
-std::vector<EncoderSetting> encoder_tier_defaults(EncoderFamily family, const std::string& tier, const Config& config) {
+std::vector<EncoderSetting> encoder_tier_defaults(EncoderFamily family, const std::string& tier, const Config& config,
+                                                  const EncoderTraits& traits) {
   const std::string t = tier_name(tier);
   const int keyint = std::max(1, config.keyframe_seconds);
+  // Frame-rate bands (plan 009): heavier settings drop a step per band, so Quality at 144 fps is never a card's heaviest setting.
+  const int fps = config.capture_fps;
+  const int band = fps <= 60 ? 0 : fps <= 90 ? 1 : 2;
   std::vector<EncoderSetting> out;
   switch (family) {
     case EncoderFamily::Nvenc: {
@@ -55,6 +59,18 @@ std::vector<EncoderSetting> encoder_tier_defaults(EncoderFamily family, const st
       //    chooses p7 anyway (decided with the user, 2026-11-05): the top tier is the user's own choice.
       //  - look-ahead bought no compression in any run and costs GPU, VRAM and delay: only the quality tier has it.
       const bool quality = t == "quality";
+      if (traits.nvenc_pre_ada) {
+        // A generation slower, never full-resolution multipass (plan 009; unmeasured on hardware).
+        put(out, "preset", Json(performance ? "p2" : standard ? "p3" : quality ? (band == 0 ? "p6" : band == 1 ? "p5" : "p4") : "p4"));
+        put(out, "tune", Json("hq"));
+        put(out, "multipass", Json(quality && band < 2 ? "qres" : "disabled"));
+        put(out, "profile", Json("high"));
+        put(out, "bf", Json(0));
+        put(out, "adaptive_quantization", Json(!performance && !standard));
+        put(out, "lookahead", Json(false));
+        put(out, "keyint_sec", Json(keyint));
+        break;
+      }
       put(out, "preset", Json(standard ? "p4" : performance ? "p3" : quality ? "p7" : "p5"));
       // The names below are NVENC's own (nvenc-properties.c). "tuning" and "psycho_aq" were written
       // here before and no encoder carries either, so both settings were refused and did nothing.
@@ -84,7 +100,17 @@ std::vector<EncoderSetting> encoder_tier_defaults(EncoderFamily family, const st
       break;
     }
     case EncoderFamily::Amf: {
-      put(out, "preset", Json(t == "performance" ? "speed" : t == "quality" ? "quality" : "balanced"));
+      const bool quality = t == "quality";
+      const bool extras = quality && traits.amf_quality_extras;
+      // Quality drops to balanced above 90 fps. highQuality (AV1 only, <= 60 fps), HQVBR and pre-analysis are the extras
+      // behind kAmfQualityExtrasProven: nothing here has run on AMD hardware yet.
+      const char* preset = t == "performance" ? "speed" : !quality ? "balanced" : band == 2 ? "balanced" : "quality";
+      if (extras && band == 0 && config.codec == "av1") preset = "highQuality";
+      put(out, "preset", Json(preset));
+      put(out, "rate_control", Json(extras && band < 2 ? "HQVBR" : "VBR"));
+      put(out, "pre_analysis", Json(extras && band == 0));
+      // No B-frames in any tier, as on NVENC: one stream shape at every size and preset (AMF's own default is 2 at 1080p60).
+      put(out, "bf", Json(0));
       put(out, "profile", Json("high"));
       put(out, "keyint_sec", Json(keyint));
       break;
@@ -93,7 +119,10 @@ std::vector<EncoderSetting> encoder_tier_defaults(EncoderFamily family, const st
       // QSV's target usage is numbered TU1 (best quality, slowest) to TU7 (fastest), not named
       // (QSV_Encoder.h:89). Writing words here meant the list rejected every tier and Intel ran on
       // its own defaults whatever the user picked.
-      put(out, "target_usage", Json(t == "performance" ? "TU7" : t == "quality" ? "TU2" : "TU4"));
+      put(out, "target_usage", Json(t == "performance" ? "TU7" : t == "standard" ? "TU5" : t == "quality" ? (band == 0 ? "TU2" : band == 1 ? "TU3" : "TU4") : "TU4"));
+      put(out, "rate_control", Json("VBR"));  // ICQ is the quality-target candidate, once measured
+      // The property is "bframes" (obs-qsv11.c:409, default 3); there is no "bf" property, so a "bf" row would be skipped.
+      put(out, "bframes", Json(0));
       put(out, "profile", Json("high"));
       put(out, "keyint_sec", Json(keyint));
       break;
@@ -124,26 +153,24 @@ std::vector<EncoderSetting> governor_overrides(EncoderFamily family, int step) {
   switch (family) {
     case EncoderFamily::Nvenc:
       // Measured on an RTX 5080 at 2560x1440, 120 fps AV1: p7 + UHQ + full-resolution multipass encoded 70%
-      // of the frames; p5 + HQ + quarter-resolution multipass kept up with all of them.
+      // of the frames; p5 + HQ + quarter-resolution multipass kept up with all of them. B-frames are not touched at any level: the pieces of a
+      // clip that crosses an encoder swap are joined by stream copy, and a changed reorder depth is a different stream (plan 008).
       if (s == 1) {
         put(out, "preset", Json("p5"));
         put(out, "tune", Json("hq"));
         put(out, "multipass", Json("qres"));
         put(out, "lookahead", Json(false));
-        put(out, "bf", Json(0));
       } else if (s == 2) {
         put(out, "preset", Json("p4"));
         put(out, "tune", Json("hq"));
         put(out, "multipass", Json("disabled"));
         put(out, "lookahead", Json(false));
-        put(out, "bf", Json(0));
       } else {
         put(out, "preset", Json("p2"));
         put(out, "tune", Json("hq"));
         put(out, "multipass", Json("disabled"));
         put(out, "lookahead", Json(false));
         put(out, "adaptive_quantization", Json(false));
-        put(out, "bf", Json(0));
       }
       break;
     case EncoderFamily::X264:
@@ -151,6 +178,11 @@ std::vector<EncoderSetting> governor_overrides(EncoderFamily family, int step) {
       break;
     case EncoderFamily::Amf:
       put(out, "preset", Json(s == 1 ? "balanced" : "speed"));
+      // The pre-analysis pass is extra GPU work per frame; OBS lists it only on some AMD cards, so the setter skips it
+      // elsewhere. Off is the light value at every step.
+      put(out, "pre_analysis", Json(false));
+      // HQVBR is a heavier rate control: every step runs the plain one.
+      put(out, "rate_control", Json("VBR"));
       break;
     case EncoderFamily::Qsv:
       put(out, "target_usage", Json(s == 1 ? "TU5" : s == 2 ? "TU6" : "TU7"));
@@ -167,6 +199,50 @@ void apply_encoder_overrides(std::vector<EncoderSetting>& settings, const std::v
     auto found = std::find_if(settings.begin(), settings.end(), [&](const EncoderSetting& s) { return s.name == item.name; });
     if (found != settings.end()) found->value = item.value;
     else settings.push_back(item);
+  }
+}
+
+int encoder_speed_rank(EncoderFamily family, const std::string& name, const std::string& value) {
+  if (family == EncoderFamily::Nvenc && name == "preset") {
+    return value.size() == 2 && value[0] == 'p' && value[1] >= '1' && value[1] <= '7' ? value[1] - '0' : -1;
+  }
+  if (family == EncoderFamily::Nvenc && name == "multipass") {
+    return value == "disabled" ? 0 : value == "qres" ? 1 : value == "fullres" ? 2 : -1;
+  }
+  if (family == EncoderFamily::Amf && name == "preset") {
+    return value == "speed" ? 0 : value == "balanced" ? 1 : value == "quality" ? 2 : value == "highQuality" ? 3 : -1;
+  }
+  if (family == EncoderFamily::Qsv && name == "target_usage") {
+    // TU7 is the fastest and TU1 the best: the rank counts up from TU7 so a larger rank is heavier.
+    return value.size() == 3 && value[0] == 'T' && value[1] == 'U' && value[2] >= '1' && value[2] <= '7' ? '8' - value[2] : -1;
+  }
+  if (family == EncoderFamily::X264 && name == "preset") {
+    static const char* const presets[] = {"ultrafast", "superfast", "veryfast", "faster", "fast",
+                                          "medium",     "slow",      "slower",   "veryslow", "placebo"};
+    for (int index = 0; index < 10; ++index) {
+      if (value == presets[index]) return index;
+    }
+    return -1;
+  }
+  return -1;
+}
+
+void apply_governor_relief(std::vector<EncoderSetting>& settings, EncoderFamily family, int step) {
+  for (const EncoderSetting& item : governor_overrides(family, step)) {
+    auto found = std::find_if(settings.begin(), settings.end(), [&](const EncoderSetting& s) { return s.name == item.name; });
+    if (found == settings.end()) {
+      settings.push_back(item);  // not set: the encoder's own default is unknown, so the relief value is the one that runs
+      continue;
+    }
+    const bool speed_setting = item.name == "preset" || item.name == "target_usage" || item.name == "multipass";
+    if (!speed_setting) {
+      found->value = item.value;
+      continue;
+    }
+    // A speed replaced only by a lighter one. An unnamed current value is kept rather than guessed at.
+    const int now = encoder_speed_rank(family, item.name, found->value.is_string() ? found->value.as_string() : std::string());
+    const int next = encoder_speed_rank(family, item.name, item.value.as_string());
+    if (now >= 0 && next >= 0 && next < now) found->value = item.value;
   }
 }
 
@@ -196,12 +272,36 @@ Json encoder_setting_value(const std::vector<EncoderSetting>& settings, const st
   return Json();
 }
 
-std::vector<EncoderSetting> configured_encoder_settings(EncoderFamily family, const Config& config, int governor_step) {
+Json encoder_options_after_edit(const Json& stored, const Json& requested, const std::vector<std::string>& keys,
+                                const std::string& name, const Json& value) {
+  Json options = stored.is_object() ? stored : Json::object();
+  for (const std::string& key : keys) {
+    // Stored wins, null and unknown included. A row the requested object does not carry (the encoder does not list it)
+    // is not written: writing it would be a knob the encoder refuses.
+    if (options.has(key) || !requested.has(key)) continue;
+    options.set(key, requested[key]);
+  }
+  options.set(name, value);
+  return options;
+}
+
+std::vector<EncoderSetting> configured_encoder_settings(EncoderFamily family, const Config& config, int governor_step,
+                                                        const EncoderTraits& traits) {
   const std::string quality = effective_quality(config);
   std::vector<EncoderSetting> settings = merge_encoder_settings(
-      encoder_tier_defaults(family, encoder_mode_tier(config.encoder_mode, quality), config),
+      encoder_tier_defaults(family, encoder_mode_tier(config.encoder_mode, quality), config, traits),
       config.encoder_mode == "custom" ? config.encoder_options : Json::object());
-  apply_encoder_overrides(settings, governor_overrides(family, config.encoder_mode == "auto" ? governor_step : 0));
+  // Never CBR, CQP, QVBR or a latency mode on AMD, nor anything but VBR on Intel (an older config's options could carry one):
+  // a replay wants the rate to follow the picture. The host's own VBR path sizes the bit rate for every allowed value.
+  if (family == EncoderFamily::Amf || family == EncoderFamily::Qsv) {
+    for (EncoderSetting& setting : settings) {
+      if (setting.name != "rate_control") continue;
+      const std::string value = setting.value.is_string() ? setting.value.as_string() : std::string();
+      if (value != "VBR" && !(family == EncoderFamily::Amf && value == "HQVBR")) setting.value = Json("VBR");
+    }
+  }
+  // Relief is the last layer in every mode: Fast, Balanced, Maximum and Custom get the same steps (decided 2026-11-14).
+  apply_governor_relief(settings, family, governor_step);
   if (family == EncoderFamily::Nvenc) apply_encoder_overrides(settings, {EncoderSetting{"tune", Json("hq")}});
   return settings;
 }

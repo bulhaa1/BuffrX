@@ -101,9 +101,16 @@ int main(int argc, char** argv) {
   has_argument(argc, argv, "--minimize-on-blur", minimize_on_blur);
   g_minimize_on_blur = minimize_on_blur != 0;
   if (exclusive) fullscreen = 1;
+  // --mode-width W --mode-height H (with --exclusive): the display mode the game asks for, as most exclusive games do:
+  // lower than the monitor's own. Windows switches the desktop to it for as long as the process holds the display and puts
+  // it back when the process lets go or ends.
+  int mode_width = 0, mode_height = 0;
+  has_argument(argc, argv, "--mode-width", mode_width);
+  has_argument(argc, argv, "--mode-height", mode_height);
+  const bool own_mode = exclusive && mode_width > 0 && mode_height > 0;
   if (fullscreen) {
-    width = GetSystemMetrics(SM_CXSCREEN);
-    height = GetSystemMetrics(SM_CYSCREEN);
+    width = own_mode ? mode_width : GetSystemMetrics(SM_CXSCREEN);
+    height = own_mode ? mode_height : GetSystemMetrics(SM_CYSCREEN);
   }
   if (seconds < 5) seconds = 5;
   int probe = 0, cap = 0, motion = 0, load = 0, settle = 0;
@@ -166,6 +173,7 @@ int main(int argc, char** argv) {
   swap_desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
   swap_desc.BufferCount = 2;
   swap_desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+  swap_desc.Flags = own_mode ? DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH : 0;  // without it the display keeps the desktop mode
   IDXGISwapChain1* swap = nullptr;
   hr = factory->CreateSwapChainForHwnd(device, g_window, &swap_desc, nullptr, nullptr, &swap);
   if (FAILED(hr)) {
@@ -178,7 +186,20 @@ int main(int argc, char** argv) {
       std::printf("PRESENT_LOOP_FAIL exclusive 0x%08lX\n", static_cast<unsigned long>(hr));
       return 1;
     }
-    hr = swap->ResizeBuffers(0, static_cast<UINT>(width), static_cast<UINT>(height), DXGI_FORMAT_UNKNOWN, 0);
+    if (own_mode) {
+      // The mode switch itself: the output is told the resolution the game wants, as an exclusive game does.
+      DXGI_MODE_DESC wanted_mode{};
+      wanted_mode.Width = static_cast<UINT>(mode_width);
+      wanted_mode.Height = static_cast<UINT>(mode_height);
+      wanted_mode.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+      hr = swap->ResizeTarget(&wanted_mode);
+      if (FAILED(hr)) {
+        std::printf("PRESENT_LOOP_FAIL exclusive mode 0x%08lX\n", static_cast<unsigned long>(hr));
+        swap->SetFullscreenState(FALSE, nullptr);
+        return 1;
+      }
+    }
+    hr = swap->ResizeBuffers(0, static_cast<UINT>(width), static_cast<UINT>(height), DXGI_FORMAT_UNKNOWN, swap_desc.Flags);
     if (FAILED(hr)) {
       std::printf("PRESENT_LOOP_FAIL exclusive resize 0x%08lX\n", static_cast<unsigned long>(hr));
       swap->SetFullscreenState(FALSE, nullptr);

@@ -10,6 +10,7 @@
 #include <cctype>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cfloat>
 #include <cstring>
 
@@ -20,6 +21,7 @@
 #include "../screenshot.h"
 #include "../toast.h"
 #include "ui_pad_nav.h"
+#include "ui_present_math.h"
 #include "backends/imgui_impl_dx11.h"
 #include "backends/imgui_impl_win32.h"
 #include "imgui.h"
@@ -263,7 +265,13 @@ struct UiWindow {
   int64_t closing_us = 0;
   bool retire_on_hide = false;
   uint64_t digest = 0;           // the draw data of the last presented frame (draw_digest), so an identical one is not presented
-  bool digest_valid = false;     // false after a show, a resize or a capture: the next frame is always presented
+  bool digest_valid = false;     // false after a show, a resize or a capture, and after any frame that did not reach the display
+  // A frame that did not reach the display (busy, covered, a target that could not be made) asks again on its own deadline; while that
+  // retry is owed, the ordinary causes wait for it (ui_present_math.h).
+  PresentRetry retry;
+  // Deliberate input since the last frame drawn (a click, a key, the wheel, a pad press, an activation, ui.input's click or keys): it
+  // draws at once. A pointer move or a focus change is not deliberate, so a moving pointer cannot renew a spent window's rebuilds.
+  bool input_fresh = false;
   // Motion. `opening`: just shown, its first frame starts the fade-in from the ground. `moving`: the last frame left
   // something that has not arrived (a hover, a slide, a scroll), so the next one is asked for at the display's rate.
   bool opening = false;
@@ -301,7 +309,12 @@ static std::string web_root_folder() {
   return dir + "\\..\\ui\\dist";  // missing: the clip picture says it could not be shown
 }
 
-UiHost::UiHost() : store_(bridge_) { wake_event_ = CreateEventW(nullptr, FALSE, FALSE, nullptr); }
+UiHost::UiHost() : store_(bridge_) {
+  wake_event_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+  // Test-only faults for the native probe (ui_present_math.h). Read once here; off unless a probe sets the variable.
+  test_present_fault_ = parse_present_fault(std::getenv("BUFFRX_UI_TEST_PRESENT"));
+  test_target_fault_ = parse_target_fault(std::getenv("BUFFRX_UI_TEST_TARGET"));
+}
 
 UiHost::~UiHost() {
   web_clip_.release();  // before the panel's window goes: the page is a child of it
@@ -621,10 +634,8 @@ UiWindow* UiHost::open_window(bool tray) {
     DestroyWindow(window->hwnd);
     return nullptr;
   }
-  ID3D11Texture2D* back = nullptr;
-  window->swap->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&back));
-  if (back) device_->CreateRenderTargetView(back, nullptr, &window->target);
-  release(back);
+  // A target that cannot be made now is retried by the frame pass, not left null for the life of the window.
+  if (const HRESULT made = make_target(*window); FAILED(made)) note_frame_failure(*window, PresentOutcome::no_target, made);
 
   open_marks_[2] = static_cast<double>(now_us() - open_t0_us_) / 1000.0;  // the swap chain and its target are made
   ImGuiContext* previous = ImGui::GetCurrentContext();
@@ -744,6 +755,9 @@ void UiHost::check_clipboard_for_link() {
 
 void UiHost::open_share_for(const std::string& file) {
   if (file.empty()) return;
+  // The sheet is drawn by the main panel. An editor opened from the quick panel would otherwise return to it
+  // when it closes, replacing the panel and hiding the sheet the person just asked for.
+  editor_return_quick_ = false;
   // The library's own entry when it is loaded (its thumbnail, length and size); otherwise one made from
   // the file, and the sheet takes the length from the engine's reply.
   UiMedia item;
@@ -818,7 +832,7 @@ void UiHost::wait(uint32_t idle_ms) {
     capture_pending = capture_.pending;
   }
   // A capture being taken is polled every 20 ms; a window on screen waits for its own next deadline (wait_hint_ms_, set by frame(),
-  // at most 100 ms): a quiet panel used to wake 60 times a second for nothing. A message, a request, a reply or an event wakes it.
+  // at most 250 ms): a quiet panel used to wake 60 times a second for nothing. A message, a request, a reply or an event wakes it.
   // With nothing on screen the loop sleeps to its earliest deadline.
   idle_ms = any_visible() || capture_pending ? std::min<uint32_t>(std::min<uint32_t>(idle_ms, capture_pending ? 20u : 250u), wait_hint_ms_)
                                               : loop_sleep_ms(idle_ms, hidden_deadline_ms());
@@ -873,7 +887,7 @@ bool UiHost::display_ready(UiWindow& window, bool strict) {
 
 // Why a frame is being drawn, for `ui.frame_stats`: every true flag counts once, so a window that draws with nothing visible
 // changing shows which one keeps asking.
-void UiHost::note_reasons(bool forced, bool store, bool dirty, bool moving, bool settle, const char* animation, bool images) {
+void UiHost::note_reasons(bool forced, bool store, bool dirty, bool moving, bool settle, const char* animation, bool images, bool retry) {
   std::lock_guard<std::mutex> lock(stats_mutex_);
   if (forced) frame_stats_.reason("forced");
   if (store) frame_stats_.reason("store");
@@ -882,6 +896,50 @@ void UiHost::note_reasons(bool forced, bool store, bool dirty, bool moving, bool
   if (settle) frame_stats_.reason("settle");
   if (animation) frame_stats_.reason(std::string("anim:") + animation);
   if (images) frame_stats_.reason("images");
+  if (retry) frame_stats_.reason("retry");
+}
+
+HRESULT UiHost::make_target(UiWindow& window) {
+  release(window.target);
+  if (!window.swap || !device_) return E_FAIL;
+  // Test-only (BUFFRX_UI_TEST_TARGET): this call fails as if the buffer could not be made. Nothing is reset.
+  if (target_fault_applies(test_target_fault_, ++test_target_calls_)) {
+    BX_LOG_NOTE("test fault: target call %d refused at %lld us", test_target_calls_, static_cast<long long>(now_us()));
+    return E_FAIL;
+  }
+  ID3D11Texture2D* back = nullptr;
+  HRESULT made = window.swap->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&back));
+  if (SUCCEEDED(made) && back) made = device_->CreateRenderTargetView(back, nullptr, &window.target);
+  else if (SUCCEEDED(made)) made = E_FAIL;  // a buffer that came back empty is no target either
+  release(back);
+  return made;
+}
+
+void UiHost::note_frame_failure(UiWindow& window, PresentOutcome outcome, HRESULT hr) {
+  const int64_t now = now_us();
+  window.retry = next_retry(window.retry, outcome, now);
+  window.digest_valid = false;  // what was not shown is not a repeat: the next frame that gets through is presented
+  window.dirty = false;         // the retry, not the dirty flag, asks for the next frame: a flag left set would spin the loop
+  // A target that cannot be made is named once, with the device's own reason, so a report says which fault it was.
+  if (window.retry.misses == 1) {
+    const HRESULT removed = device_ ? device_->GetDeviceRemovedReason() : S_OK;
+    BX_LOG_WARN("the %s window's frame did not present (0x%08lx, device 0x%08lx): retrying",
+                window.tray ? "quick panel" : "panel", static_cast<unsigned long>(hr), static_cast<unsigned long>(removed));
+  }
+  // The episode asks for a rebuild once, at the attempt that spends it. Its slow re-arms do not ask again.
+  if (retry_gave_up_now(window.retry) && escalates(outcome)) {
+    if (may_rebuild(resource_rebuilds_)) {
+      ++resource_rebuilds_;
+      device_lost_ = true;  // the frame pass rebuilds the device, its swap chains and the atlases, as it does after a lost device
+      BX_LOG_WARN("the interface gave up on its frame (0x%08lx); rebuilding its graphics device (%d of %d)",
+                  static_cast<unsigned long>(hr), resource_rebuilds_, kResourceRebuilds);
+      wake();
+    } else {
+      // Not rebuilt without limit: the re-arms go on for a minute, then only a deliberate input draws again.
+      BX_LOG_ERROR("the interface could not draw after %d device rebuilds (0x%08lx); it retries once a second, then on the next input",
+                   kResourceRebuilds, static_cast<unsigned long>(hr));
+    }
+  }
 }
 
 void UiHost::note_pass(double ms, uint32_t message) {
@@ -1768,6 +1826,10 @@ void UiHost::apply_inputs() {
     ImGui::SetCurrentContext(previous);
     // An injected move on its own is the pointer alone, like a real one; anything else is drawn at the display's rate.
     window->pointer_only = args.has("move") && !args.has("click") && !args.has("keys") && !args.has("wheel") && !args.has("text") && !args.has("chord");
+    if (!window->pointer_only) {
+      window->input_fresh = true;  // a click, keys, a chord, the wheel or text: deliberate, as a person's would be
+      if (test_present_fault_ != PresentFault::none) BX_LOG_NOTE("test fault: deliberate input at %lld us", static_cast<long long>(now_us()));
+    }
     window->dirty = true;
     window->settle_us = now_us() + kSettleUs;
   }
@@ -2116,7 +2178,13 @@ void UiHost::frame() {
   }
   game_flag_.store(game_running_, std::memory_order_relaxed);
   for (UiWindow* window : {main_.get(), tray_.get()}) {
-    if (!window || !window->visible || IsIconic(window->hwnd)) continue;
+    if (!window) continue;
+    // A hidden or minimized window keeps no pending present: it does no GPU work, and its restore (WM_SIZE, WM_ACTIVATE) asks for a frame.
+    if (!window->visible || IsIconic(window->hwnd)) {
+      window->retry = retry_while_shown(window->retry, false);
+      window->input_fresh = false;
+      continue;
+    }
     // The picture's surface stays under every other child (the clip page, the editor): a new child or an activation can raise it.
     if (window->surface && GetWindow(window->surface, GW_HWNDNEXT))
       SetWindowPos(window->surface, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
@@ -2131,9 +2199,25 @@ void UiHost::frame() {
     const bool spinning = window->spinning && animation_frame_due(kSpinnerMs, false, current_us, window->last_present_us);
     const int64_t since_present = current_us - window->last_present_us;
     window->focused = GetForegroundWindow() == window->hwnd;
+    // A frame the display did not take (busy, covered, a target that could not be made) is owed until it shows, or until its attempts
+    // are spent and its slow re-arms are too. While it is owed, the ordinary causes below wait for it. Deliberate input, a capture and
+    // a pad press draw at once (`fresh`), and a spent window that gets one starts a new episode and is granted one rebuild.
+    const bool fresh = forced || pad_urgent || window->input_fresh;
+    if (fresh && window->retry.gave_up) {
+      window->retry = PresentRetry{};
+      if (may_grant_rebuild(resource_rebuilds_, current_us, last_rebuild_grant_us_)) {
+        resource_rebuilds_ = grant_rebuild(resource_rebuilds_);
+        last_rebuild_grant_us_ = current_us;
+      }
+    }
+    const bool retry = retry_due(window->retry, current_us, true);
+    const bool held = retry_holds(window->retry, retry, fresh);
     // Something asked for this frame (an input, new data), or something moves slowly and is due again.
     // `urgent` follows the display; the settle frame after an input (a tooltip finishing) and the slow animations do not.
-    const bool urgent = forced || store_changed || window->dirty || window->moving;
+    const bool pending = forced || store_changed || window->dirty || window->moving;
+    // Held content stays pending: store_.dirty is cleared below, so the frame at the retry's deadline finds the flag here.
+    if (held && pending) window->dirty = true;
+    const bool urgent = pending && !held;
     const bool settle = settle_due(window->settle_us, current_us);
     // A game holds a frame like a slow one only while it runs and this window is not the one the user operates (Phase 1.3).
     const bool game_holds = game_running_ && !window->focused;
@@ -2144,25 +2228,36 @@ void UiHost::frame() {
       wait_hint_ms_ = std::min<uint32_t>(wait_hint_ms_, static_cast<uint32_t>((gap - since_present) / 1000 + 1));
     }
     const bool images_due = images_busy && slow_frame_due(since_present) && (window->focused || since_present >= kUnfocusedGapUs);
-    const bool ambient_due = images_due || settle || animation_due || spinning;
+    const bool ambient_due = !held && (images_due || settle || animation_due || spinning);
     // What is still pending sets the next pass: an animation's period, a spinner's 33 ms, thumbnails still loading, a settle frame.
-    if (animation.name) wait_hint_ms_ = std::min<uint32_t>(wait_hint_ms_, std::max<uint32_t>(animation.period_ms, 20u));
-    if (window->spinning || window->moving || images_busy) wait_hint_ms_ = std::min<uint32_t>(wait_hint_ms_, window->spinning ? 33u : 20u);
-    if (window->settle_us != 0)
-      wait_hint_ms_ = std::min<uint32_t>(wait_hint_ms_, static_cast<uint32_t>(std::max<int64_t>(4, (window->settle_us - current_us) / 1000 + 1)));
-    if (urgent_due || ambient_due) {
+    // A held window sets none of these: it draws at its retry's deadline, and a wake per animation period would be the poll it avoids.
+    if (!held) {
+      if (animation.name) wait_hint_ms_ = std::min<uint32_t>(wait_hint_ms_, std::max<uint32_t>(animation.period_ms, 20u));
+      if (window->spinning || window->moving || images_busy) wait_hint_ms_ = std::min<uint32_t>(wait_hint_ms_, window->spinning ? 33u : 20u);
+      if (window->settle_us != 0)
+        wait_hint_ms_ = std::min<uint32_t>(wait_hint_ms_, static_cast<uint32_t>(std::max<int64_t>(4, (window->settle_us - current_us) / 1000 + 1)));
+    }
+    if (window->retry.due_us != 0) wait_hint_ms_ = std::min<uint32_t>(wait_hint_ms_, retry_wait_ms(window->retry, current_us));
+    if (urgent_due || ambient_due || retry) {
       // A pad edge draws at once: one refresh of waiting for the display's slot is a whole press's worth of delay.
       if (forced || pad_urgent || display_ready(*window, game_holds)) {
         part = GetTickCount();
-        note_reasons(forced, store_changed, window->dirty, window->moving, settle, animation.name, images_busy);
+        note_reasons(forced, store_changed, window->dirty, window->moving, settle, animation.name, images_busy, retry);
         render(*window, false, !game_holds);
+        window->input_fresh = false;        // drawn: the input, if it was one, is answered
         if (settle) window->settle_us = 0;  // drawn: the frame that follows the input is answered
+        // A render that returned without an attempt (no context or swap chain) leaves a due retry due: move it on, or the loop polls at 4 ms.
+        if (retry && retry_pending(window->retry) && window->retry.due_us <= current_us) window->retry = retry_later(window->retry, current_us);
         time_part(frame_report_, window->tray ? "drawing the tray panel" : "drawing the panel", part);
-      } else if (urgent) {
-        window->dirty = true;  // held back for the display: the store's flag is cleared below, this one is not
+      } else {
+        // Held back for the display: a due retry asks again on the busy deadline. No attempt was made, so none is counted against
+        // the episode, and a strict-game window costs one pass per deadline, not a poll.
+        if (retry) window->retry = retry_later(window->retry, current_us);
+        if (urgent) window->dirty = true;  // the store's flag is cleared below, this one is not
       }
-      // An asked-for frame may be followed by more: the loop waits for the display's next frame instead of sleeping.
-      if (urgent_due && window->pace && !game_holds) paced = window;
+      // An asked-for frame may be followed by more: the loop waits for the display's next frame instead of sleeping. A window
+      // without a target has nothing to wait for: its frame failed and is retried on the deadline.
+      if (urgent_due && window->pace && window->target && !game_holds) paced = window;
     } else if (urgent) {
       window->dirty = true;  // capped while a game runs: the next pass draws it
     }
@@ -2209,9 +2304,26 @@ void UiHost::frame() {
 }
 
 void UiHost::render(UiWindow& window, bool for_capture, bool vsync) {
-  // No context, no swap chain or no render target (a lost device, a resize that could not make one): nothing to draw
-  // into. The next pass rebuilds it instead of presenting a frame that was never drawn.
-  if (!window.imgui || !window.swap || !window.target) return;
+  // No context or swap chain: nothing to draw with (the device is rebuilt by its own path).
+  if (!window.imgui || !window.swap) return;
+  // No render target (a resize that could not make one, or a failed attempt): make it now. A target that still cannot be made
+  // is retried on the frame pass's deadline; nothing is presented that was never drawn.
+  if (!window.target) {
+    if (const HRESULT made = make_target(window); FAILED(made)) {
+      if (!for_capture) {
+        note_frame_failure(window, PresentOutcome::no_target, made);
+      } else {
+        // A capture must answer, or its caller waits for a frame that will never come.
+        std::lock_guard<std::mutex> lock(requests_mutex_);
+        capture_.ok = false;
+        capture_.error = "the window has no frame";
+        capture_.done = true;
+        capture_.pending = false;
+        capture_done_.notify_all();
+      }
+      return;
+    }
+  }
   ImGui::SetCurrentContext(window.imgui);
   drawing_ = &window;
   const std::string theme = store_.theme();
@@ -2425,16 +2537,44 @@ void UiHost::render(UiWindow& window, bool for_capture, bool vsync) {
   // A sync interval of 1 waits for the vertical blank. A sleeping display, a covered window (DWM stops taking frames
   // while another window is in front) or a stalled driver can leave that wait without an answer, which hangs the window
   // thread; DO_NOT_WAIT turns it into a skipped frame instead, for an unpaced present too.
-  const HRESULT presented = window.swap->Present(sync, DXGI_PRESENT_DO_NOT_WAIT);
-  const bool present_skipped = presented == DXGI_ERROR_WAS_STILL_DRAWING || presented == DXGI_STATUS_OCCLUDED;
-  // A skipped frame was not seen: offer the same picture again next time instead of counting it as shown.
-  if (present_skipped) window.digest_valid = false;
+  // Test-only (BUFFRX_UI_TEST_PRESENT): this attempt's return is replaced and the display is not asked, so the GPU does no work for it.
+  HRESULT presented = S_OK;
+  if (!for_capture && test_present_fault_ != PresentFault::none && present_fault_applies(test_present_fault_, ++test_present_attempts_)) {
+    presented = static_cast<HRESULT>(present_fault_hresult(test_present_fault_));
+    BX_LOG_NOTE("test fault: present attempt %d returns 0x%08lx at %lld us", test_present_attempts_, static_cast<unsigned long>(presented),
+                static_cast<long long>(present_t0));
+  } else {
+    presented = window.swap->Present(sync, DXGI_PRESENT_DO_NOT_WAIT);
+  }
+  const PresentOutcome outcome = classify_present(static_cast<uint32_t>(presented));
+  // A frame that did not reach the display was not seen: the same picture is offered again (the digest stays invalid until a
+  // frame really shows), and the retry below asks for it on its own deadline.
+  if (outcome != PresentOutcome::shown) window.digest_valid = false;
   const int64_t present_us = now_us() - present_t0;
-  if (presented == DXGI_ERROR_DEVICE_REMOVED || presented == DXGI_ERROR_DEVICE_RESET) {
-    // A driver reset (a TDR) took the device and every resource with it: the next pass rebuilds the device, the swap
-    // chains and the atlases instead of drawing into a device that no longer answers.
-    device_lost_ = true;
-    BX_LOG_WARN("the interface's present failed (0x%08lx): its device will be rebuilt", static_cast<unsigned long>(presented));
+  if (outcome == PresentOutcome::lost) {
+    // A driver reset (a TDR) took the device and every resource with it: the next pass rebuilds the device, the swap chains and the
+    // atlases instead of drawing into a device that no longer answers. Bounded like a missing target: a device that fails its first
+    // present again is rebuilt at most kResourceRebuilds times in a run, then waits for a deliberate input.
+    if (may_rebuild(resource_rebuilds_)) {
+      ++resource_rebuilds_;
+      window.retry = PresentRetry{};
+      device_lost_ = true;
+      wake();
+      BX_LOG_WARN("the interface's present failed (0x%08lx): its device will be rebuilt (%d of %d)", static_cast<unsigned long>(presented),
+                  resource_rebuilds_, kResourceRebuilds);
+    } else {
+      if (!window.retry.gave_up)
+        BX_LOG_ERROR("the interface's present failed again (0x%08lx) after %d device rebuilds; it waits for a deliberate input",
+                     static_cast<unsigned long>(presented), kResourceRebuilds);
+      window.retry = retry_spent();  // held: no rebuild and no retry until a deliberate input
+    }
+  } else if (!for_capture) {
+    if (outcome == PresentOutcome::shown) {
+      window.retry = PresentRetry{};
+      resource_rebuilds_ = 0;  // a frame got through: a later failure starts a new run
+    } else {
+      note_frame_failure(window, outcome, presented);
+    }
   }
   if (!for_capture) {
     std::lock_guard<std::mutex> lock(stats_mutex_);
@@ -2449,8 +2589,8 @@ void UiHost::render(UiWindow& window, bool for_capture, bool vsync) {
                 window.pace_ready ? 1 : 0, static_cast<long long>(now_us() - window.last_present_us), GetForegroundWindow() == window.hwnd ? 1 : 0);
   }
   window.pace_ready = false;
-  window.last_present_us = now_us();
-  if (!for_capture && !present_skipped) {
+  window.last_present_us = now_us();  // the attempt's time: pacing follows attempts, the retry has its own deadline
+  if (!for_capture && outcome == PresentOutcome::shown) {
     std::lock_guard<std::mutex> lock(stats_mutex_);
     frame_stats_.present(window.last_present_us);
   }
@@ -2646,10 +2786,11 @@ LRESULT UiHost::handle(UiWindow& window, UINT message, WPARAM wparam, LPARAM lpa
           device_lost_ = true;
           return 0;
         }
-        ID3D11Texture2D* back = nullptr;
-        window.swap->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&back));
-        if (back) device_->CreateRenderTargetView(back, nullptr, &window.target);
-        release(back);
+        if (const HRESULT made = make_target(window); FAILED(made)) {
+          // The frame pass retries the target on its own deadline (and rebuilds the device once that is spent); nothing draws now.
+          note_frame_failure(window, PresentOutcome::no_target, made);
+          return 0;
+        }
         window.dirty = true;
         // Resizing runs a modal loop that starves the main loop: draw from here so the panel keeps up. Not while the fonts
         // are due: a DPI change is followed by this message, and rebuilding the atlas inside it froze a cross-DPI drag.
@@ -2836,6 +2977,7 @@ LRESULT UiHost::handle(UiWindow& window, UINT message, WPARAM wparam, LPARAM lpa
       // The quick panel stays where it is when another app takes the focus: it is a floating widget, closed by
       // its own button, Esc or the tray icon. The panel is never on top; the quick panel always is.
       window.dirty = true;
+      if (LOWORD(wparam) != WA_INACTIVE) window.input_fresh = true;  // an activation draws at once, even a spent window's
       break;
     case WM_SYSCOMMAND:
       if ((wparam & 0xFFF0) == SC_KEYMENU) return 0;  // no menu: Alt must never steal focus
@@ -2850,6 +2992,7 @@ LRESULT UiHost::handle(UiWindow& window, UINT message, WPARAM wparam, LPARAM lpa
         keys_.push_back(Key{GetKeyState(VK_CONTROL) < 0, GetKeyState(VK_MENU) < 0, GetKeyState(VK_SHIFT) < 0,
                             GetKeyState(VK_LWIN) < 0 || GetKeyState(VK_RWIN) < 0, static_cast<unsigned>(wparam), true});
         window.dirty = true;
+        window.input_fresh = true;
         window.settle_us = now_us() + kSettleUs;
         return 0;
       }
@@ -2862,6 +3005,7 @@ LRESULT UiHost::handle(UiWindow& window, UINT message, WPARAM wparam, LPARAM lpa
         keys_.push_back(Key{GetKeyState(VK_CONTROL) < 0, GetKeyState(VK_MENU) < 0, GetKeyState(VK_SHIFT) < 0,
                             GetKeyState(VK_LWIN) < 0 || GetKeyState(VK_RWIN) < 0, static_cast<unsigned>(wparam), false});
         window.dirty = true;
+        window.input_fresh = true;
         window.settle_us = now_us() + kSettleUs;
         return 0;
       }
@@ -2888,6 +3032,8 @@ LRESULT UiHost::handle(UiWindow& window, UINT message, WPARAM wparam, LPARAM lpa
       if (pointer_move_wakes(window.pointer_only, window.focused)) {
         window.dirty = true;
         window.settle_us = now_us() + kSettleUs;
+        // A click, a key or the wheel is deliberate. A move on its own or a focus change is an ordinary cause, so it cannot renew a rebuild.
+        if (!window.pointer_only && message != WM_MOUSELEAVE && message != WM_SETFOCUS && message != WM_KILLFOCUS) window.input_fresh = true;
         note_input(message_kind(message));
       }
     }

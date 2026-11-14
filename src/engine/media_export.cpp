@@ -11,11 +11,13 @@
 #include <filesystem>
 #include <memory>
 
+#include "audio_layout.h"
 #include "clip_check.h"
 #include "library.h"
 #include "media.h"
 #include "mp4_edit.h"
 #include "stitch_plan.h"
+#include "../shared/log.h"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -75,6 +77,18 @@ int64_t file_bytes(const std::string& path) {
   WIN32_FILE_ATTRIBUTE_DATA data{};
   if (!GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &data)) return 0;
   return (static_cast<int64_t>(data.nFileSizeHigh) << 32) | data.nFileSizeLow;
+}
+
+// The last write time, seconds since 1970: a cached track copy is keyed by it, because a replaced file
+// keeps its path and may keep its size.
+int64_t file_modified(const std::string& path) {
+  WIN32_FILE_ATTRIBUTE_DATA data{};
+  if (!GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &data)) return 0;
+  ULARGE_INTEGER stamp{};
+  stamp.LowPart = data.ftLastWriteTime.dwLowDateTime;
+  stamp.HighPart = data.ftLastWriteTime.dwHighDateTime;
+  constexpr uint64_t kUnixEpochInFileTime = 116444736000000000ull;
+  return stamp.QuadPart > kUnixEpochInFileTime ? static_cast<int64_t>((stamp.QuadPart - kUnixEpochInFileTime) / 10000000ull) : 0;
 }
 
 // Owners for the FFmpeg objects one pipeline creates; released in reverse order by the destructor.
@@ -318,6 +332,146 @@ bool drain_filter(FilterGraph& graph, AVCodecContext* encoder, AVFormatContext* 
   }
 }
 
+// A recomputed mix (audio_layout.h: AudioMixPlan::recompute): the sources BuffrX recorded separately,
+// summed through their edited levels, so a player that reads only the first audio track hears exactly
+// the mix the editor shows. Every source is resampled to one format before the sum, and each keeps its
+// own timestamps, so amix aligns them the way the recorder did.
+struct MixPipe {
+  std::vector<int> inputs;   // input stream indexes, in track order
+  std::vector<double> gains;
+  std::vector<std::unique_ptr<CodecContext>> decoders;
+  std::vector<int> rates;    // each decoder's own sample rate, its buffer's time base
+  std::vector<int64_t> next_pts;  // the sample this source continues at, so a join never overlaps
+  std::vector<AVFilterContext*> sources;
+  std::vector<bool> done;
+  FilterGraph graph;
+  CodecContext encoder;
+  AVStream* output = nullptr;
+};
+
+AVFilterContext* add_filter(FilterGraph& graph, const char* name, const std::string& instance, const char* args) {
+  AVFilterContext* context = nullptr;
+  if (avfilter_graph_create_filter(&context, avfilter_get_by_name(name), instance.c_str(), args, nullptr, graph.graph) < 0) {
+    return nullptr;
+  }
+  return context;
+}
+
+// `chain` is parsed on the graph so a speed change can be several atempo stages: it takes one unlabelled
+// input and one output, which are linked to the source and to the mix's own input.
+bool link_chain(FilterGraph& graph, AVFilterContext* from, AVFilterContext* to, int to_pad, const std::string& chain,
+                std::string& error) {
+  AVFilterInOut* chain_in = nullptr;
+  AVFilterInOut* chain_out = nullptr;
+  if (avfilter_graph_parse2(graph.graph, chain.c_str(), &chain_in, &chain_out) < 0 || !chain_in || !chain_out) {
+    avfilter_inout_free(&chain_in);
+    avfilter_inout_free(&chain_out);
+    error = "the mix chain was refused: " + chain;
+    return false;
+  }
+  const int linked_in = avfilter_link(from, 0, chain_in->filter_ctx, chain_in->pad_idx);
+  const int linked_out = avfilter_link(chain_out->filter_ctx, chain_out->pad_idx, to, to_pad);
+  avfilter_inout_free(&chain_in);
+  avfilter_inout_free(&chain_out);
+  if (linked_in < 0 || linked_out < 0) {
+    error = "the mix chain could not be linked: " + chain;
+    return false;
+  }
+  return true;
+}
+
+bool build_mix_graph(MixPipe& pipe, int rate, const char* layout_out, double speed, std::string& error) {
+  pipe.graph.graph = avfilter_graph_alloc();
+  if (!pipe.graph.graph) {
+    error = "out of memory";
+    return false;
+  }
+  const std::string mix_args = "inputs=" + std::to_string(pipe.inputs.size()) + ":normalize=0:duration=longest";
+  AVFilterContext* mix = add_filter(pipe.graph, "amix", "mix", mix_args.c_str());
+  if (!mix) {
+    error = "the mix could not be built";
+    return false;
+  }
+  for (size_t i = 0; i < pipe.inputs.size(); ++i) {
+    AVCodecContext* decoder = pipe.decoders[i]->context;
+    char layout_in[128] = {0};
+    if (av_channel_layout_describe(&decoder->ch_layout, layout_in, sizeof(layout_in)) < 0) {
+      AVChannelLayout fallback = {};
+      av_channel_layout_default(&fallback, std::max(1, decoder->ch_layout.nb_channels));
+      av_channel_layout_describe(&fallback, layout_in, sizeof(layout_in));
+      av_channel_layout_uninit(&fallback);
+    }
+    char args[320];
+    std::snprintf(args, sizeof(args), "time_base=1/%d:sample_rate=%d:sample_fmt=%s:channel_layout=%s", pipe.rates[i],
+                  pipe.rates[i], av_get_sample_fmt_name(decoder->sample_fmt), layout_in);
+    AVFilterContext* source = add_filter(pipe.graph, "abuffer", "in" + std::to_string(i), args);
+    if (!source) {
+      error = "the mix could not be built";
+      return false;
+    }
+    char format[160];
+    std::snprintf(format, sizeof(format), "aformat=sample_fmts=fltp:sample_rates=%d:channel_layouts=%s", rate, layout_out);
+    std::string chain = format;
+    const std::string tempo = atempo_chain(speed);
+    // atempo works on packed samples and hands them on packed: the encoder and the mix want planar, so the
+    // format is set again after it. Without this the AAC encoder was given a frame with no second plane and
+    // the export process died on the first mixed frame of any sped-up edit that rebuilt its mix.
+    if (!tempo.empty()) chain += "," + tempo.substr(0, tempo.size() - 1) + "," + format;
+    char volume[64];
+    std::snprintf(volume, sizeof(volume), ",volume=%.4f", pipe.gains[i]);
+    chain += volume;
+    if (!link_chain(pipe.graph, source, mix, static_cast<int>(i), chain, error)) return false;
+    pipe.sources.push_back(source);
+  }
+  pipe.graph.sink = add_filter(pipe.graph, "abuffersink", "out", nullptr);
+  if (!pipe.graph.sink || avfilter_link(mix, 0, pipe.graph.sink, 0) < 0) {
+    error = "the mix could not be built";
+    return false;
+  }
+  if (avfilter_graph_config(pipe.graph.graph, nullptr) < 0) {
+    error = "the mix was refused";
+    return false;
+  }
+  av_buffersink_set_frame_size(pipe.graph.sink, static_cast<unsigned>(pipe.encoder.context->frame_size > 0
+                                                                         ? pipe.encoder.context->frame_size
+                                                                         : 1024));
+  pipe.done.assign(pipe.inputs.size(), false);
+  return true;
+}
+
+bool open_aac_encoder(CodecContext& encoder, int rate, int channels, int kbps, bool global_header, std::string& error) {
+  const AVCodec* aac = avcodec_find_encoder(AV_CODEC_ID_AAC);
+  encoder.context = aac ? avcodec_alloc_context3(aac) : nullptr;
+  if (!encoder.context) {
+    error = "no AAC encoder";
+    return false;
+  }
+  AVCodecContext* e = encoder.context;
+  e->sample_rate = rate;
+  e->sample_fmt = AV_SAMPLE_FMT_FLTP;
+  av_channel_layout_default(&e->ch_layout, std::max(1, channels));
+  e->bit_rate = kbps > 0 ? static_cast<int64_t>(kbps) * 1000 : 160000;
+  e->time_base = AVRational{1, rate};
+  if (global_header) e->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+  if (avcodec_open2(e, aac, nullptr) < 0) {
+    error = "the AAC encoder would not open";
+    return false;
+  }
+  return true;
+}
+
+// The sidecar a finished export carries (audio_layout.h): the labels of the file it was written from,
+// rewritten beside the output, or removed when the output has none. Never a stale label on a new file.
+void sync_export_layout(const std::string& output, const AudioLayout& layout) {
+  if (layout.buffrx && layout.tracks.size() > 1) {
+    if (!write_audio_layout(output, layout)) {
+      BX_LOG_WARN("the audio track labels for %s were not written", output.c_str());
+    }
+    return;
+  }
+  remove_audio_layout(output);
+}
+
 // How long one picture lasts, from the stream's own frame rate.
 double frame_length(AVFormatContext* format, int video) {
   if (video < 0) return 0.0;
@@ -382,6 +536,16 @@ MediaDetails media_details(const std::string& path) {
   if (details.width == 0) {
     details.reason = "the file has no video";
     return details;
+  }
+  details.modified = file_modified(path);
+  // The tracks' labels and whether track 1 is a mix this editor may rebuild come from the file's own
+  // sidecar, never from the current capture settings (audio_layout.h). A file without one keeps generic
+  // labels and no aggregate.
+  details.layout = read_audio_layout(path, static_cast<int>(details.audio.size()));
+  for (size_t i = 0; i < details.audio.size() && i < details.layout.tracks.size(); ++i) {
+    details.audio[i].role = details.layout.tracks[i].role;
+    details.audio[i].sources = details.layout.tracks[i].sources;
+    if (!details.layout.tracks[i].title.empty()) details.audio[i].title = details.layout.tracks[i].title;
   }
   // Matroska rarely records a per-stream rate; the container's average less the audio is close.
   if (details.video_kbps <= 0 && details.duration > 0.0) {
@@ -707,8 +871,10 @@ bool media_audio_track(const std::string& path, int track, const std::string& ou
   return true;
 }
 
-bool media_peaks(const std::string& path, int buckets, std::vector<std::vector<float>>& tracks, std::string& error) {
+bool media_peaks(const std::string& path, int buckets, std::vector<std::vector<float>>& tracks,
+                 std::string& error, std::vector<bool>* decoded, bool normalize) {
   tracks.clear();
+  if (decoded) decoded->clear();
   buckets = std::clamp(buckets, 16, 4000);
   InputFile input;
   if (!open_file(path, input, error)) return false;
@@ -718,6 +884,8 @@ bool media_peaks(const std::string& path, int buckets, std::vector<std::vector<f
     return false;
   }
   std::vector<int> stream_track(input.format->nb_streams, -1);
+  // One lane per audio stream, in stream order, even when its decoder will not open: a silently failed
+  // lane must not shift every lane after it away from the track it belongs to.
   std::vector<std::unique_ptr<CodecContext>> decoders;
   for (unsigned i = 0; i < input.format->nb_streams; ++i) {
     AVStream* stream = input.format->streams[i];
@@ -725,16 +893,19 @@ bool media_peaks(const std::string& path, int buckets, std::vector<std::vector<f
       stream->discard = AVDISCARD_ALL;  // the waveform never needs a video frame
       continue;
     }
+    const int lane = static_cast<int>(tracks.size());
+    stream_track[i] = lane;
+    tracks.emplace_back(static_cast<size_t>(buckets), 0.0f);
     auto decoder = std::make_unique<CodecContext>();
     std::string decoder_error;
-    if (!open_decoder(stream, *decoder, decoder_error)) continue;
-    stream_track[i] = static_cast<int>(decoders.size());
-    decoders.push_back(std::move(decoder));
-    tracks.emplace_back(static_cast<size_t>(buckets), 0.0f);
+    const bool opened = open_decoder(stream, *decoder, decoder_error);
+    decoders.push_back(opened ? std::move(decoder) : nullptr);
+    if (decoded) decoded->push_back(opened);
   }
   AVPacket* packet = av_packet_alloc();
   AVFrame* frame = av_frame_alloc();
   auto take = [&](int track, AVStream* stream) {
+    if (track < 0 || !decoders[static_cast<size_t>(track)]) return;
     AVCodecContext* decoder = decoders[static_cast<size_t>(track)]->context;
     while (avcodec_receive_frame(decoder, frame) >= 0) {
       const int64_t stamp = frame->best_effort_timestamp != AV_NOPTS_VALUE ? frame->best_effort_timestamp : frame->pts;
@@ -767,24 +938,28 @@ bool media_peaks(const std::string& path, int buckets, std::vector<std::vector<f
   };
   while (av_read_frame(input.format, packet) >= 0) {
     const int track = stream_track[static_cast<size_t>(packet->stream_index)];
-    if (track >= 0 && avcodec_send_packet(decoders[static_cast<size_t>(track)]->context, packet) >= 0) {
+    if (track >= 0 && decoders[static_cast<size_t>(track)] &&
+        avcodec_send_packet(decoders[static_cast<size_t>(track)]->context, packet) >= 0) {
       take(track, input.format->streams[packet->stream_index]);
     }
     av_packet_unref(packet);
   }
   for (unsigned i = 0; i < input.format->nb_streams; ++i) {
     const int track = stream_track[i];
-    if (track < 0) continue;
+    if (track < 0 || !decoders[static_cast<size_t>(track)]) continue;
     avcodec_send_packet(decoders[static_cast<size_t>(track)]->context, nullptr);
     take(track, input.format->streams[i]);
   }
   av_frame_free(&frame);
   av_packet_free(&packet);
-  // Each lane normalised to its own loudest point, so a quiet microphone track still reads.
-  for (std::vector<float>& lane : tracks) {
-    const float loudest = *std::max_element(lane.begin(), lane.end());
-    if (loudest > 0.0f) {
-      for (float& value : lane) value /= loudest;
+  // Each lane normalised to its own loudest point, so a quiet microphone track still reads. The editor
+  // asks for unnormalised lanes instead: normalising here threw away the level difference it draws.
+  if (normalize) {
+    for (std::vector<float>& lane : tracks) {
+      const float loudest = *std::max_element(lane.begin(), lane.end());
+      if (loudest > 0.0f) {
+        for (float& value : lane) value /= loudest;
+      }
     }
   }
   return true;
@@ -809,10 +984,14 @@ bool put_export_in_place(const ExportJob& job, const std::string& part, std::str
     error = "the original could not be set aside; it was left as it was";
     return false;
   }
-  if (!MoveFileExA(part.c_str(), job.output.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+  const DWORD move_flags = job.fail_if_exists && !replacing ? 0 : MOVEFILE_REPLACE_EXISTING;
+  if (!MoveFileExA(part.c_str(), job.output.c_str(), move_flags)) {
+    const DWORD move_error = GetLastError();
     if (replacing) MoveFileExA(aside.c_str(), job.output.c_str(), MOVEFILE_REPLACE_EXISTING);
     DeleteFileA(part.c_str());
-    error = "the export could not be put in place; the original was left as it was";
+    error = job.fail_if_exists && (move_error == ERROR_ALREADY_EXISTS || move_error == ERROR_FILE_EXISTS)
+                ? "a file with that name appeared while saving; save again to choose another name"
+                : "the export could not be put in place; the original was left as it was";
     return false;
   }
   library_forget_cached_images(job.output);
@@ -866,6 +1045,13 @@ bool export_once(const ExportJob& job, const std::function<void(double)>& progre
     error = "the file has no video";
     return false;
   }
+  // The file's own audio tracks and labels, read once: both the copy path (which carries the sidecar to
+  // the output) and the audio path below need the same answer (audio_layout.h).
+  int audio_count = 0;
+  for (unsigned i = 0; i < input.format->nb_streams; ++i) {
+    if (input.format->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) ++audio_count;
+  }
+  const AudioLayout layout = read_audio_layout(job.input, audio_count);
   // A copy begins on the keyframe at or before the cut whatever it is, and the frames between that
   // keyframe and the cut are hidden by an edit list, so the picture starts where the user cut it. A
   // keyframe further back than an edit list may hide is re-encoded instead: never a wrong file.
@@ -889,6 +1075,7 @@ bool export_once(const ExportJob& job, const std::function<void(double)>& progre
     const bool small_head = !std::isnan(head);
     if (small_head && (head <= 0.0 || mp4_head_trim(staged, head, error))) {
       if (!put_export_in_place(job, staged, error)) return false;
+      sync_export_layout(job.output, layout);
       if (progress) progress(1.0);
       return true;
     }
@@ -1025,45 +1212,85 @@ bool export_once(const ExportJob& job, const std::function<void(double)>& progre
     encoder_name = "copy";
   }
 
-  // ---- audio: every track re-encoded through its own volume; a track at 0 is dropped
-  std::vector<std::unique_ptr<AudioPipe>> audio;
-  int track_number = 0;
+  // ---- audio
+  // Every track is re-encoded through its own level. A BuffrX recording whose sidecar names track 1 as
+  // the mix of the tracks after it has that mix rebuilt from them, so a mute or a level reaches both the
+  // ordinary mix a player hears and the separate tracks a remix would use (audio_layout.h). A file whose
+  // tracks nothing describes keeps every stream at its own gain: no track is assumed to be a mix of the
+  // others, and no stream is dropped, so a track keeps its place and its label.
+  std::vector<int> audio_streams;
   for (unsigned i = 0; i < input.format->nb_streams; ++i) {
-    AVStream* stream = input.format->streams[i];
-    if (stream->codecpar->codec_type != AVMEDIA_TYPE_AUDIO) continue;
-    const double volume = static_cast<size_t>(track_number) < job.volumes.size()
-                              ? job.volumes[static_cast<size_t>(track_number)]
-                              : 1.0;
-    ++track_number;
-    if (volume <= 0.0001) continue;
-    auto pipe = std::make_unique<AudioPipe>();
-    pipe->input_index = static_cast<int>(i);
-    pipe->volume = std::min(volume, 4.0);
-    if (!open_decoder(stream, pipe->decoder, error)) return false;
-    const AVCodec* aac = avcodec_find_encoder(AV_CODEC_ID_AAC);
-    pipe->encoder.context = aac ? avcodec_alloc_context3(aac) : nullptr;
-    if (!pipe->encoder.context) {
-      error = "no AAC encoder";
-      return false;
+    if (input.format->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+      audio_streams.push_back(static_cast<int>(i));
     }
-    AVCodecContext* e = pipe->encoder.context;
-    int channels = pipe->decoder.context->ch_layout.nb_channels;
+  }
+  const AudioGains gains = audio_gains(job.volumes, {}, {}, static_cast<int>(audio_streams.size()));
+  std::string mix_error;
+  const AudioMixPlan mix_plan = audio_mix_plan(layout, gains, mix_error);
+  if (mix_plan == AudioMixPlan::refuse) {
+    error = mix_error;
+    return false;
+  }
+  const auto channels_of = [&](AVCodecContext* decoder) {
+    int channels = decoder->ch_layout.nb_channels;
     if (job.audio_channels == 1) channels = 1;
     else if (job.audio_channels >= 2) channels = 2;
-    channels = std::min(2, std::max(1, channels));
+    return std::min(2, std::max(1, channels));
+  };
+
+  std::unique_ptr<MixPipe> mix;
+  if (mix_plan == AudioMixPlan::recompute && audio_streams.size() > 1) {
+    mix = std::make_unique<MixPipe>();
+    // read_audio_layout proved every track after the first is a source of the mix, exactly once.
+    for (size_t track = 1; track < audio_streams.size(); ++track) {
+      const int index = audio_streams[track];
+      auto decoder = std::make_unique<CodecContext>();
+      if (!open_decoder(input.format->streams[index], *decoder, error)) return false;
+      const int rate = decoder->context->sample_rate > 0 ? decoder->context->sample_rate : 48000;
+      mix->inputs.push_back(index);
+      mix->rates.push_back(rate);
+      // The mix's own level scales what is summed: its row is not editable when the mix is rebuilt, but
+      // a job may still carry a level for track 1, and it must mean the same as it does on the mix itself.
+      mix->gains.push_back(gains.values[track] * gains.values[0]);
+      mix->decoders.push_back(std::move(decoder));
+    }
+    mix->next_pts.assign(mix->inputs.size(), 0);
+    const int rate = job.audio_rate > 0 ? job.audio_rate : mix->rates.front();
+    if (!open_aac_encoder(mix->encoder, rate, channels_of(mix->decoders.front()->context), job.audio_kbps, global_header,
+                          error)) {
+      return false;
+    }
+    char layout_out[128] = {0};
+    av_channel_layout_describe(&mix->encoder.context->ch_layout, layout_out, sizeof(layout_out));
+    if (!build_mix_graph(*mix, rate, layout_out, job.speed, error)) return false;
+    mix->output = avformat_new_stream(output, nullptr);
+    if (!mix->output) {
+      error = "out of memory";
+      return false;
+    }
+    avcodec_parameters_from_context(mix->output->codecpar, mix->encoder.context);
+    mix->output->time_base = mix->encoder.context->time_base;
+    const std::string title = !layout.tracks.front().title.empty() ? layout.tracks.front().title : "BuffrX Mix";
+    av_dict_set(&mix->output->metadata, "title", title.c_str(), 0);
+  }
+
+  std::vector<std::unique_ptr<AudioPipe>> audio;
+  for (size_t track = 0; track < audio_streams.size(); ++track) {
+    // The recorded mix is replaced by the rebuilt one; every other stream is written as it is.
+    if (mix && track == 0) continue;
+    AVStream* stream = input.format->streams[audio_streams[track]];
+    auto pipe = std::make_unique<AudioPipe>();
+    pipe->input_index = audio_streams[track];
+    pipe->volume = std::clamp(gains.values[track], 0.0, 4.0);
+    if (!open_decoder(stream, pipe->decoder, error)) return false;
     const int rate = job.audio_rate > 0
                          ? job.audio_rate
                          : (pipe->decoder.context->sample_rate > 0 ? pipe->decoder.context->sample_rate : 48000);
-    e->sample_rate = rate;
-    e->sample_fmt = AV_SAMPLE_FMT_FLTP;
-    av_channel_layout_default(&e->ch_layout, channels);
-    e->bit_rate = job.audio_kbps > 0 ? static_cast<int64_t>(job.audio_kbps) * 1000 : 160000;
-    e->time_base = AVRational{1, rate};
-    if (global_header) e->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
-    if (avcodec_open2(e, aac, nullptr) < 0) {
-      error = "the AAC encoder would not open";
+    const int input_rate = pipe->decoder.context->sample_rate > 0 ? pipe->decoder.context->sample_rate : 48000;
+    if (!open_aac_encoder(pipe->encoder, rate, channels_of(pipe->decoder.context), job.audio_kbps, global_header, error)) {
       return false;
     }
+    AVCodecContext* e = pipe->encoder.context;
     char layout_in[128] = {0};
     char layout_out[128] = {0};
     if (av_channel_layout_describe(&pipe->decoder.context->ch_layout, layout_in, sizeof(layout_in)) < 0) {
@@ -1076,7 +1303,7 @@ bool export_once(const ExportJob& job, const std::function<void(double)>& progre
     }
     av_channel_layout_describe(&e->ch_layout, layout_out, sizeof(layout_out));
     char args[320];
-    std::snprintf(args, sizeof(args), "time_base=1/%d:sample_rate=%d:sample_fmt=%s:channel_layout=%s", rate, rate,
+    std::snprintf(args, sizeof(args), "time_base=1/%d:sample_rate=%d:sample_fmt=%s:channel_layout=%s", input_rate, input_rate,
                   av_get_sample_fmt_name(pipe->decoder.context->sample_fmt), layout_in);
     char chain[512];
     std::snprintf(chain, sizeof(chain), "volume=%.4f,%saformat=sample_fmts=fltp:sample_rates=%d:channel_layouts=%s",
@@ -1090,9 +1317,10 @@ bool export_once(const ExportJob& job, const std::function<void(double)>& progre
     }
     avcodec_parameters_from_context(pipe->output->codecpar, e);
     pipe->output->time_base = e->time_base;
-    if (const AVDictionaryEntry* title = av_dict_get(stream->metadata, "title", nullptr, 0)) {
-      av_dict_set(&pipe->output->metadata, "title", title->value, 0);
-    }
+    const std::string own = track < layout.tracks.size() ? layout.tracks[track].title : std::string();
+    const AVDictionaryEntry* title = av_dict_get(stream->metadata, "title", nullptr, 0);
+    if (!own.empty()) av_dict_set(&pipe->output->metadata, "title", own.c_str(), 0);
+    else if (title && title->value) av_dict_set(&pipe->output->metadata, "title", title->value, 0);
     audio.push_back(std::move(pipe));
   }
 
@@ -1219,7 +1447,8 @@ bool export_once(const ExportJob& job, const std::function<void(double)>& progre
       }
       // On the output's clock, and never overlapping the frame before: at a join the sound of the next
       // part follows the last sample of the one before it.
-      const int rate = pipe.encoder.context->sample_rate;
+      // These are decoded samples; the filter resamples them to the encoder's rate.
+      const int rate = pipe.decoder.context->sample_rate > 0 ? pipe.decoder.context->sample_rate : 48000;
       int64_t pts = std::llround((part_offset + (t - base)) * rate);
       pts = std::max(pts, next_audio_pts[which]);
       next_audio_pts[which] = pts + frame->nb_samples;
@@ -1234,10 +1463,55 @@ bool export_once(const ExportJob& job, const std::function<void(double)>& progre
     }
   };
 
+  // A rebuilt mix receives the same packets as the tracks it is made of, keeps each source on its own
+  // clock, and is summed by amix. A source that ends before the others leaves the sum silent, not short.
+  auto push_mix_frames = [&]() -> bool {
+    if (!mix) return true;
+    const double base = reencode_video ? part_from : origin;
+    for (size_t which = 0; which < mix->inputs.size(); ++which) {
+      AVCodecContext* decoder = mix->decoders[which]->context;
+      AVStream* stream = input.format->streams[mix->inputs[which]];
+      while (true) {
+        const int received = avcodec_receive_frame(decoder, frame);
+        if (received == AVERROR(EAGAIN) || received == AVERROR_EOF) break;
+        if (received < 0) break;  // a damaged audio packet is skipped, not fatal
+        const int64_t stamp = frame->best_effort_timestamp != AV_NOPTS_VALUE ? frame->best_effort_timestamp : frame->pts;
+        const double t = stamp != AV_NOPTS_VALUE ? stamp * av_q2d(stream->time_base) : base;
+        if (base < 0.0 || t < base || t >= part_to || mix->done[which]) {
+          if (t >= part_to) mix->done[which] = true;
+          av_frame_unref(frame);
+          continue;
+        }
+        // The buffer declares this source's own rate, so its timestamps are counted in it; the chain
+        // resamples to the mix's rate after that. A part that follows another continues where the last
+        // sample of the one before ended, as the separate tracks do, so a cut never adds a sample twice.
+        int64_t pts = std::llround((part_offset + (t - base)) * mix->rates[which]);
+        pts = std::max(pts, mix->next_pts[which]);
+        mix->next_pts[which] = pts + frame->nb_samples;
+        frame->pts = pts;
+        const int added = av_buffersrc_add_frame_flags(mix->sources[which], frame, AV_BUFFERSRC_FLAG_KEEP_REF);
+        av_frame_unref(frame);
+        if (added < 0) {
+          error = "the mix could not be built";
+          return false;
+        }
+        if (!drain_filter(mix->graph, mix->encoder.context, output, mix->output, filtered, out_packet, error)) {
+          return false;
+        }
+      }
+    }
+    return true;
+  };
+
   auto part_finished = [&]() {
     if (!video_done) return false;
     for (const auto& pipe : audio) {
       if (!pipe->done) return false;
+    }
+    if (mix) {
+      for (bool done : mix->done) {
+        if (!done) return false;
+      }
     }
     return true;
   };
@@ -1248,6 +1522,7 @@ bool export_once(const ExportJob& job, const std::function<void(double)>& progre
     part_to = segments[index].second;
     video_done = false;
     for (auto& pipe : audio) pipe->done = false;
+    if (mix) mix->done.assign(mix->inputs.size(), false);
     // Each part is read from the keyframe before it: the frames between that keyframe and the cut are
     // decoded (a frame needs the ones before it) and then dropped.
     if (av_seek_frame(input.format, -1, static_cast<int64_t>(part_from * AV_TIME_BASE), AVSEEK_FLAG_BACKWARD) < 0) {
@@ -1255,6 +1530,9 @@ bool export_once(const ExportJob& job, const std::function<void(double)>& progre
     }
     if (reencode_video) avcodec_flush_buffers(video_decoder.context);
     for (auto& pipe : audio) avcodec_flush_buffers(pipe->decoder.context);
+    if (mix) {
+      for (auto& decoder : mix->decoders) avcodec_flush_buffers(decoder->context);
+    }
 
     while (!part_finished()) {
       if (av_read_frame(input.format, packet) < 0) {
@@ -1299,6 +1577,15 @@ bool export_once(const ExportJob& job, const std::function<void(double)>& progre
             return false;
           }
         }
+        if (mix) {
+          for (size_t which = 0; which < mix->inputs.size(); ++which) {
+            if (mix->inputs[which] != packet->stream_index) continue;
+            if (avcodec_send_packet(mix->decoders[which]->context, packet) >= 0 && !push_mix_frames()) {
+              av_packet_unref(packet);
+              return false;
+            }
+          }
+        }
       }
       av_packet_unref(packet);
     }
@@ -1311,6 +1598,10 @@ bool export_once(const ExportJob& job, const std::function<void(double)>& progre
       for (size_t which = 0; which < audio.size(); ++which) {
         avcodec_send_packet(audio[which]->decoder.context, nullptr);
         if (!push_audio_frames(which)) return false;
+      }
+      if (mix) {
+        for (auto& decoder : mix->decoders) avcodec_send_packet(decoder->context, nullptr);
+        if (!push_mix_frames()) return false;
       }
     }
     part_offset += part_to - part_from;
@@ -1326,6 +1617,11 @@ bool export_once(const ExportJob& job, const std::function<void(double)>& progre
     (void)av_buffersrc_add_frame_flags(pipe->graph.source, nullptr, 0);
     if (!drain_filter(pipe->graph, pipe->encoder.context, output, pipe->output, filtered, out_packet, error)) return false;
     if (!encode_frame(pipe->encoder.context, nullptr, output, pipe->output, out_packet, error)) return false;
+  }
+  if (mix) {
+    for (AVFilterContext* source : mix->sources) (void)av_buffersrc_add_frame_flags(source, nullptr, 0);
+    if (!drain_filter(mix->graph, mix->encoder.context, output, mix->output, filtered, out_packet, error)) return false;
+    if (!encode_frame(mix->encoder.context, nullptr, output, mix->output, out_packet, error)) return false;
   }
   if (av_write_trailer(output) < 0) {
     error = "the export could not be finished";
@@ -1361,6 +1657,7 @@ bool export_once(const ExportJob& job, const std::function<void(double)>& progre
     return false;
   }
   if (!put_export_in_place(job, part, error)) return false;
+  sync_export_layout(job.output, layout);
   if (progress) progress(1.0);
   return true;
 }
@@ -1384,12 +1681,15 @@ bool export_stitch(const ExportJob& job, const std::function<void(double)>& prog
                    std::string& error) {
   std::vector<StitchSource> sources;
   sources.reserve(job.inputs.size());
+  std::vector<AudioLayout> layouts;
+  layouts.reserve(job.inputs.size());
   for (const ExportInput& input : job.inputs) {
     const MediaDetails details = media_details(input.input);
     if (!details.ok) {
       error = "a clip in the join could not be read: " + input.input + " (" + details.reason + ")";
       return false;
     }
+    layouts.push_back(details.layout);
     StitchSource source;
     source.path = input.input;
     source.duration = details.duration;
@@ -1405,6 +1705,14 @@ bool export_stitch(const ExportJob& job, const std::function<void(double)>& prog
   }
   StitchPlan plan;
   if (!make_stitch_plan(sources, job, plan, error)) return false;
+  // What the output's sound will be, decided before the first expensive encode: a join of a mix-first
+  // clip with one that has only independent tracks cannot be described, so it is refused here rather
+  // than written with tracks that play as an import (audio twice) or with no labels at all.
+  const JoinAudioLayout joined = join_audio_layout(layouts);
+  if (!joined.error.empty()) {
+    error = joined.error;
+    return false;
+  }
 
   const std::filesystem::path output = utf8_path(job.output);
   const std::filesystem::path work =
@@ -1504,6 +1812,14 @@ bool export_stitch(const ExportJob& job, const std::function<void(double)>& prog
   if (!put_export_in_place(final_job, staged, error)) {
     DeleteFileA(staged.c_str());
     return false;
+  }
+  // The joined file carries the layout decided from every clip before the encode: identical clips keep
+  // their own labels, and clips whose lanes differ get an honest positional one (audio_layout.h) so the
+  // editor never reads the mix and its stems as independent streams and plays the sound twice.
+  if (joined.carries) {
+    sync_export_layout(job.output, joined.layout);
+  } else {
+    remove_audio_layout(job.output);
   }
   encoder_name = first_encoder;
   if (progress) progress(1.0);
