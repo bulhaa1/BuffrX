@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -1108,5 +1109,94 @@ std::string executable_directory() {
   const size_t slash = path.find_last_of('/');
   return slash == std::string::npos ? "." : path.substr(0, slash);
 }
+
+namespace {
+std::string g_obs_muxer;
+
+// A folder this user owns and other accounts cannot enter: the staged helper must not be replaceable
+// by anything else on the machine.
+bool private_directory(const std::string& dir) {
+  if (mkdir(dir.c_str(), 0700) != 0 && errno != EEXIST) return false;
+  struct stat status {};
+  if (lstat(dir.c_str(), &status) != 0) return false;
+  if (!S_ISDIR(status.st_mode) || status.st_uid != geteuid()) return false;
+  if ((status.st_mode & 0077) != 0 && chmod(dir.c_str(), 0700) != 0) return false;
+  return true;
+}
+
+std::string muxer_directory() {
+  if (const char* runtime = std::getenv("XDG_RUNTIME_DIR"); runtime && *runtime) {
+    const std::string dir = std::string(runtime) + "/buffrx";
+    if (private_directory(dir)) return dir;
+  }
+  // A fallback only this uid can claim. A folder another user made under this name is refused, so the
+  // engine never runs a helper it did not place.
+  const std::string dir = "/tmp/buffrx-" + std::to_string(static_cast<unsigned long long>(geteuid()));
+  return private_directory(dir) ? dir : std::string();
+}
+}  // namespace
+
+// The helper cannot run from the read-only AppImage mount, and a fixed name in /tmp lets another user
+// put a program there first. A private folder per user fixes both; the copy is written under a
+// temporary name and renamed into place, so a half-written helper is never executed.
+bool stage_obs_muxer(const std::string& source, std::string& problem) {
+  if (!g_obs_muxer.empty()) return true;
+  const std::string dir = muxer_directory();
+  if (dir.empty()) {
+    problem = "no private folder for the muxer helper";
+    return false;
+  }
+  std::ifstream input(source, std::ios::binary);
+  if (!input) {
+    problem = "cannot read " + source;
+    return false;
+  }
+  std::string template_path = dir + "/.muxer-XXXXXX";
+  std::vector<char> name(template_path.begin(), template_path.end());
+  name.push_back('\0');
+  const int handle = mkstemp(name.data());
+  if (handle < 0) {
+    problem = "cannot create the muxer helper";
+    return false;
+  }
+  bool ok = true;
+  std::vector<char> block(64 * 1024);
+  while (ok && input) {
+    input.read(block.data(), static_cast<std::streamsize>(block.size()));
+    const std::streamsize bytes = input.gcount();
+    if (bytes <= 0) break;
+    ssize_t written = 0;
+    while (written < bytes) {
+      const ssize_t step = write(handle, block.data() + written, static_cast<size_t>(bytes - written));
+      if (step < 0) {
+        if (errno == EINTR) continue;
+        ok = false;
+        break;
+      }
+      written += step;
+    }
+  }
+  if (input.bad()) ok = false;
+  if (ok && fchmod(handle, 0700) != 0) ok = false;
+  if (close(handle) != 0) ok = false;
+  const std::string target = dir + "/obs-ffmpeg-mux";
+  if (ok && rename(name.data(), target.c_str()) != 0) ok = false;
+  if (!ok) {
+    const int failure = errno;
+    unlink(name.data());
+    problem = failure ? std::strerror(failure) : "the muxer helper could not be written";
+    return false;
+  }
+  g_obs_muxer = target;
+  // The Ubuntu obs-ffmpeg build is patched to run `"$BUFFRX_MUXER"` (tools/prepare-linux-runtime.sh).
+  if (setenv("BUFFRX_MUXER", g_obs_muxer.c_str(), 1) != 0) {
+    g_obs_muxer.clear();
+    problem = "cannot pass the muxer helper to OBS";
+    return false;
+  }
+  return true;
+}
+
+std::string obs_muxer_path() { return g_obs_muxer; }
 
 }  // namespace bx

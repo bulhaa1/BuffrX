@@ -34,18 +34,22 @@ ln -sf libsrt-gnutls.so.1.5 "$libdir/libsrt.so.1.5"
 for source in /usr/lib/x86_64-linux-gnu/libavfilter.so.9* /usr/lib/x86_64-linux-gnu/libcurl.so.4*; do
   [ -e "$source" ] && cp -P "$source" "$libdir/" 2>/dev/null || true
 done
-# Ubuntu's obs-ffmpeg hardcodes its muxer helper at /usr/lib/...; the engine puts a copy at /tmp so
-# an AppImage can run it. The replacement is exactly as long as the original at most, NUL-padded.
+# Ubuntu's obs-ffmpeg hardcodes its muxer helper at /usr/lib/..., which an AppImage cannot run. The
+# engine stages a copy in a private per-user folder and exports its path as BUFFRX_MUXER; the plugin
+# runs the helper through popen, so the shell expands this name. The replacement is shorter than the
+# original and NUL-padded.
 python3 - "$libdir/obs-plugins/obs-ffmpeg.so" <<'PY'
 import sys
 path = sys.argv[1]
 try:
     data = open(path, 'rb').read()
-    old = b'/usr/lib/x86_64-linux-gnu/obs-plugins/obs-ffmpeg/obs-ffmpeg-mux'
-    new = b'/tmp/buffrx-obs-ffmpeg-mux'
-    if old in data:
-        open(path, 'wb').write(data.replace(old, new + b'\0' * (len(old) - len(new))))
-        print('patched the obs-ffmpeg muxer path')
+    new = b'$BUFFRX_MUXER'
+    for old in (b'/usr/lib/x86_64-linux-gnu/obs-plugins/obs-ffmpeg/obs-ffmpeg-mux',
+                b'/tmp/buffrx-obs-ffmpeg-mux'):
+        if old in data:
+            open(path, 'wb').write(data.replace(old, new + b'\0' * (len(old) - len(new))))
+            print('patched the obs-ffmpeg muxer path')
+            break
 except FileNotFoundError:
     pass
 PY

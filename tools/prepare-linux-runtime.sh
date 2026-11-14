@@ -21,16 +21,19 @@ for module in linux-capture linux-pulseaudio obs-ffmpeg obs-x264 obs-outputs ima
     cp -r "$runtime/usr/share/obs/obs-plugins/$module/." "$stage/data/obs-plugins/$module/"
   fi
 done
-# Ubuntu's obs-ffmpeg hardcodes its muxer helper at /usr/lib/...; the engine copies a fresh helper to
-# the fixed /tmp path so an AppImage can execute it. Patch only the pristine package copy.
+# Ubuntu's obs-ffmpeg hardcodes its muxer helper at /usr/lib/...; the engine stages a copy in a
+# private per-user folder and exports its path as BUFFRX_MUXER. Patch only the pristine package copy.
 python3 - "$stage/obs-plugins/obs-ffmpeg.so" <<'PY'
 import sys
 path = sys.argv[1]
 data = open(path, 'rb').read()
-old = b'/usr/lib/x86_64-linux-gnu/obs-plugins/obs-ffmpeg/obs-ffmpeg-mux'
-new = b'/tmp/buffrx-obs-ffmpeg-mux'
-if old in data:
-    open(path, 'wb').write(data.replace(old, new + b'\0' * (len(old) - len(new))))
+new = b'$BUFFRX_MUXER'
+for old in (b'/usr/lib/x86_64-linux-gnu/obs-plugins/obs-ffmpeg/obs-ffmpeg-mux',
+            b'/tmp/buffrx-obs-ffmpeg-mux'):
+    if old in data:
+        open(path, 'wb').write(data.replace(old, new + b'\0' * (len(old) - len(new))))
+        print('patched the obs-ffmpeg muxer path')
+        break
 PY
 cp "$src/obs-plugins/obs-ffmpeg/obs-ffmpeg-mux" "$stage/obs-ffmpeg-mux"
 chmod +x "$stage/obs-ffmpeg-mux"

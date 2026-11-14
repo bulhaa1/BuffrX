@@ -507,10 +507,15 @@ bool ObsHost::start_obs(std::string& error) {
 
   const std::string module_config = slashify(data_root_);
 #ifndef _WIN32
-  // The Ubuntu obs-ffmpeg build hardcodes its muxer helper's path (the package patches an absolute
-  // path into the plugin). The shimmed copy points at /tmp, where the engine puts a fresh helper.
-  const std::string helper = std::string(runtime_root_) + "/obs-ffmpeg-mux";
-  if (CopyFileA(helper.c_str(), "/tmp/buffrx-obs-ffmpeg-mux", FALSE)) chmod("/tmp/buffrx-obs-ffmpeg-mux", 0755);
+  // The Ubuntu obs-ffmpeg build has the muxer helper's path patched in (see
+  // tools/prepare-linux-runtime.sh). It points at $BUFFRX_MUXER, which the engine fills with a helper
+  // staged in a private per-user folder: the AppImage mount is not executable, and a fixed /tmp name
+  // would let another local user place the program the engine runs.
+  std::string muxer_problem;
+  if (!stage_obs_muxer(std::string(runtime_root_) + "/obs-ffmpeg-mux", muxer_problem)) {
+    error = "the OBS muxer helper could not be staged: " + muxer_problem;
+    return false;
+  }
 #endif
   if (!obs_startup("en-US", module_config.c_str(), nullptr)) {
     error = "libobs failed to start";

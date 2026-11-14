@@ -196,14 +196,18 @@ const customScheme = (name: string, path: string) =>
   /Windows|Android/i.test(navigator.userAgent) ? `http://${name}.localhost/${path}` : `${name}://localhost/${path}`
 
 // The Linux editor serves media from a loopback HTTP server (see src-tauri/src/media.rs): its
-// WebKitGTK build does not play a custom scheme reliably, and every WebView agrees on HTTP.
-const mediaPort = hasWindow ? new URLSearchParams(window.location.search).get('media_port') : null
-const loopbackMedia = mediaPort ? `http://127.0.0.1:${mediaPort}` : ''
+// WebKitGTK build does not play a custom scheme reliably, and every WebView agrees on HTTP. The
+// server needs the per-run token the page was opened with; without both the custom scheme is used.
+const mediaQuery = hasWindow ? new URLSearchParams(window.location.search) : null
+const mediaPort = mediaQuery?.get('media_port')
+const mediaToken = mediaQuery?.get('media_token')
+const loopbackMedia = mediaPort && mediaToken ? `http://127.0.0.1:${mediaPort}` : ''
+const mediaTokenQuery = mediaToken ? `?media_token=${encodeURIComponent(mediaToken)}` : ''
 
 export function mediaUrl(path: string): string {
   if (!path) return ''
   if (transport === 'tauri') {
-    if (loopbackMedia) return `${loopbackMedia}/media/${encodeURIComponent(path)}`
+    if (loopbackMedia) return `${loopbackMedia}/media/${encodeURIComponent(path)}${mediaTokenQuery}`
     return customScheme('media', encodeURIComponent(path))
   }
   if (transport === 'webview') return webviewMediaUrl(path)
@@ -215,7 +219,7 @@ export function mediaUrl(path: string): string {
 export function thumbnailUrl(name: string): string {
   if (!name) return ''
   if (transport === 'tauri') {
-    if (loopbackMedia) return `${loopbackMedia}/thumbnails/${encodeURIComponent(name)}`
+    if (loopbackMedia) return `${loopbackMedia}/thumbnails/${encodeURIComponent(name)}${mediaTokenQuery}`
     return customScheme('thumbnails', encodeURIComponent(name))
   }
   if (transport === 'dev') return `/thumbnails/${encodeURIComponent(name)}`

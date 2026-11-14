@@ -34,22 +34,74 @@ fn native_buf(path: &Path) -> PathBuf {
 
 // ---------------------------------------------------------------- local HTTP media (Linux)
 
+#[cfg(unix)]
 use std::net::TcpListener;
+#[cfg(unix)]
 use std::sync::atomic::{AtomicU16, Ordering};
+#[cfg(unix)]
+use std::sync::OnceLock;
 
+#[cfg(unix)]
 static MEDIA_PORT: AtomicU16 = AtomicU16::new(0);
+#[cfg(unix)]
+static MEDIA_TOKEN: OnceLock<String> = OnceLock::new();
 
-pub fn media_port() -> u16 { MEDIA_PORT.load(Ordering::Relaxed) }
+#[cfg(unix)]
+fn media_port() -> u16 { MEDIA_PORT.load(Ordering::Relaxed) }
+
+/// The page is handed the loopback port and a per-run secret. Without the secret any local program,
+/// and any page loaded in the editor, could read every clip and screenshot the allow-list reaches.
+pub fn page_query() -> String {
+    #[cfg(unix)]
+    {
+        let port = media_port();
+        if port == 0 { return String::new(); }
+        return format!("?media_port={port}&media_token={}", MEDIA_TOKEN.get().map(String::as_str).unwrap_or(""));
+    }
+    #[cfg(not(unix))]
+    { String::new() }
+}
+
+/// A fresh 256-bit secret for one editor run. `/dev/urandom` is the source; the fallback still differs
+/// per process and run, which is enough for a listener that only lives as long as the window.
+#[cfg(unix)]
+fn new_media_token() -> String {
+    let mut bytes = [0u8; 32];
+    let read = std::fs::File::open("/dev/urandom").and_then(|mut file| file.read_exact(&mut bytes));
+    if read.is_err() {
+        use std::hash::{BuildHasher, Hasher};
+        for chunk in bytes.chunks_mut(8) {
+            let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+            hasher.write_u32(std::process::id());
+            hasher.write_u128(SystemTime::now().duration_since(UNIX_EPOCH).map(|age| age.as_nanos()).unwrap_or(0));
+            chunk.copy_from_slice(&hasher.finish().to_le_bytes()[..chunk.len()]);
+        }
+    }
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// True when the request carries this run's secret. The comparison visits every byte so a caller
+/// cannot learn the token a character at a time from how long the answer takes.
+#[cfg(unix)]
+fn authorised(query: &str) -> bool {
+    let Some(expected) = MEDIA_TOKEN.get() else { return false };
+    let Some(given) = query.split('&').find_map(|pair| pair.strip_prefix("media_token=")) else { return false };
+    expected.len() == given.len() &&
+        expected.bytes().zip(given.bytes()).fold(0u8, |mismatch, (left, right)| mismatch | (left ^ right)) == 0
+}
 
 /// The editor's WebKitGTK build plays media from a custom scheme unreliably; a loopback HTTP server
 /// with byte ranges is the same transport the browser and every WebView agree on. Bound to 127.0.0.1
-/// only, and every path passes the same allow-list the custom scheme uses.
+/// only, every request needs the page's token, and every path passes the same allow-list the custom
+/// scheme uses. It runs only on the Linux host; Windows keeps the custom scheme.
+#[cfg(unix)]
 pub fn start_http_server(data_root: PathBuf) -> u16 {
     if media_port() != 0 {
         return media_port();
     }
     let Ok(listener) = TcpListener::bind(("127.0.0.1", 0)) else { return 0 };
     let Ok(address) = listener.local_addr() else { return 0 };
+    let _ = MEDIA_TOKEN.set(new_media_token());
     MEDIA_PORT.store(address.port(), Ordering::Relaxed);
     std::thread::spawn(move || {
         for connection in listener.incoming() {
@@ -74,6 +126,12 @@ pub fn start_http_server(data_root: PathBuf) -> u16 {
                 let mut parts = request.split_whitespace();
                 let _method = parts.next();
                 let target = parts.next().unwrap_or("/");
+                let (target, query) = target.split_once('?').unwrap_or((target, ""));
+                if !authorised(query) {
+                    use std::io::Write;
+                    let _ = stream.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                    return;
+                }
                 let (status, headers, body) = http_response(&root, target, range);
                 let reason = match status { 200 => "OK", 206 => "Partial Content", 403 => "Forbidden", 404 => "Not Found", _ => "Error" };
                 let mut response = format!("HTTP/1.1 {status} {reason}\r\n");
@@ -89,6 +147,9 @@ pub fn start_http_server(data_root: PathBuf) -> u16 {
     });
     media_port()
 }
+
+#[cfg(not(unix))]
+pub fn start_http_server(_data_root: PathBuf) -> u16 { 0 }
 
 /// `path` is `<encoded absolute path>` or begins with `/media/`; `/thumbnails/<name>` reads the cache.
 fn http_response(data_root: &Path, target: &str, range: Option<(u64, Option<u64>)>) -> (u16, Vec<(String, String)>, Vec<u8>) {
@@ -369,9 +430,7 @@ pub fn serve(data_root: &Path, request: &tauri::http::Request<Vec<u8>>) -> tauri
         .body(Vec::new()).unwrap();
     let raw = request.uri().path().trim_start_matches('/');
     let path = native(&percent_decode(raw));
-    eprintln!("buffrx-media: request {} -> {}", raw, path.display());
     if !is_allowed_to_read(data_root, &path) {
-        eprintln!("buffrx-media: refused {}", path.display());
         return respond(403);
     }
     // A Timeline chunk is read while its writer still holds it: Live tails it and trims to whole fragments itself

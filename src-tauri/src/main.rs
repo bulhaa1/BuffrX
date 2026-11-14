@@ -520,7 +520,7 @@ fn main() {
     }
 
     let data = data_root();
-    let media_port = media::start_http_server(data.clone());
+    media::start_http_server(data.clone());
     let embedded = launch.parent != 0;
     media::cleanup_timeline_cache(&data);
     let shared = Arc::new(Shared { data_root: data.clone(), launch: launch.clone(), exports: Arc::new(media::Exports::default()) });
@@ -606,7 +606,7 @@ fn main() {
                 .flatten()
                 .map(|monitor| editor_sizes((monitor.work_area().size.width, monitor.work_area().size.height), monitor.scale_factor()))
                 .unwrap_or((EDITOR_SIZE, EDITOR_MIN, EDITOR_MAX));
-            let mut editor = WebviewWindowBuilder::new(app, "editor", WebviewUrl::App(format!("index.html?media_port={media_port}").into()))
+            let mut editor = WebviewWindowBuilder::new(app, "editor", WebviewUrl::App(format!("index.html{}", media::page_query()).into()))
                 .title(if launch.view == "preview" { "BuffrX Preview" } else { "BuffrX Editor" })
                 .inner_size(start.0, start.1)
                 .maximizable(false)
@@ -692,7 +692,7 @@ fn run_timeline(launch: Launch) {
         return;
     }
     let data = data_root();
-    let media_port = media::start_http_server(data.clone());
+    media::start_http_server(data.clone());
     let media_root = data.clone();
     let thumbnail_root = data.clone();
     let shared = Arc::new(Shared { data_root: data.clone(), launch: launch.clone(), exports: Arc::new(media::Exports::default()) });
@@ -714,7 +714,7 @@ fn run_timeline(launch: Launch) {
             let pipe = Arc::new(pipe::PipeClient::new(handle, data.clone(), engine_path(), false));
             app.manage(pipe.clone());
             pipe.start();
-            let mut preview = WebviewWindowBuilder::new(app, "timeline", WebviewUrl::App(format!("timeline.html?media_port={media_port}").into()))
+            let mut preview = WebviewWindowBuilder::new(app, "timeline", WebviewUrl::App(format!("timeline.html{}", media::page_query()).into()))
                 .title("BuffrX Timeline")
                 .inner_size(1440.0, 900.0)
                 // The slide preview: no frame, no shadow (an undecorated window keeps 8 white pixels around the page),

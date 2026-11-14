@@ -1,6 +1,6 @@
-// Linux platform services the engine owns: global hotkeys, notifications, single-instance control,
-// folder actions, the editor launcher and the clipboard. The tray is deliberately absent for now:
-// the panel is opened from the launcher, the toggle hotkey, or `--show`.
+// Linux platform services the engine owns: global hotkeys, notifications, a GTK status-icon tray,
+// single-instance control, folder actions, the editor launcher and the clipboard. Some desktops do not
+// show a status icon; the panel also opens from the launcher, the toggle hotkey, or `--show`.
 #pragma once
 
 #include "linux/compat/windows.h"
@@ -136,5 +136,10 @@ std::vector<std::string> window_process_paths();
 
 std::string executable_path();
 std::string executable_directory();
+
+// The OBS ffmpeg muxer helper, staged out of the package and the shared /tmp namespace. The engine
+// calls `stage_obs_muxer` before libobs starts; `obs_muxer_path` is the copy it made, or "".
+bool stage_obs_muxer(const std::string& source, std::string& problem);
+std::string obs_muxer_path();
 
 }  // namespace bx

@@ -26,6 +26,7 @@
 #include "library.h"
 #include "media.h"
 #include "packet_hash.h"
+#include "platform.h"
 #include "ring_disk.h"
 #include "ring_publish.h"
 #include "ring_save.h"
@@ -376,10 +377,13 @@ os_process_pipe_t* start_muxer(Ring& ring, const std::string& path) {
   MuxArgsType* args = os_process_args_create(exe ? exe : "obs-ffmpeg-mux.exe");
   if (exe) bfree(exe);
 #else
-  // The same path the Ubuntu obs-ffmpeg plugin was pointed at by the runtime staging script. Keeping
-  // the helper out of $PATH means a stray program of that name is never executed.
+  // The same helper the runtime staging script points obs-ffmpeg at: it runs from a private per-user
+  // folder, never from the read-only AppImage mount or a fixed name in /tmp. The engine staged it
+  // before libobs started, so an empty path means the engine cannot record at all.
+  const std::string muxer = obs_muxer_path();
+  if (muxer.empty()) return nullptr;
   MuxArgs built;
-  built.add("/tmp/buffrx-obs-ffmpeg-mux");
+  built.add(muxer);
   MuxArgsType* args = &built;
 #endif
   mux_add_arg(args, path.c_str());
