@@ -276,6 +276,7 @@ endif()
 enable_testing()
 foreach(check IN ITEMS buffrx-tests buffrx-display-tests buffrx-ui-present-tests buffrx-canvas-tests)
   add_test(NAME ${check} COMMAND ${check})
+  set_tests_properties(${check} PROPERTIES TIMEOUT 180)
   # Tests-only binaries can run without copying toolchain DLLs into a staged runtime.
   if(BUFFRX_TESTS_ONLY)
     target_link_options(${check} PRIVATE -static)

@@ -1,4 +1,4 @@
-﻿# Builds BuffrX with the pinned toolchain. One entry point for humans and CI:
+# Builds BuffrX with the pinned toolchain. One entry point for humans and CI:
 #   powershell -File tools/build.ps1            # configure + build everything staged
 #   powershell -File tools/build.ps1 -Target buffrx-engine
 #
