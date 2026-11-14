@@ -37,7 +37,7 @@ try {
         }
       }
     }
-    Invoke-Check 'whitespace' { git -c core.safecrlf=false diff --check }
+    Invoke-Check 'whitespace' { & (Join-Path $PSScriptRoot 'check-whitespace.ps1') }
     Write-Host 'Public document links passed.'
   }
 

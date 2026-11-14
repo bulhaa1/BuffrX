@@ -55,9 +55,12 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          fetch-depth: 0
           persist-credentials: false
       - shell: pwsh
-        run: ./tools/verify.ps1 -Area Docs
+        run: |
+          ./tools/test-whitespace.ps1
+          ./tools/verify.ps1 -Area Docs
 
   editor:
     needs: changes
