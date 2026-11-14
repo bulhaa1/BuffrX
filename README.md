@@ -44,7 +44,8 @@ No account. No ads. No watermark. No telemetry.
 [Install](#install) ·
 [FAQ](#faq) ·
 [Roadmap](#roadmap) ·
-[Build](#build-from-source)
+[Build](#build-from-source) ·
+[Contributing](#contributing)
 
 ---
 
@@ -158,7 +159,7 @@ for connections except the sharing helper, and only while a BuffrX link you made
 ## Install
 
 1. Open the [latest release](https://github.com/bulhaa1/BuffrX/releases/latest) and download
-   **`BuffrX-Setup.exe`**. A portable `BuffrX-0.5.0.zip` is there too.
+   **`BuffrX-Setup.exe`**. A portable `BuffrX-0.6.0.zip` is there too.
 2. Run it.
 3. Press `Alt+1` in a game.
 
@@ -243,32 +244,10 @@ in-process (capture, audio, encoders, the replay ring, recording, the Timeline),
 sharing and the panel, drawn with Dear ImGui. The editor, clip preview and Timeline preview run in a
 separate WebView2 process that exists only while one is open.
 
-The toolchain is downloaded, not installed: pinned, SHA-256 verified, staged into `work/`. No Visual
-Studio, no system Rust, no system CMake. Run in order:
-
-```powershell
-powershell -File tools/bootstrap-toolchain.ps1   # LLVM-MinGW, CMake, Ninja, Windows SDK, WebView2, Dear ImGui, fonts
-powershell -File tools/prepare-runtime.ps1       # pinned OBS release -> runtime/
-powershell -File tools/prepare-headers.ps1       # libobs public headers
-powershell -File tools/build.ps1                 # configure, build, stage into runtime/bin/64bit
-```
-
-The editor's page, then a portable package:
-
-```powershell
-cd ui; npm install; npm run build; cd ..
-powershell -File tools/package.ps1
-```
-
-Run and check it:
-
-```powershell
-$env:BUFFRX_DATA_ROOT = "$env:TEMP\buffrx-test"                      # keep test state out of your profile
-runtime\bin\64bit\buffrx-engine.exe --package-smoke-test            # libobs starts, modules load, clean exit
-runtime\bin\64bit\buffrx-engine.exe --capture-smoke-test            # capture ~6 s, save a clip, verify it
-runtime\bin\64bit\buffrx-engine.exe --show                          # run for real with the panel open
-build\buffrx-tests.exe                                              # unit checks
-```
+Follow the [development guide](DEVELOPMENT.md) for setup, checks, and running the app.
+Choose documentation, editor, or native logic first; you only need the full Windows
+build for changes that exercise the app. The minimal native test setup needs no OBS
+download or GPU. Build tools live in `work/`; no Visual Studio is required.
 
 ```
 src/engine/       libobs host: config, capture, encoders, replay, Timeline, library, protocol, tray
@@ -282,6 +261,24 @@ tools/            bootstrap, build, packaging and probe scripts
 </details>
 
 ---
+
+## Contributing
+
+BuffrX is open source, and I'd love for you to help shape it. Bring your ideas,
+fix something that bugs you, or build a feature you'd like to use.
+
+First-time contributors are welcome. Small fixes, docs, testing, and feedback all
+help. Feel free to open a draft PR and work things out as you go.
+
+Have an idea that could make BuffrX better? [Share it in Ideas](https://github.com/bulhaa1/BuffrX/discussions/categories/ideas).
+I'd love to hear what you'd like to see.
+
+- Read [CONTRIBUTING.md](CONTRIBUTING.md) to get started.
+- Ask a question or find an answer in [Q&A](https://github.com/bulhaa1/BuffrX/discussions/categories/q-a).
+- Report reproducible bugs in [Issues](https://github.com/bulhaa1/BuffrX/issues).
+- Build and check your change with the [development guide](DEVELOPMENT.md).
+- Help with the native Linux port using the [Linux guide](DEVELOPMENT_LINUX.md).
+- Using an agent? Point it to [CONTRIBUTOR_AGENT.md](CONTRIBUTOR_AGENT.md).
 
 ## License
 

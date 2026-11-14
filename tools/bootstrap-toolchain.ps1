@@ -7,9 +7,11 @@
 # -ShareSpike also fetches the peer-to-peer live-link spike's sources (libdatachannel and what it
 # builds from: libjuice, usrsctp, plog, Mbed TLS). Nothing the product ships needs them.
 
-param([switch]$ShareSpike)
+param([switch]$ShareSpike, [switch]$Minimal)
 
 $ErrorActionPreference = 'Stop'
+if ($Minimal -and $ShareSpike) { throw 'Choose -Minimal or -ShareSpike, not both.' }
+if ($env:OS -ne 'Windows_NT') { throw 'The native toolchain requires Windows. Editor checks can run on other systems.' }
 Add-Type -AssemblyName System.IO.Compression.FileSystem | Out-Null
 
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
@@ -112,6 +114,20 @@ function Get-SingleDirectory {
 $llvm  = Get-PinnedPackage 'llvm'  'https://github.com/mstorsjo/llvm-mingw/releases/download/20260922/llvm-mingw-20260922-ucrt-x86_64.zip' 'e3ad77d117a4bea19a7a3b333341824d79a5a371004a10e25b8504e7b3047666'
 $cmake = Get-PinnedPackage 'cmake' 'https://github.com/Kitware/CMake/releases/download/v4.4.3/cmake-4.4.3-windows-x86_64.zip' '4d52ebab7193a698651639ed80d8d04fd903358843572cf44c7fd234cb7c26ab'
 $ninja = Get-PinnedPackage 'ninja' 'https://github.com/ninja-build/ninja/releases/download/v1.13.2/ninja-win.zip' '07fc8261b42b20e71d1720b39068c2e14ffcee6396b76fb7a795fb460b78dc65'
+# Keep the tests-only setup independent of OBS, Rust, SDK, WebView2 and interface assets.
+# A separate manifest lets a minimal run preserve an existing full setup.
+$minimalConfig = [ordered]@{
+  schema = 1
+  llvm_root = (Get-SingleDirectory $llvm)
+  clangxx = (Join-Path (Get-SingleDirectory $llvm) 'bin\x86_64-w64-mingw32-clang++.exe')
+  cmake = (Join-Path (Get-SingleDirectory $cmake) 'bin\cmake.exe')
+  ninja = (Join-Path $ninja 'ninja.exe')
+}
+$minimalConfig | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $root 'work\toolchain-minimal.json')
+if ($Minimal) {
+  Write-Host 'Minimal toolchain ready. Run: powershell -File tools/verify.ps1 -Area Native'
+  return
+}
 $sdk   = Get-PinnedPackage 'winsdk' 'https://api.nuget.org/v3-flatcontainer/microsoft.windows.sdk.cpp/10.0.28000.2705/microsoft.windows.sdk.cpp.10.0.28000.2705.nupkg' 'a74ca8f9af98bd61925d9e2932ad98f746306123167b8f0bba99cd9ea9f03807'
 $wv2   = Get-PinnedPackage 'webview2' 'https://api.nuget.org/v3-flatcontainer/microsoft.web.webview2/1.0.4258.31/microsoft.web.webview2.1.0.4258.31.nupkg' '56f7f4b8bf9aee4b8efefbbdd4f67d5f74ebd1b100ed0806da71bf76af481aa9'
 

@@ -1,0 +1,32 @@
+name: Bug report
+description: Something in BuffrX is not working.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Thanks for helping. Check existing reports first; share only what you are comfortable making public.
+  - type: input
+    id: version
+    attributes:
+      label: BuffrX version
+      placeholder: Version from Settings, or the source commit
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: What happened?
+      description: Steps to reproduce, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: setup
+    attributes:
+      label: Your setup (if relevant)
+      description: Windows version, GPU/driver, game, capture mode, monitors or audio devices. Share what you know.
+  - type: textarea
+    id: logs
+    attributes:
+      label: Log excerpt or screenshot (optional)
+      description: Logs are under the BuffrX data folder in %LOCALAPPDATA%\BuffrX\logs for a normal install. Include only the lines around the problem; remove personal paths, webhook URLs and tokens. Logs and clips are not required.
+      render: text
