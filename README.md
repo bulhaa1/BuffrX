@@ -24,6 +24,13 @@ No account. No ads. No watermark. No telemetry.
 ![License](https://img.shields.io/badge/license-GPL--2.0--or--later-blue?style=flat-square)
 ![Release](https://img.shields.io/github/v/release/bulhaa1/BuffrX?style=flat-square&color=ff6a1a)
 
+<a href="https://alternativeto.net/software/buffrx/about/?utm_source=badge&utm_medium=referral" target="_blank">
+  <img src="https://alternativeto.net/static/badges/badge-wide-dark.svg"
+       alt="BuffrX | AlternativeTo"
+       width="284" height="54"
+       style="width: 284px; height: 54px;" />
+</a>
+
 &nbsp;
 
 | Watch the trailer |
