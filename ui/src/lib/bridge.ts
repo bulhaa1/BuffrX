@@ -98,14 +98,14 @@ async function start() {
     await listen<string>('engine_event', (event) => engineFrame(event.payload))
     await listen<string>('engine_status', (event) => dispatch(engineListeners, 'connection', event.payload))
     for (const name of ['media-progress', 'media-done', 'editor-files', 'preview-files']) {
-      await listen(name, (event) => dispatch(shellListeners, name, event.payload))
+      await listen(name, (event) => shellEvent(name, event.payload))
     }
   } else if (transport === 'dev') {
     const source = new EventSource('/__engine/events')
     source.onmessage = (message) => engineFrame(message.data)
     source.addEventListener('shell', (message) => {
       const { name, data } = JSON.parse((message as MessageEvent).data) as { name: string; data: unknown }
-      dispatch(shellListeners, name, data)
+      shellEvent(name, data)
     })
     source.onerror = () => dispatch(engineListeners, 'connection', 'disconnected')
     source.onopen = () => dispatch(engineListeners, 'connection', 'connected')
@@ -163,10 +163,36 @@ export async function shell<T = unknown>(cmd: string, args: Json = {}): Promise<
   return mockShell(cmd, args) as Promise<T>
 }
 
+// Files the engine hands this window before the view that takes them listens: a preview says hello before its own code
+// has loaded, and an Edit pressed in that moment was dropped, leaving the preview where it was. The last one is held for
+// the first listener. Progress events are not held: a late one is only stale.
+const HELD_SHELL = new Set(['editor-files', 'preview-files'])
+const unheard = new Map<string, unknown>()
+
+/** One shell event to its listeners; a files event nobody listens to yet is kept for the first one. */
+export function shellEvent(name: string, data: unknown) {
+  if (HELD_SHELL.has(name) && !shellListeners.get(name)?.size) {
+    unheard.set(name, data)
+    return
+  }
+  dispatch(shellListeners, name, data)
+}
+
 /** Shell events: media-progress, media-done, editor-files, preview-files. */
 export function onShell(name: string, handler: Handler): () => void {
   if (!shellListeners.has(name)) shellListeners.set(name, new Set())
   shellListeners.get(name)!.add(handler)
+  if (unheard.has(name)) {
+    const held = unheard.get(name)
+    unheard.delete(name)
+    // A view that subscribes, leaves and subscribes again in one commit (React's development double mount) still gets them.
+    queueMicrotask(() => {
+      const now = shellListeners.get(name)
+      if (now?.has(handler)) handler(held)
+      else if (now?.size) dispatch(shellListeners, name, held)
+      else if (!unheard.has(name)) unheard.set(name, held)
+    })
+  }
   return () => shellListeners.get(name)?.delete(handler)
 }
 

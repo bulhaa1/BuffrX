@@ -193,7 +193,7 @@ textarea {
 .editor-shell {
   display: grid;
   gap: 8px;
-  grid-template-columns: minmax(0, 1fr) clamp(280px, 22vw, 340px);
+  grid-template-columns: minmax(0, 1fr) clamp(288px, 20vw, 320px);
   grid-template-rows: minmax(0, 1fr) auto;
   grid-template-areas:
     'stage inspector'
@@ -435,6 +435,55 @@ textarea {
 .bx-slider-instant .bx-slider-thumb,
 .bx-slider-instant .bx-slider-fill {
   transition: none;
+}
+/* An upright mixer fader: a native range laid on its side. The browser keeps its arrows, Home/End and
+ * Page keys; only the track and the thumb are drawn here, in the theme's accent. */
+.fader {
+  appearance: none;
+  background: transparent;
+  cursor: default;
+}
+.fader::-webkit-slider-runnable-track {
+  height: 4px;
+  background: var(--bx-raised);
+  border: 0;
+}
+.fader::-webkit-slider-thumb {
+  appearance: none;
+  width: 8px;
+  height: 18px;
+  margin-top: -7px;
+  background: var(--bx-accent);
+  border: 1px solid var(--bx-canvas);
+}
+.fader:hover::-webkit-slider-thumb {
+  background: var(--bx-ink);
+}
+.fader:focus-visible {
+  outline: 2px solid var(--bx-accent);
+  outline-offset: 4px;
+}
+/* A level laid flat across its row: the track fills to the value in the accent (--fill, 0-100%), the thumb a
+ * short upright bar. 100% sits at the middle of 0-200%. */
+.fader-h::-webkit-slider-runnable-track {
+  height: 4px;
+  background: linear-gradient(90deg, var(--bx-accent) var(--fill, 50%), var(--bx-raised) var(--fill, 50%));
+}
+.fader-h::-webkit-slider-thumb {
+  width: 6px;
+  height: 16px;
+  margin-top: -6px;
+  background: var(--bx-ink);
+  border: 1px solid var(--bx-canvas);
+}
+.fader-h:hover::-webkit-slider-thumb {
+  background: var(--bx-accent);
+}
+.fader-h:focus-visible {
+  outline-offset: 2px;
+}
+.fader:disabled {
+  opacity: 0.45;
 }
 .menu-item {
   display: flex;

@@ -2,16 +2,14 @@
 // export choices. Nothing here knows about a clip or a sequence, so both the picker's editor and the
 // image editor use the same ones.
 
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { mediaUrl, shell } from '../lib/bridge'
-import { runEngine } from '../lib/media'
+import { audioLayout, elementGain, extraGain, extraTracks, monitorMode, whenPlayable, type AudioTrack } from '../lib/audio'
+import { cancelEngine, runEngine } from '../lib/media'
 import { dragCrop, type Crop } from '../lib/sequence'
 
-export interface AudioTrack {
-  index: number
-  channels: number
-  title: string
-}
+/** One audio track of a file, as the engine reports it (src/engine/media_export.cpp). */
+export type { AudioTrack }
 
 /** What `--media-info` reports about a file (src/engine/media_export.cpp). */
 export interface MediaDetails {
@@ -24,6 +22,8 @@ export interface MediaDetails {
   videoCodec: string
   videoKbps: number
   bytes: number
+  /** Last write time, seconds since 1970: a replaced clip keeps its path and may keep its size. */
+  modified: number
   audio: AudioTrack[]
 }
 
@@ -48,7 +48,8 @@ export async function loadDetails(path: string): Promise<MediaDetails> {
     video_codec: string
     video_kbps: number
     bytes: number
-    audio: AudioTrack[]
+    modified?: number
+    audio: { index: number; channels: number; title?: string; role?: string; sources?: string[] }[]
   }
   return {
     ok: raw.ok,
@@ -60,7 +61,16 @@ export async function loadDetails(path: string): Promise<MediaDetails> {
     videoCodec: raw.video_codec ?? '',
     videoKbps: raw.video_kbps ?? 0,
     bytes: raw.bytes ?? 0,
-    audio: raw.audio ?? [],
+    modified: raw.modified ?? 0,
+    // The labels and roles come from the file's own sidecar, read by the engine; an imported file's
+    // tracks arrive as 'track' with no sources (lib/audio.ts).
+    audio: (raw.audio ?? []).map((track) => ({
+      index: track.index,
+      channels: track.channels,
+      title: track.title ?? '',
+      role: track.role ?? 'track',
+      sources: track.sources ?? [],
+    })),
   }
 }
 
@@ -264,10 +274,11 @@ export const SPEEDS = [0.5, 0.75, 1, 1.25, 1.5, 2]
 
 // ---------------------------------------------------------------- the preview's sound
 
-/** A short, stable name for a clip's cached track files: FNV-1a over its path and size. */
-function trackCacheKey(path: string, size: number): string {
+/** A short, stable name for a clip's cached track files: FNV-1a over its path, size and write time. The
+ *  write time is part of it because a replaced clip keeps its path and may keep its size. */
+function trackCacheKey(path: string, size: number, modified: number): string {
   let hash = 0x811c9dc5
-  for (const c of `${path.toLowerCase()}|${size}`) {
+  for (const c of `${path.toLowerCase()}|${size}|${modified}`) {
     hash ^= c.charCodeAt(0)
     hash = Math.imul(hash, 0x01000193) >>> 0
   }
@@ -288,85 +299,224 @@ function mixSource(element: HTMLMediaElement): MediaElementAudioSourceNode {
   return source
 }
 
+// Every track copy this window has asked for, so a run that is left behind can end its process by name.
+let readSequence = 0
+
 /**
  * The preview's sound as the save will mix it. A browser plays only a file's first audio track, and an
- * element's own volume stops at 100%. So the video's sound (track 1) goes through a gain, and every
- * further track is copied out once (`--media-audio`, cached in the data root) and played in step with
- * the picture through a gain of its own. 'failed' leaves the first track playing as before.
+ * element's own volume stops at 100%, so the tracks the editor must represent are played through a gain
+ * each: the element's own track, and every further track copied out once (`--media-audio`, cached in the
+ * data root).
+ *
+ * Which tracks those are comes from the file's own layout (`lib/audio.ts`), never from the current
+ * capture settings: a BuffrX recording whose track 1 is the mix of the tracks after it is monitored
+ * through those sources alone, so nothing is heard twice; when the mix holds sound no track carries, the
+ * mix is what plays, so nothing is dropped. 'failed' falls back to the mix and says so.
+ *
+ * The work is per clip and cancellable: leaving a clip, pausing the editor or closing the window kills
+ * a copy that is still being made, and no process is left running behind a window nobody is looking at.
  */
-export function useTrackMix(video: React.RefObject<HTMLVideoElement | null>, path: string, details: MediaDetails, volumes: number[], off: boolean): 'loading' | 'ready' | 'failed' {
+export interface TrackMix {
+  state: 'loading' | 'ready' | 'failed'
+  /** Ask again after a failed copy: the reads are not cached, so a busy engine is tried afresh. */
+  retry: () => void
+}
+
+export function useTrackMix(video: React.RefObject<HTMLVideoElement | null>, path: string, details: MediaDetails, gains: number[], off: boolean): TrackMix {
   const [state, setState] = useState<'loading' | 'ready' | 'failed'>('loading')
-  const gains = useRef<GainNode[]>([])
+  const [attempt, setAttempt] = useState(0)
+  const retry = useCallback(() => setAttempt((count) => count + 1), [])
+  const levels = useRef<Map<number, GainNode>>(new Map())
+  const gainsRef = useRef(gains)
+  gainsRef.current = gains
+  const mode = monitorMode(audioLayout(details.audio), details.audio.length)
+  const modeRef = useRef(mode)
+  modeRef.current = mode
+  const stateRef = useRef(state)
+  stateRef.current = state
+
+  // The levels are written from one place, so a gain made after a mute was set starts muted: the async
+  // copies used to be added at full volume and only picked up the level on the next unrelated change.
+  const applyLevels = useCallback(() => {
+    for (const [index, gain] of levels.current) {
+      gain.gain.value = index === 0
+        ? elementGain(modeRef.current, gainsRef.current, stateRef.current)
+        : extraGain(gainsRef.current, index, stateRef.current)
+    }
+  }, [])
+
+  // A replaced clip keeps its path, so its size and write time are what say its cached copies are stale.
+  const signature = `${path}|${details.bytes}|${details.modified}|${details.audio.length}`
+
   useEffect(() => {
     const element = video.current
-    if (!element || off || !details.audio.length) return
+    levels.current = new Map()
+    if (!element || !details.audio.length) {
+      setState('ready')
+      return
+    }
+    if (off) return
     let gone = false
+    const context = mixContext ?? (mixContext = new AudioContext())
     const source = mixSource(element)
-    const context = mixContext!
+    const own = context.createGain()
+    source.connect(own).connect(context.destination)
+    levels.current.set(0, own)
+    // A graph made while the picture is already playing never sees a play event: start it here.
+    void context.resume().catch(() => undefined)
+    // A retry after a failed copy starts from loading again, so an aggregate mix is not heard beside
+    // the sources that are being made ready.
+    stateRef.current = 'loading'
+    setState('loading')
+    applyLevels()
     const extras: HTMLAudioElement[] = []
-    const first = context.createGain()
-    source.connect(first).connect(context.destination)
-    gains.current = [first]
+    // Every copy this effect made, ready or still loading: leaving the clip owns all of them, so a wait
+    // that is still running leaves no src, listener or timer behind.
+    const owned: HTMLAudioElement[] = []
+    // Cancels a readiness wait that is still running when the clip is left or replaced.
+    const readiness = new AbortController()
+    const ids: string[] = []
+    let failedOnce = false
+    // The drift check runs only while the picture plays: a paused clip holds no repeating timer.
+    let ticker = 0
+    const stopTicker = () => {
+      if (ticker) window.clearInterval(ticker)
+      ticker = 0
+    }
+    // Only copies that are ready need following: an element or mix-only file has none, and used to make
+    // a 250 ms interval on every play that did nothing at all.
+    const startTicker = () => {
+      if (gone || failedOnce || !extras.length) return
+      if (!ticker) ticker = window.setInterval(() => follow(), 250)
+    }
+    // A copy that cannot play must never be counted as ready: the mix falls back and says so, with Retry.
+    const fail = () => {
+      if (gone || failedOnce) return
+      failedOnce = true
+      stopTicker()
+      for (const audio of extras) audio.pause()
+      stateRef.current = 'failed'
+      setState('failed')
+    }
+    // A copy that fails after it was ready (a decode error mid-play) is still owned by this graph.
+    const onCopyError = () => fail()
     // Follow the picture: play, pause, seek and speed, and pull a track back when it drifts.
     const follow = () => {
+      if (gone || failedOnce) return
       for (const audio of extras) {
         if (Math.abs(audio.currentTime - element.currentTime) > 0.06) audio.currentTime = element.currentTime
         audio.playbackRate = element.playbackRate
         if (element.paused && !audio.paused) audio.pause()
-        else if (!element.paused && audio.paused) void audio.play().catch(() => undefined)
+        else if (!element.paused && audio.paused) {
+          // A play the browser refuses (an autoplay policy, a stalled copy) is a real failure of the
+          // preview, not a silent success: fall back to the mix rather than play one track of several.
+          void audio.play().catch(() => {
+            if (!element.paused && stateRef.current === 'ready') fail()
+          })
+        }
       }
     }
     const resume = () => void context.resume().catch(() => undefined)
-    const events = ['play', 'pause', 'seeked', 'ratechange'] as const
-    for (const name of events) element.addEventListener(name, follow)
-    element.addEventListener('play', resume)
-    const timer = window.setInterval(() => !element.paused && follow(), 250)
+    const onPlay = () => {
+      if (gone || failedOnce) return
+      resume()
+      startTicker()
+      follow()
+    }
+    const onPause = () => {
+      stopTicker()
+      follow()
+    }
+    element.addEventListener('play', onPlay)
+    element.addEventListener('pause', onPause)
+    element.addEventListener('seeked', follow)
+    element.addEventListener('ratechange', follow)
+    // A graph made while the picture is already playing never sees a play event: start it here.
+    if (!element.paused) startTicker()
     void (async () => {
-      if (details.audio.length < 2) return setState('ready')
+      const wanted = extraTracks(mode, details.audio.length)
+      if (!wanted.length) {
+        stopTicker()
+        if (!gone) setState('ready')
+        return
+      }
       try {
         const root = await shell<string>('get_data_root')
-        const key = trackCacheKey(path, details.bytes)
-        for (let track = 1; track < details.audio.length; track++) {
+        if (gone) return
+        const key = trackCacheKey(path, details.bytes, details.modified)
+        for (const track of wanted) {
           const file = `${root}\\cache\\audio\\${key}-${track}.m4a`
-          const answer = (await runEngine(['--media-audio', path, String(track), file])) as { ok: boolean; error?: string }
-          if (!answer.ok) throw new Error(answer.error ?? 'the track could not be read')
+          const id = `track-${++readSequence}`
+          ids.push(id)
+          const answer = (await runEngine(['--media-audio', path, String(track), file], id)) as { ok: boolean; error?: string }
           if (gone) return
+          if (!answer.ok) throw new Error(answer.error ?? 'the track could not be read')
           const audio = new Audio()
           audio.crossOrigin = 'anonymous'
           audio.preload = 'auto'
+          // The copy is owned from the moment it exists, so a decode failure after it is ready is still
+          // seen (the readiness wait takes its own listeners back) and leaving mid-wait can clean it.
+          audio.addEventListener('error', onCopyError)
+          owned.push(audio)
           audio.src = mediaUrl(file)
+          // Assigning a src is not a playable track: an unsupported codec or a truncated copy reports its
+          // error here, and the wait is bounded so a copy that never arrives cannot read as ready.
+          await whenPlayable(audio, 12000, readiness.signal)
+          if (gone || failedOnce) return
+          // The seek and the speed are written once the copy can take them, never on an empty element.
+          audio.currentTime = element.currentTime
+          audio.playbackRate = element.playbackRate
           const gain = context.createGain()
           mixSource(audio).connect(gain).connect(context.destination)
           extras.push(audio)
-          gains.current.push(gain)
+          levels.current.set(track, gain)
+          applyLevels()
         }
-        if (gone) return
-        follow()
+        if (gone || failedOnce) return
+        // A play promise can reject before React renders the state update. Publish readiness to
+        // the callback first, so that rejection cannot leave a silent copy reported as ready.
+        stateRef.current = 'ready'
         setState('ready')
+        if (!element.paused) startTicker()
+        follow()
       } catch {
-        if (!gone) setState('failed')
+        // A cancelled wait is the view leaving, not a copy that failed.
+        if (gone) return
+        // The mix is playing instead; stop following copies that will never carry sound.
+        fail()
       }
     })()
     return () => {
       gone = true
-      window.clearInterval(timer)
-      for (const name of events) element.removeEventListener(name, follow)
-      element.removeEventListener('play', resume)
-      for (const audio of extras) {
+      // A wait still running ends now, and every copy this effect made lets go of its src and listeners,
+      // ready or not: a clip left mid-read used to keep its element alive for the whole wait.
+      readiness.abort()
+      // A copy still being read is a process of its own: it ends with the view that wanted it.
+      for (const id of ids) cancelEngine(id)
+      stopTicker()
+      element.removeEventListener('play', onPlay)
+      element.removeEventListener('pause', onPause)
+      element.removeEventListener('seeked', follow)
+      element.removeEventListener('ratechange', follow)
+      for (const audio of owned) {
+        audio.removeEventListener('error', onCopyError)
         audio.pause()
         audio.removeAttribute('src')
+        audio.load()
         mixSources.get(audio)?.disconnect()
       }
       source.disconnect()
-      for (const gain of gains.current) gain.disconnect()
-      gains.current = []
+      for (const gain of levels.current.values()) gain.disconnect()
+      levels.current = new Map()
     }
-  }, [video, path, details, off])
-  // Every gain at the track's own volume, up to the 200% the save allows.
+    // The clip and its bytes decide the graph; a level is written by the effect below, so changing one
+    // never restarts a copy.
+  }, [video, signature, off, applyLevels, mode, attempt]) // eslint-disable-line react-hooks/exhaustive-deps -- details are read through refs
+
   useEffect(() => {
-    gains.current.forEach((gain, index) => (gain.gain.value = volumes[index] ?? 1))
-    // `off` turns a sequence's other player down and back up: its gains are rebuilt at 1 when it
-    // becomes active again, so the levels must be written then too.
-  }, [volumes, state, off])
-  return state
+    applyLevels()
+    // `off` turns a sequence's other player down and back up: its gains are rebuilt when it becomes
+    // active again, so the levels must be written then too.
+  }, [gains, state, off, mode, applyLevels])
+  return { state, retry }
 }

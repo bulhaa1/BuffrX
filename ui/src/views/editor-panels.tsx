@@ -6,7 +6,7 @@ import clsx from 'clsx'
 import { useEffect, useRef, useState } from 'react'
 import { Icon } from '../components/icons'
 import { Thumb } from '../components/thumb'
-import { Button, ContextMenu, DialogBox, IconButton, Spinner } from '../components/ui'
+import { Button, ContextMenu, DialogBox, IconButton, Segmented, Spinner } from '../components/ui'
 import { engine, type MediaItem } from '../lib/api'
 import { onEngine } from '../lib/bridge'
 import { simpleTitle, stampOf, stampText } from '../lib/clip_label'
@@ -343,12 +343,17 @@ export function EmptyStage({ hover, onBrowse }: { hover: boolean; onBrowse: () =
   )
 }
 
-/** The row under the picture: play, the clip before and after, where the playhead is, and the clip's figures. */
-export function Transport({ playing, fullscreen, time, total, hasNext, clip, onToggle, onPrev, onNext, onFullscreen }: {
+/** The row under the picture: play, the clip before and after, the preview's clock, and the clip's figures. */
+export function Transport({ playing, fullscreen, time, total, scope, showScope, onScope, hasNext, clip, onToggle, onPrev, onNext, onFullscreen }: {
   playing: boolean
   fullscreen: boolean
+  /** The preview's own clock: the selected part's time and length in a Selection, the sequence's otherwise. */
   time: number
   total: number
+  scope: 'selection' | 'sequence'
+  /** Whether the choice matters: a sequence of more than one clip or part. A lone whole part is the same either way. */
+  showScope: boolean
+  onScope: (scope: 'selection' | 'sequence') => void
   hasNext: boolean
   clip: SequenceClip
   onToggle: () => void
@@ -356,12 +361,27 @@ export function Transport({ playing, fullscreen, time, total, hasNext, clip, onT
   onNext: () => void
   onFullscreen: () => void
 }) {
-  // Three columns on one centre line: where the playhead is, the three playback buttons, and the clip figures.
+  const scopeName = scope === 'selection' ? 'Part' : 'All'
+  // Three columns on one centre line: the preview's clock with its scope, the three playback buttons, and the clip figures.
   return (
-    <div className="grid h-[38px] shrink-0 grid-cols-[1fr_auto_1fr] items-center gap-2 border-t border-line px-2 text-[13px] leading-none">
-      <div className="num flex items-baseline gap-1 whitespace-nowrap">
-        <span className="font-bold text-ink">{duration(time)}</span>
-        <span className="text-muted">/ {duration(total)}</span>
+    <div className="grid min-h-[38px] shrink-0 grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center gap-2 border-t border-line px-2 text-[13px] leading-none">
+      <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 py-1 whitespace-nowrap">
+        <div className="num flex items-baseline gap-1 whitespace-nowrap" role="timer" aria-label={`${scopeName} preview: ${duration(time)} of ${duration(total)}`} data-scope={scope}>
+          <span className="font-bold text-ink">{duration(time)}</span>
+          <span className="text-muted">/ {duration(total)}</span>
+        </div>
+        {showScope && (
+          <span title="Preview the selected part, or everything">
+            <Segmented
+              size="sm"
+              label="Preview scope"
+              className="shrink-0"
+              value={scope}
+              onChange={onScope}
+              options={[{ value: 'selection', label: 'Part' }, { value: 'sequence', label: 'All' }]}
+            />
+          </span>
+        )}
       </div>
       <div className="flex items-center gap-1">
         <IconButton icon="skipBack" label="Previous clip (Up)" onPress={onPrev} />

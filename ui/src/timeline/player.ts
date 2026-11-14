@@ -8,10 +8,10 @@
 // Segments come from lib/mp4: each chunk's moof+mdat copied with its decode time moved onto the
 // session's clock. A chunk's index `startMs` is where it sits, so shifts are self-explanatory; the
 // engine's own chunk boundaries are the mapping (no per-packet time mapping yet).
-import { codecString, initBytes, segments } from '../lib/mp4.ts'
+import { codecString, headerBytes, initBytes, segments } from '../lib/mp4.ts'
 import { fetchChunkBytes } from '../lib/timeline/chunk-fetch.ts'
 import type { TimelineChunk, TimelineSession } from '../lib/timeline/model.ts'
-import { evictBeforeMs, GAP_MS, seekInside, windowForSeek, type LoadedWindow } from '../lib/timeline/window.ts'
+import { evictBeforeMs, GAP_MS, holeJump, seekInside, windowForSeek, type LoadedWindow } from '../lib/timeline/window.ts'
 
 export type PlayerState = 'buffering' | 'ready' | 'codec' | 'error' | 'missing' | 'empty' | 'append-failed'
 
@@ -114,6 +114,10 @@ export class TimelinePlayer {
   private liveJumpRequested = false
   private extending = false
   private seekVersion = 0
+  /** The init segment and codec the SourceBuffer is decoding with now: a chunk written after an encoder swap or a
+   *  rebuild has its own, and its fragments must not be read against the previous one. */
+  private initSent?: Uint8Array
+  private codecSent = ''
   /** Whether the last chunk append failed, and why: the page shows it and the tick stops asking. */
   appendFailed = false
   appendError = ''
@@ -124,6 +128,7 @@ export class TimelinePlayer {
     video.addEventListener('loadeddata', this.onFirstFrame)
     video.addEventListener('seeked', this.onSeeked)
     video.addEventListener('timeupdate', this.onTime)
+    video.addEventListener('waiting', this.onWaiting)
   }
 
   /** Where the picture is now, on the session's clock. */
@@ -411,8 +416,9 @@ export class TimelinePlayer {
         })
         if (this.closed || generation !== this.generation || !this.liveRequested || version !== this.liveVersion) return
         this.sourceBuffer = media.addSourceBuffer(mime)
-        await this.push(initBytes(prefix), generation)
       }
+      // The first fragment of the stream, and the first of every rotated chunk whose headers changed (an encoder swap).
+      if (!(await this.ensureInit(prefix, generation))) return
       if (this.closed || generation !== this.generation || !this.liveRequested || version !== this.liveVersion) return
       const parts = segments(prefix, this.liveStartMs - this.liveWindowStart, this.sequence, this.liveAppended)
       for (const part of parts) {
@@ -423,8 +429,9 @@ export class TimelinePlayer {
       }
       if (parts.length) {
         // Keep the init and what is not appended yet, nothing more. The open chunk grows to hundreds of
-        // MB, and copying and re-parsing all of it on every poll got slower the longer Live ran.
-        const init = initBytes(prefix)
+        // MB, and copying and re-parsing all of it on every poll got slower the longer Live ran. The header is kept as the file wrote it:
+        // the hidden init no longer names the extra audio tracks, and the next fragment's trafs for them would be refused.
+        const init = headerBytes(prefix)
         const rest = this.liveBytes.subarray(whole)
         const kept = new Uint8Array(init.length + rest.length)
         kept.set(init, 0)
@@ -471,6 +478,7 @@ export class TimelinePlayer {
     this.video.removeEventListener('loadeddata', this.onFirstFrame)
     this.video.removeEventListener('seeked', this.onSeeked)
     this.video.removeEventListener('timeupdate', this.onTime)
+    this.video.removeEventListener('waiting', this.onWaiting)
     this.release()
     this.log('closed')
   }
@@ -553,10 +561,10 @@ export class TimelinePlayer {
     }
     this.sourceBuffer = buffer
     try {
-      await this.push(initBytes(firstFile), generation)
       for (const chunk of chunks) {
         const file = chunk === chunks[0] ? firstFile : await this.bytes(chunk)
         if (generation !== this.generation) return
+        if (!(await this.ensureInit(file, generation))) return
         const parts = segments(file, chunk.startMs - stretch.startMs, this.sequence)
         this.sequence += parts.length
         for (const part of parts) await this.push(part.bytes, generation)
@@ -644,6 +652,7 @@ export class TimelinePlayer {
     // as a player that waits for a fetch that will not finish: `append` reports it once per episode.
     const file = await this.bytes(chunk)
     if (generation !== this.generation) return false
+    if (!(await this.ensureInit(file, generation))) return false
     const parts = segments(file, chunk.startMs - stretch.startMs, this.sequence)
     if (parts.length === 0) return false
     this.sequence += parts.length
@@ -653,6 +662,36 @@ export class TimelinePlayer {
 
   private async bytes(chunk: TimelineChunk): Promise<Uint8Array> {
     return fetchChunkBytes(mediaUrl(chunk.file), this.controller.signal)
+  }
+
+  /**
+   * Hands the SourceBuffer this file's init segment when it is not the one it already decodes with: the first chunk of
+   * a stream, and a chunk written after an encoder swap or a rebuild (new parameter sets, a new size, a new codec).
+   * A new codec needs `changeType`; where the browser cannot change, or cannot play it, the page is told and false is
+   * returned so nothing of that chunk is appended against the wrong headers.
+   */
+  private async ensureInit(file: Uint8Array, generation: number): Promise<boolean> {
+    const init = initBytes(file)
+    const sent = this.initSent
+    if (sent && sent.length === init.length && sent.every((byte, i) => byte === init[i])) return true
+    const codec = codecString(init)
+    const buffer = this.sourceBuffer
+    if (!buffer || generation !== this.generation) return false
+    if (this.codecSent && codec !== this.codecSent) {
+      const mime = `video/mp4; codecs="${codec}, ${AUDIO_CODEC}"`
+      if (typeof buffer.changeType !== 'function' || !MediaSource.isTypeSupported(mime)) {
+        this.fail(generation, 'codec', `The footage changes to a codec the preview cannot switch to here (${mime}). The footage can still be saved.`)
+        return false
+      }
+      this.log(`codec changes to ${codec}`)
+      buffer.changeType(mime)
+    }
+    await this.push(init, generation)
+    if (generation !== this.generation) return false
+    if (sent) this.log('new stream headers: the init segment is appended again')
+    this.initSent = init
+    this.codecSent = codec
+    return true
   }
 
   private push(bytes: Uint8Array, generation: number): Promise<void> {
@@ -694,9 +733,25 @@ export class TimelinePlayer {
 
   // One removal every second of playback at most; `SourceBuffer.remove` is asynchronous and a call
   // per frame would queue work the decoder cannot use. A removal the browser refuses costs a rebuild.
+  /** A playing picture that reached a short hole in the buffer (an encoder swap's seam) moves to the footage after it: the element
+   *  itself would sit on its last frame, unpaused, for good. A longer hole is the page's, which says why there is no picture. */
+  private onWaiting = () => this.stepHole(true)
+
+  private stepHole(stalled = false): void {
+    const ranges = this.sourceBuffer?.buffered
+    if (this.closed || !ranges || this.video.paused || this.video.seeking) return
+    const spans: [number, number][] = []
+    for (let i = 0; i < ranges.length; i++) spans.push([ranges.start(i), ranges.end(i)])
+    const to = holeJump(spans, this.video.currentTime, undefined, stalled)
+    if (to === null) return
+    this.log(`stepped over a ${Math.round((to - this.video.currentTime) * 1000)} ms hole in the buffer`)
+    this.video.currentTime = to
+  }
+
   private onTime = () => {
     const stretch = this.loadedWindow
     if (!stretch || !this.sourceBuffer || this.video.paused) return
+    this.stepHole()
     const now = stretch.startMs + this.video.currentTime * 1000
     // A gap that already ended this window is not asked about again until a chunk past it appears.
     const blocked = this.gapAfterMs > 0 && !!this.session && !this.session.chunks.some((chunk) => chunk.startMs > this.gapAfterMs)
@@ -779,6 +834,8 @@ export class TimelinePlayer {
   private release(): void {
     this.controller.abort()
     this.sourceBuffer = undefined
+    this.initSent = undefined
+    this.codecSent = ''
     if (this.objectUrl) URL.revokeObjectURL(this.objectUrl)
     this.objectUrl = undefined
     this.video.pause()

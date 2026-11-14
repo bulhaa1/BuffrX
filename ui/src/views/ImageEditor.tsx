@@ -9,7 +9,7 @@ import { Icon, type IconName } from '../components/icons'
 import { Button, DialogBox, IconButton, Segmented, Slider, Tabs } from '../components/ui'
 import { engine } from '../lib/api'
 import { mediaUrl, shell } from '../lib/bridge'
-import { canShareSaved } from '../lib/editor-share'
+import { canShareSaved, shareThenLeave } from '../lib/editor-share'
 import { fileName, stem } from '../lib/format'
 import { applyOp, boxOf, copyOf, drawOp, replay, traceArea, type Area, type DrawOp, type Effect, type Op, type Point } from '../lib/image_ops'
 import type { Crop } from '../lib/sequence'
@@ -68,7 +68,7 @@ function SizeControl({ label, value, min, max, onChange, preview }: {
   )
 }
 
-export function ImageEditor({ path, clipsDir, hover, clips, onBack, onDirtyChange }: {
+export function ImageEditor({ path, clipsDir, hover, clips, onBack, onDirtyChange, onShared }: {
   path: string
   clipsDir: string
   /** A file is over the window. */
@@ -77,6 +77,8 @@ export function ImageEditor({ path, clipsDir, hover, clips, onBack, onDirtyChang
   clips: number
   onBack: () => void
   onDirtyChange: (dirty: boolean) => void
+  /** The panel's Share sheet is open on this image: leave the editor for it. */
+  onShared?: () => void
 }) {
   const stage = useRef<HTMLDivElement>(null)
   const base = useRef<HTMLCanvasElement>(null)
@@ -300,6 +302,13 @@ export function ImageEditor({ path, clipsDir, hover, clips, onBack, onDirtyChang
 
   // ---------------------------------------------------------------- saving
 
+  // The panel draws the sheet; the editor leaves only after the engine accepted the file, so a refused share
+  // does not take the person away from the picture. Save & share and Share saved image both end here.
+  const shareFile = useCallback((file: string) => {
+    void attempt('The share sheet did not open',
+                 () => shareThenLeave(() => engine.share(file), () => onShared?.()))
+  }, [onShared])
+
   const save = useCallback(async (replace: boolean, share = false) => {
     if (saving.current || !baked || (!replace && !clipsDir)) return
     saving.current = true
@@ -322,13 +331,14 @@ export function ImageEditor({ path, clipsDir, hover, clips, onBack, onDirtyChang
           if (!blob) throw new Error('the image could not be encoded')
           const target = replace ? path : await uniquePath(`${clipsDir}\\Edits\\${stem(path)}-edit.${jpeg ? 'jpg' : 'png'}`)
           // Base64, not one JSON number per byte: a 4K picture is millions of numbers and froze the window.
-          const bytes_base64 = await new Promise<string>((resolve, reject) => {
+          const bytes = await new Promise<string>((resolve, reject) => {
             const reader = new FileReader()
             reader.onload = () => resolve(String(reader.result).replace(/^data:[^,]*,/, ''))
             reader.onerror = () => reject(reader.error ?? new Error('the image could not be read'))
             reader.readAsDataURL(blob)
           })
-          await shell('write_image', { path: target, bytes_base64 })
+          // `bytesBase64`, not `bytes_base64`: Tauri reads a command's parameters in camelCase.
+          await shell('write_image', { path: target, bytesBase64: bytes })
           return target
         },
       })
@@ -337,7 +347,7 @@ export function ImageEditor({ path, clipsDir, hover, clips, onBack, onDirtyChang
       setSavedShareable(!replace)
       toast('success', 'Saved', fileName(target))
       void engine.notifyLibrary().catch(() => undefined)
-      if (share && canShareSaved(signature, current, !replace)) void attempt('The share sheet did not open', () => engine.share(target))
+      if (share && canShareSaved(signature, current, !replace)) shareFile(target)
       else if (share) toast('info', 'Image saved', 'Your edit changed while saving. Save it again to share the latest version.')
     } catch (error) {
       toast('error', 'The image was not saved', error instanceof Error ? error.message : String(error))
@@ -345,7 +355,7 @@ export function ImageEditor({ path, clipsDir, hover, clips, onBack, onDirtyChang
       saving.current = false
       setBusy(false)
     }
-  }, [baked, clipsDir, cropping, crop, filter, path])
+  }, [baked, clipsDir, cropping, crop, filter, path, shareFile])
 
   const saveRef = useRef(save)
   saveRef.current = save
@@ -527,7 +537,7 @@ export function ImageEditor({ path, clipsDir, hover, clips, onBack, onDirtyChang
             <div className="mb-2 truncate text-[13px] font-bold" title={saved}>Saved · {fileName(saved)}</div>
             {savedSignature !== editSignature && <div className="mb-2 text-[13px] text-muted">Your edit has changed since this save.</div>}
             {savedShareable
-              ? <Button variant="primary" icon="share" isDisabled={!canShareSaved(savedSignature, editSignature, savedShareable)} onPress={() => void attempt('The share sheet did not open', () => engine.share(saved))}>Share saved image</Button>
+              ? <Button variant="primary" icon="share" isDisabled={!canShareSaved(savedSignature, editSignature, savedShareable)} onPress={() => saved && shareFile(saved)}>Share saved image</Button>
               : <div className="text-[13px] text-muted">Save a copy to share this edit.</div>}
           </div>
         )}

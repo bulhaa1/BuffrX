@@ -1,9 +1,10 @@
 // The editor's sequence: an ordered list of clips that stay separate until the export joins them.
-// Each clip keeps its own parts, crop, colour, speed and volumes; the sequence only decides the order
-// and how long each clip is on the timeline after its speed. Pure functions, tested on their own.
+// Each clip keeps its own parts, crop, colour, speed, sound levels and mutes; the sequence only decides
+// the order and how long each clip is on the timeline after its speed. Pure functions, tested on their own.
 
 import type { Part } from './segments.ts'
 import { keptLength } from './segments.ts'
+import { audioDefaults, audioIsEdited, audioLayout, exportGains, mixIsDerived, type AudioTrack } from './audio.ts'
 
 export interface Crop {
   x: number
@@ -20,11 +21,7 @@ export interface Grade {
 export const FLAT: Grade = { brightness: 100, contrast: 100, saturation: 100 }
 
 /** One audio track of a source, as the cut lane names it and the preview mixes it. */
-export interface ClipTrack {
-  index: number
-  channels: number
-  title: string
-}
+export type ClipTrack = AudioTrack
 
 /** One clip as the sequence holds it: a reference to the file and the edits made to it. */
 export interface SequenceClip {
@@ -43,6 +40,9 @@ export interface SequenceClip {
   fps: number
   /** The file's size, which names its cached preview tracks. */
   bytes: number
+  /** Last write time, seconds since 1970: it names the cached preview tracks too, because a replaced
+   *  file keeps its path and may keep its size. */
+  modified?: number
   audio: ClipTrack[]
   /** The parts of the source that are kept, in order. A split and a delete leave gaps. */
   parts: Part[]
@@ -52,8 +52,17 @@ export interface SequenceClip {
   future: Part[][]
   aspect: string
   crop: Crop
-  /** Per audio track, 1 is unchanged. */
+  /** Per audio track, 1 is unchanged. The export is given exportGains(clip): the levels with their
+   *  mutes, and never a solo. */
   volumes: number[]
+  /** Per audio track: silenced by its own switch, in the preview and in the export. */
+  muted: boolean[]
+  /** Per audio track: while any is on, only the soloed tracks are auditioned in the preview. Solo is
+   *  never written to a file and never makes the clip edited on its own. */
+  solo: boolean[]
+  /** One overall level over every source, 1 is unchanged. It is separate from the per-track balance and
+   *  reaches the preview and the export exactly once (audio.ts exportGains/monitorGains). */
+  master: number
   grade: Grade
   /** 2 plays twice as fast, so the clip is half as long on the sequence. */
   speed: number
@@ -83,10 +92,13 @@ export interface ClipSource {
   height: number
   fps: number
   bytes: number
+  /** Last write time, seconds since 1970: it names the cached preview tracks beside the size. */
+  modified?: number
   audio: ClipTrack[]
 }
 
 export function newClip(source: ClipSource): SequenceClip {
+  const sound = audioDefaults(source.audio)
   return {
     id: source.path.toLowerCase(),
     path: source.path,
@@ -96,6 +108,7 @@ export function newClip(source: ClipSource): SequenceClip {
     height: source.height,
     fps: source.fps,
     bytes: source.bytes,
+    modified: source.modified ?? 0,
     audio: source.audio,
     parts: [[0, source.duration]],
     active: 0,
@@ -103,7 +116,10 @@ export function newClip(source: ClipSource): SequenceClip {
     future: [],
     aspect: 'off',
     crop: { x: 0, y: 0, width: source.width, height: source.height },
-    volumes: Array.from({ length: source.audio.length }, () => 1),
+    volumes: sound.volumes,
+    muted: sound.muted,
+    solo: sound.solo,
+    master: sound.master,
     grade: FLAT,
     speed: 1,
   }
@@ -169,7 +185,9 @@ export function locate(clips: SequenceClip[], outputTime: number): { index: numb
   return { index: -1, offset: 0, sourceTime: 0 }
 }
 
-/** A clip as the join's input: its parts and its own edit. */
+/** A clip as the join's input: its parts and its own edit. The levels sent are the ones saved: a mute
+ *  is a zero here, a solo is ignored because it only auditions the preview, and the one overall level is
+ *  folded into the sources once (audio.ts exportGains). */
 export function clipExportInput(clip: SequenceClip): ExportInput {
   const cropped = clip.crop.width > 0 && (clip.crop.width < clip.width || clip.crop.height < clip.height)
   return {
@@ -183,7 +201,7 @@ export function clipExportInput(clip: SequenceClip): ExportInput {
     grade_contrast: clip.grade.contrast,
     grade_saturation: clip.grade.saturation,
     speed: clip.speed,
-    volumes: clip.volumes,
+    volumes: exportGains(clip.volumes, clip.muted, clip.audio.length, mixIsDerived(audioLayout(clip.audio)), clip.master),
   }
 }
 
@@ -274,7 +292,9 @@ export function isEdited(clip: SequenceClip): boolean {
   const whole = clip.parts.length === 1 && clip.parts[0][0] <= 0.001 && clip.parts[0][1] >= clip.duration - 0.001
   const cropped = clip.crop.width > 0 && (clip.crop.width < clip.width || clip.crop.height < clip.height)
   const graded = clip.grade.brightness !== 100 || clip.grade.contrast !== 100 || clip.grade.saturation !== 100
-  const levelled = clip.volumes.some((volume) => Math.abs(volume - 1) > 0.005)
+  // Solo only auditions the preview, so it alone does not make a clip edited; a mute, a source level or
+  // the overall level is saved.
+  const levelled = audioIsEdited(clip.audio, clip.volumes, clip.muted, clip.master)
   return !!clip.timelineTrimmed || !whole || cropped || graded || levelled || clip.speed !== 1
 }
 
