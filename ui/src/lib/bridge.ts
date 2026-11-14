@@ -190,9 +190,26 @@ function webviewMediaUrl(path: string): string {
 }
 
 /** A clip or screenshot as a URL a <video>/<img> can load (streams with byte ranges). */
+// Tauri serves custom schemes as http://<name>.localhost on Windows/Android and as
+// <name>://localhost elsewhere; WebKitGTK will not resolve the Windows form.
+const customScheme = (name: string, path: string) =>
+  /Windows|Android/i.test(navigator.userAgent) ? `http://${name}.localhost/${path}` : `${name}://localhost/${path}`
+
+// The Linux editor serves media from a loopback HTTP server (see src-tauri/src/media.rs): its
+// WebKitGTK build does not play a custom scheme reliably, and every WebView agrees on HTTP. The
+// server needs the per-run token the page was opened with; without both the custom scheme is used.
+const mediaQuery = hasWindow ? new URLSearchParams(window.location.search) : null
+const mediaPort = mediaQuery?.get('media_port')
+const mediaToken = mediaQuery?.get('media_token')
+const loopbackMedia = mediaPort && mediaToken ? `http://127.0.0.1:${mediaPort}` : ''
+const mediaTokenQuery = mediaToken ? `?media_token=${encodeURIComponent(mediaToken)}` : ''
+
 export function mediaUrl(path: string): string {
   if (!path) return ''
-  if (transport === 'tauri') return `http://media.localhost/${encodeURIComponent(path)}`
+  if (transport === 'tauri') {
+    if (loopbackMedia) return `${loopbackMedia}/media/${encodeURIComponent(path)}${mediaTokenQuery}`
+    return customScheme('media', encodeURIComponent(path))
+  }
   if (transport === 'webview') return webviewMediaUrl(path)
   if (transport === 'dev') return `/media/${encodeURIComponent(path)}`
   return ''
@@ -201,7 +218,10 @@ export function mediaUrl(path: string): string {
 /** A cached thumbnail by file name (the engine reports thumbnails by name). */
 export function thumbnailUrl(name: string): string {
   if (!name) return ''
-  if (transport === 'tauri') return `http://thumbnails.localhost/${encodeURIComponent(name)}`
+  if (transport === 'tauri') {
+    if (loopbackMedia) return `${loopbackMedia}/thumbnails/${encodeURIComponent(name)}${mediaTokenQuery}`
+    return customScheme('thumbnails', encodeURIComponent(name))
+  }
   if (transport === 'dev') return `/thumbnails/${encodeURIComponent(name)}`
   return ''
 }

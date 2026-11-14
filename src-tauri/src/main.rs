@@ -1,4 +1,4 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 //! The BuffrX editor host (`buffrx-ui.exe --editor [files...]`, `--editor --preview <file>`).
 //!
@@ -37,6 +37,7 @@ fn data_root() -> PathBuf {
         let _ = fs::create_dir_all(&p);
         return p;
     }
+    #[cfg(windows)]
     let p = if let Ok(local) = env::var("LOCALAPPDATA") {
         if local.is_empty() { exe_dir.join("data") } else { PathBuf::from(local).join("BuffrX") }
     } else {
@@ -44,12 +45,25 @@ fn data_root() -> PathBuf {
         // "BuffrX" against whatever working directory the launch happened to have.
         exe_dir.join("data")
     };
+    #[cfg(unix)]
+    let p = if let Ok(xdg) = env::var("XDG_DATA_HOME") {
+        if xdg.is_empty() { exe_dir.join("data") } else { PathBuf::from(xdg).join("buffrx") }
+    } else if let Ok(home) = env::var("HOME") {
+        PathBuf::from(home).join(".local/share/buffrx")
+    } else {
+        exe_dir.join("data")
+    };
     let _ = fs::create_dir_all(&p);
     p
 }
 
 pub(crate) fn engine_path() -> PathBuf {
-    env::current_exe().ok().and_then(|p| p.parent().map(PathBuf::from)).unwrap_or_default().join("buffrx-engine.exe")
+    let directory = env::current_exe().ok().and_then(|p| p.parent().map(PathBuf::from)).unwrap_or_default();
+    #[cfg(windows)]
+    let name = "buffrx-engine.exe";
+    #[cfg(unix)]
+    let name = "buffrx-engine";
+    directory.join(name)
 }
 
 /// The two schemes every window serves: media (byte ranges from the allowed root) and thumbnails (cached
@@ -132,15 +146,39 @@ fn parse_launch(args: &[String]) -> Launch {
 
 /// True when this process is the first holder of `name`: a named mutex, one per role.
 fn acquire_instance(name: &str) -> bool {
-    use std::ffi::CString;
-    extern "system" {
-        fn CreateMutexA(attributes: *mut std::ffi::c_void, owner: i32, name: *const i8) -> *mut std::ffi::c_void;
-        fn GetLastError() -> u32;
+    #[cfg(windows)]
+    {
+        use std::ffi::CString;
+        extern "system" {
+            fn CreateMutexA(attributes: *mut std::ffi::c_void, owner: i32, name: *const i8) -> *mut std::ffi::c_void;
+            fn GetLastError() -> u32;
+        }
+        let name = CString::new(name).unwrap();
+        let handle = unsafe { CreateMutexA(std::ptr::null_mut(), 0, name.as_ptr()) };
+        // ERROR_ALREADY_EXISTS (183): another process holds the mutex.
+        return handle.is_null() || unsafe { GetLastError() } != 183;
     }
-    let name = CString::new(name).unwrap();
-    let handle = unsafe { CreateMutexA(std::ptr::null_mut(), 0, name.as_ptr()) };
-    // ERROR_ALREADY_EXISTS (183): another process holds the mutex.
-    handle.is_null() || unsafe { GetLastError() } != 183
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        extern "C" {
+            fn getuid() -> u32;
+            fn flock(fd: i32, operation: i32) -> i32;
+        }
+        const LOCK_EX: i32 = 2;
+        const LOCK_NB: i32 = 4;
+        let base = env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
+        let uid = unsafe { getuid() };
+        let safe: String = name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' }).collect();
+        let path = format!("{base}/buffrx-ui-{uid}-{safe}.lock");
+        let Ok(file) = fs::OpenOptions::new().create(true).write(true).open(&path) else { return true };
+        let taken = unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) } == 0;
+        if taken {
+            // The lock lives as long as the descriptor: keep it for the process's life.
+            std::mem::forget(file);
+        }
+        return taken;
+    }
 }
 
 /// True when this process is the first Timeline preview. A mutex of its own: the preview may run beside
@@ -149,6 +187,7 @@ fn acquire_timeline_instance() -> bool { acquire_instance("Local\\BuffrX.timelin
 
 /// Sends one command to the engine and waits for its answer: how a second launch hands its request to
 /// the first instance.
+#[cfg(windows)]
 fn engine_once(cmd: &str, args: serde_json::Value) -> bool {
     use std::io::{Read, Write};
     use std::time::{Duration, Instant};
@@ -214,9 +253,57 @@ fn engine_once(cmd: &str, args: serde_json::Value) -> bool {
     false
 }
 
+#[cfg(unix)]
+fn engine_once(cmd: &str, args: serde_json::Value) -> bool {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+    use std::time::Duration;
+    let Ok(mut stream) = UnixStream::connect(pipe::pipe_name()) else { return false };
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let mut send = |frame: String| -> bool {
+        let bytes = frame.into_bytes();
+        stream.write_all(&(bytes.len() as u32).to_le_bytes()).is_ok() && stream.write_all(&bytes).is_ok()
+    };
+    let ok = send(serde_json::json!({"id": 1, "cmd": "hello", "args": {"client": "forward"}}).to_string())
+        && send(serde_json::json!({"id": 2, "cmd": cmd, "args": args}).to_string());
+    if !ok {
+        return false;
+    }
+    for _ in 0..16 {
+        let mut header = [0u8; 4];
+        if stream.read_exact(&mut header).is_err() {
+            return false;
+        }
+        let length = u32::from_le_bytes(header) as usize;
+        if length == 0 || length > 16 * 1024 * 1024 {
+            return false;
+        }
+        let mut body = vec![0u8; length];
+        if stream.read_exact(&mut body).is_err() {
+            return false;
+        }
+        if String::from_utf8_lossy(&body).contains("\"id\":2") {
+            return true;
+        }
+    }
+    false
+}
+
 fn run_self_test() {
     use std::io::{Read, Write};
+    #[cfg(unix)]
     let mut file = None;
+    #[cfg(unix)]
+    for _ in 0..50 {
+        if let Ok(f) = std::os::unix::net::UnixStream::connect(pipe::pipe_name()) {
+            file = Some(f);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    #[cfg(windows)]
+    let mut file = None;
+    #[cfg(windows)]
     for _ in 0..50 {
         if let Ok(f) = fs::OpenOptions::new().read(true).write(true).open(pipe::pipe_name()) {
             file = Some(f);
@@ -433,6 +520,7 @@ fn main() {
     }
 
     let data = data_root();
+    media::start_http_server(data.clone());
     let embedded = launch.parent != 0;
     media::cleanup_timeline_cache(&data);
     let shared = Arc::new(Shared { data_root: data.clone(), launch: launch.clone(), exports: Arc::new(media::Exports::default()) });
@@ -518,7 +606,7 @@ fn main() {
                 .flatten()
                 .map(|monitor| editor_sizes((monitor.work_area().size.width, monitor.work_area().size.height), monitor.scale_factor()))
                 .unwrap_or((EDITOR_SIZE, EDITOR_MIN, EDITOR_MAX));
-            let mut editor = WebviewWindowBuilder::new(app, "editor", WebviewUrl::App("index.html".into()))
+            let mut editor = WebviewWindowBuilder::new(app, "editor", WebviewUrl::App(format!("index.html{}", media::page_query()).into()))
                 .title(if launch.view == "preview" { "BuffrX Preview" } else { "BuffrX Editor" })
                 .inner_size(start.0, start.1)
                 .maximizable(false)
@@ -604,6 +692,7 @@ fn run_timeline(launch: Launch) {
         return;
     }
     let data = data_root();
+    media::start_http_server(data.clone());
     let media_root = data.clone();
     let thumbnail_root = data.clone();
     let shared = Arc::new(Shared { data_root: data.clone(), launch: launch.clone(), exports: Arc::new(media::Exports::default()) });
@@ -625,7 +714,7 @@ fn run_timeline(launch: Launch) {
             let pipe = Arc::new(pipe::PipeClient::new(handle, data.clone(), engine_path(), false));
             app.manage(pipe.clone());
             pipe.start();
-            let mut preview = WebviewWindowBuilder::new(app, "timeline", WebviewUrl::App("timeline.html".into()))
+            let mut preview = WebviewWindowBuilder::new(app, "timeline", WebviewUrl::App(format!("timeline.html{}", media::page_query()).into()))
                 .title("BuffrX Timeline")
                 .inner_size(1440.0, 900.0)
                 // The slide preview: no frame, no shadow (an undecorated window keeps 8 white pixels around the page),
@@ -894,7 +983,18 @@ async fn pick_clips() -> Result<Vec<String>, String> {
     }
     #[cfg(not(windows))]
     {
-        Err("the file picker is only available on Windows".into())
+        let output = std::process::Command::new("zenity")
+            .args(["--file-selection", "--multiple", "--separator=\n", "--title=Choose files"])
+            .output()
+            .map_err(|e| format!("the file picker could not open: {e}"))?;
+        if !output.status.success() {
+            return Ok(Vec::new());
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        let paths: Vec<String> = text.lines().map(str::trim).filter(|line| !line.is_empty()).map(str::to_string).collect();
+        let list: Vec<PathBuf> = paths.iter().map(|p| media::native(p)).collect();
+        media::allow_dropped(&list);
+        Ok(paths)
     }
 }
 
@@ -1047,7 +1147,8 @@ fn write_image(path: String, bytes_base64: String, shared: tauri::State<'_, Arc<
         return Err("the image is too large to write".into());
     }
     let bytes = decode_base64(&bytes_base64)?;
-    let target = std::path::Path::new(&path);
+    let native = media::native(&path);
+    let target = native.as_path();
     let image = matches!(
         target.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref(),
         Some("png") | Some("jpg") | Some("jpeg")

@@ -7,6 +7,7 @@
 #pragma once
 
 #include <cstdint>
+#include <clocale>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -16,6 +17,23 @@
 #include <vector>
 
 namespace bx {
+
+#ifndef _WIN32
+// JSON's number grammar is locale-independent. GTK (the tray) calls setlocale(LC_ALL, ""), which on a
+// comma-decimal desktop would write 63,49 into a frame; uselocale pins the serializer and parser.
+inline locale_t json_c_locale() {
+  static locale_t value = newlocale(LC_NUMERIC_MASK, "C", static_cast<locale_t>(nullptr));
+  return value;
+}
+inline double json_strtod(const char* text) {
+  locale_t previous = uselocale(json_c_locale());
+  const double value = std::strtod(text, nullptr);
+  uselocale(previous);
+  return value;
+}
+#else
+inline double json_strtod(const char* text) { return std::strtod(text, nullptr); }
+#endif
 
 // How many values one document may hold. A frame is bounded in bytes at the pipe, and every value in
 // it costs a heap object: without this a small frame of tiny numbers grows into hundreds of megabytes
@@ -401,7 +419,7 @@ private:
       }
     }
     errno = 0;
-    const double number = std::strtod(slice.c_str(), nullptr);
+    const double number = json_strtod(slice.c_str());
     // 1e999 reads as +inf, which has no JSON spelling: written back it became null and the value was
     // gone. A number that is not finite, or that overflowed/underflowed, is a parse error instead.
     if (errno == ERANGE || !std::isfinite(number)) {
@@ -449,7 +467,13 @@ private:
           out += "null";
         } else {
           char buffer[40];
+#ifndef _WIN32
+          locale_t previous = uselocale(json_c_locale());
           std::snprintf(buffer, sizeof(buffer), "%.10g", number_);
+          uselocale(previous);
+#else
+          std::snprintf(buffer, sizeof(buffer), "%.10g", number_);
+#endif
           out += buffer;
         }
         return;

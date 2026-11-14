@@ -1,7 +1,11 @@
 #include "short_link.h"
 
+#ifdef _WIN32
 #include <windows.h>
 #include <winhttp.h>
+#else
+#include <curl/curl.h>
+#endif
 
 #include <cstdlib>
 #include <chrono>
@@ -14,6 +18,7 @@
 namespace bx {
 namespace {
 
+#ifdef _WIN32
 // Irohs and Windows both hand back UTF-16; the endpoint is ASCII but the path is not ours to assume.
 std::wstring wide(const std::string& text) {
   if (text.empty()) return std::wstring();
@@ -30,6 +35,7 @@ struct Handle {
     if (handle) WinHttpCloseHandle(handle);
   }
 };
+#endif
 
 std::string quoted(const std::string& text) {
   std::string out = "\"";
@@ -70,6 +76,8 @@ std::string service_endpoint() {
   return kShortLinkEndpoint;
 }
 
+// One attempt. `failure` is the line to show when this returns false.
+#ifdef _WIN32
 // One attempt. `failure` is the line to show when this returns false.
 bool attempt(const std::string& endpoint, const std::string& body, std::string& url, const char*& failure,
              bool& retry) {
@@ -177,6 +185,67 @@ bool attempt(const std::string& endpoint, const std::string& body, std::string& 
   return true;
 }
 
+#else
+bool attempt(const std::string& endpoint, const std::string& body, std::string& url, const char*& failure,
+             bool& retry) {
+  failure = kUnavailable;
+  retry = true;
+  if (endpoint.rfind("https://", 0) != 0 && !loopback(endpoint)) {
+    retry = false;
+    return false;
+  }
+  CURL* curl = curl_easy_init();
+  if (!curl) return false;
+  struct curl_slist* headers = curl_slist_append(nullptr, "Content-Type: application/json");
+  std::string answer;
+  curl_easy_setopt(curl, CURLOPT_URL, endpoint.c_str());
+  curl_easy_setopt(curl, CURLOPT_USERAGENT, "BuffrX");
+  curl_easy_setopt(curl, CURLOPT_POST, 1L);
+  curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.data());
+  curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(body.size()));
+  curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+  curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, static_cast<long>(kShortLinkTimeoutMs));
+  curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 0L);
+  curl_easy_setopt(curl, CURLOPT_WRITEDATA, &answer);
+  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION,
+                   +[](char* data, size_t size, size_t count, void* user) -> size_t {
+                     auto* text = static_cast<std::string*>(user);
+                     const size_t bytes = size * count;
+                     if (text->size() + bytes > 8192) return 0;
+                     text->append(data, bytes);
+                     return bytes;
+                   });
+  const CURLcode code = curl_easy_perform(curl);
+  long http_status = 0;
+  curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_status);
+  curl_slist_free_all(headers);
+  curl_easy_cleanup(curl);
+  if (code != CURLE_OK) {
+    failure = (code == CURLE_COULDNT_RESOLVE_HOST || code == CURLE_COULDNT_CONNECT) ? kNoConnection
+              : (code == CURLE_OPERATION_TIMEDOUT ? kTimedOut : kUnavailable);
+    return false;
+  }
+  if (http_status != 200) {
+    retry = http_status >= 500;
+    failure = kUnavailable;
+    return false;
+  }
+  Json reply;
+  std::string error;
+  const std::string candidate =
+      Json::parse(answer, reply, error) && reply.is_object() ? reply["url"].as_string() : std::string();
+  const size_t origin_end = endpoint.find('/', endpoint.find("://") + 3);
+  const std::string origin = endpoint.substr(0, origin_end);
+  const size_t slash = candidate.rfind(origin + "/s/", 0);
+  if (slash != 0 || candidate.size() < origin.size() + 6 || candidate.size() > 200) {
+    retry = false;
+    failure = kUnavailable;
+    return false;
+  }
+  url = candidate;
+  return true;
+}
+#endif
 }  // namespace
 
 const char kShortLinkEndpoint[] = "https://buffrx.app/api/shorten";

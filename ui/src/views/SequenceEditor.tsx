@@ -786,7 +786,7 @@ export function SequenceEditor({ clips, setClips, hover, dragging, suspended, cl
                     key={entry.path}
                     ref={players[slot]}
                     src={mediaUrl(entry.path)}
-                    crossOrigin="anonymous"
+                    crossOrigin={/Windows|Android/i.test(navigator.userAgent) ? "anonymous" : undefined}
                     className={clsx('absolute inset-0 h-full w-full border border-line-strong bg-black', !here && 'pointer-events-none opacity-0')}
                     style={{ filter: gradeFilter(entry.grade) }}
                     onLoadedMetadata={() => prepare(slot)}

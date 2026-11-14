@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <clocale>
 #include <cstdio>
 #include <condition_variable>
 #include <cstring>
@@ -93,6 +94,10 @@ std::string pipe_name() {
 
 int main(int argc, char** argv) {
   using namespace bx;
+  // JSON numbers are written with snprintf/ostringstream and read with strtod, both of which honor
+  // LC_NUMERIC. A Norwegian desktop would otherwise write 63,49 and the interface's JSON parser (and
+  // every other client) would reject the frame.
+  std::setlocale(LC_NUMERIC, "C");
   // Per-monitor DPI awareness before anything touches D3D or a window. DXGI desktop duplication
   // (DuplicateOutput1) refuses a process that is not DPI aware with DXGI_ERROR_UNSUPPORTED, which left
   // display capture with no frames at all; OBS declares the same awareness in its manifest.
@@ -586,6 +591,13 @@ int main(int argc, char** argv) {
     }
     return result == ERROR_SUCCESS || result == ERROR_CANCELLED ? 0 : 2;
   }
+#ifndef _WIN32
+  // Linux has no game-capture hook and no window-manager notion of "a fullscreen game" that is safe to
+  // auto-select: the desktop itself reports fullscreen. The default is the display; a window or game
+  // target is still chosen explicitly in the panel.
+  config.auto_game_capture = false;
+  if (config.capture_mode == "game") config.capture_mode = "display";
+#endif
   // Load-time reality check: a persisted window or game target that no longer exists â€” or that
   // resolves to this process â€” falls back to display for this session. The flip is deliberately NOT
   // falls back to display. The fallback is written to the config like the runtime one

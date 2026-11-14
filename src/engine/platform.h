@@ -5,6 +5,10 @@
 // must not depend on a window being open.
 #pragma once
 
+#ifndef _WIN32
+#include "platform_linux.h"
+#else
+
 #include <windows.h>
 
 #include <functional>
@@ -228,3 +232,5 @@ std::string executable_path();
 std::string executable_directory();
 
 }  // namespace bx
+
+#endif  // _WIN32

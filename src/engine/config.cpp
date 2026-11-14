@@ -103,9 +103,17 @@ bool resolve_data_root(std::string& data_root, bool& portable) {
     return ensure_directory(data_root);
   }
   portable = false;
+#ifdef _WIN32
   char local[MAX_PATH] = {0};
   if (GetEnvironmentVariableA("LOCALAPPDATA", local, MAX_PATH) == 0) return false;
   data_root = std::string(local) + "\\BuffrX";
+#else
+  const char* xdg = std::getenv("XDG_DATA_HOME");
+  const char* home = std::getenv("HOME");
+  if (xdg && *xdg) data_root = std::string(xdg) + "/buffrx";
+  else if (home && *home) data_root = std::string(home) + "/.local/share/buffrx";
+  else return false;
+#endif
   return ensure_directory(data_root);
 }
 

@@ -14,21 +14,211 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter};
 
+/// An engine path as a native path. The engine keeps Windows separators by design; the editor's own
+/// file calls must use the host's separator.
+pub fn native(path: &str) -> PathBuf {
+    #[cfg(windows)]
+    {
+        PathBuf::from(path)
+    }
+    #[cfg(unix)]
+    {
+        PathBuf::from(path.replace('\\', "/"))
+    }
+}
+
+fn native_buf(path: &Path) -> PathBuf {
+    native(&path.to_string_lossy())
+}
+
+
+// ---------------------------------------------------------------- local HTTP media (Linux)
+
+#[cfg(unix)]
+use std::net::TcpListener;
+#[cfg(unix)]
+use std::sync::atomic::{AtomicU16, Ordering};
+#[cfg(unix)]
+use std::sync::OnceLock;
+
+#[cfg(unix)]
+static MEDIA_PORT: AtomicU16 = AtomicU16::new(0);
+#[cfg(unix)]
+static MEDIA_TOKEN: OnceLock<String> = OnceLock::new();
+
+#[cfg(unix)]
+fn media_port() -> u16 { MEDIA_PORT.load(Ordering::Relaxed) }
+
+/// The page is handed the loopback port and a per-run secret. Without the secret any local program,
+/// and any page loaded in the editor, could read every clip and screenshot the allow-list reaches.
+pub fn page_query() -> String {
+    #[cfg(unix)]
+    {
+        let port = media_port();
+        if port == 0 { return String::new(); }
+        return format!("?media_port={port}&media_token={}", MEDIA_TOKEN.get().map(String::as_str).unwrap_or(""));
+    }
+    #[cfg(not(unix))]
+    { String::new() }
+}
+
+/// A fresh 256-bit secret for one editor run. `/dev/urandom` is the source; the fallback still differs
+/// per process and run, which is enough for a listener that only lives as long as the window.
+#[cfg(unix)]
+fn new_media_token() -> String {
+    let mut bytes = [0u8; 32];
+    let read = std::fs::File::open("/dev/urandom").and_then(|mut file| file.read_exact(&mut bytes));
+    if read.is_err() {
+        use std::hash::{BuildHasher, Hasher};
+        for chunk in bytes.chunks_mut(8) {
+            let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+            hasher.write_u32(std::process::id());
+            hasher.write_u128(SystemTime::now().duration_since(UNIX_EPOCH).map(|age| age.as_nanos()).unwrap_or(0));
+            chunk.copy_from_slice(&hasher.finish().to_le_bytes()[..chunk.len()]);
+        }
+    }
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// True when the request carries this run's secret. The comparison visits every byte so a caller
+/// cannot learn the token a character at a time from how long the answer takes.
+#[cfg(unix)]
+fn authorised(query: &str) -> bool {
+    let Some(expected) = MEDIA_TOKEN.get() else { return false };
+    let Some(given) = query.split('&').find_map(|pair| pair.strip_prefix("media_token=")) else { return false };
+    expected.len() == given.len() &&
+        expected.bytes().zip(given.bytes()).fold(0u8, |mismatch, (left, right)| mismatch | (left ^ right)) == 0
+}
+
+/// The editor's WebKitGTK build plays media from a custom scheme unreliably; a loopback HTTP server
+/// with byte ranges is the same transport the browser and every WebView agree on. Bound to 127.0.0.1
+/// only, every request needs the page's token, and every path passes the same allow-list the custom
+/// scheme uses. It runs only on the Linux host; Windows keeps the custom scheme.
+#[cfg(unix)]
+pub fn start_http_server(data_root: PathBuf) -> u16 {
+    if media_port() != 0 {
+        return media_port();
+    }
+    let Ok(listener) = TcpListener::bind(("127.0.0.1", 0)) else { return 0 };
+    let Ok(address) = listener.local_addr() else { return 0 };
+    let _ = MEDIA_TOKEN.set(new_media_token());
+    MEDIA_PORT.store(address.port(), Ordering::Relaxed);
+    std::thread::spawn(move || {
+        for connection in listener.incoming() {
+            let Ok(mut stream) = connection else { continue };
+            let root = data_root.clone();
+            std::thread::spawn(move || {
+                let mut reader = std::io::BufReader::new(&mut stream);
+                let mut request = String::new();
+                if reader.read_line(&mut request).is_err() { return; }
+                let mut range = None;
+                let mut header = String::new();
+                while reader.read_line(&mut header).is_ok() && !header.trim().is_empty() {
+                    if let Some(value) = header.trim().strip_prefix("Range:").or_else(|| header.trim().strip_prefix("range:")) {
+                        if let Some(value) = value.trim().strip_prefix("bytes=") {
+                            if let Some((start, end)) = value.split_once('-') {
+                                range = Some((start.parse::<u64>().unwrap_or(0), end.parse::<u64>().ok()));
+                            }
+                        }
+                    }
+                    header.clear();
+                }
+                let mut parts = request.split_whitespace();
+                let _method = parts.next();
+                let target = parts.next().unwrap_or("/");
+                let (target, query) = target.split_once('?').unwrap_or((target, ""));
+                if !authorised(query) {
+                    use std::io::Write;
+                    let _ = stream.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                    return;
+                }
+                let (status, headers, body) = http_response(&root, target, range);
+                let reason = match status { 200 => "OK", 206 => "Partial Content", 403 => "Forbidden", 404 => "Not Found", _ => "Error" };
+                let mut response = format!("HTTP/1.1 {status} {reason}\r\n");
+                for (name, value) in &headers {
+                    response.push_str(&format!("{name}: {value}\r\n"));
+                }
+                response.push_str(&format!("Content-Length: {}\r\nConnection: close\r\n\r\n", body.len()));
+                use std::io::Write;
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.write_all(&body);
+            });
+        }
+    });
+    media_port()
+}
+
+#[cfg(not(unix))]
+pub fn start_http_server(_data_root: PathBuf) -> u16 { 0 }
+
+/// `path` is `<encoded absolute path>` or begins with `/media/`; `/thumbnails/<name>` reads the cache.
+fn http_response(data_root: &Path, target: &str, range: Option<(u64, Option<u64>)>) -> (u16, Vec<(String, String)>, Vec<u8>) {
+    let mut cors = vec![("Access-Control-Allow-Origin".to_string(), "*".to_string()),
+                        ("Accept-Ranges".to_string(), "bytes".to_string())];
+    let raw = target.split('?').next().unwrap_or(target).trim_start_matches('/');
+    let (kind, raw) = match raw.split_once('/') {
+        Some(("media", rest)) => ("media", rest),
+        Some(("thumbnails", rest)) => ("thumbnails", rest),
+        _ => ("media", raw),
+    };
+    let decoded = percent_decode(raw);
+    let path = if kind == "thumbnails" {
+        let name = decoded.trim_start_matches('/');
+        if name.is_empty() || name.contains('/') || name.contains('\\') || name.contains("..") {
+            return (404, cors, Vec::new());
+        }
+        data_root.join("thumbnails").join(name)
+    } else {
+        let path = native(&decoded);
+        if !is_allowed_to_read(data_root, &path) {
+            return (403, cors, Vec::new());
+        }
+        path
+    };
+    let Ok(mut file) = std::fs::File::open(&path) else { return (404, cors, Vec::new()) };
+    let size = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let content_type = content_type(&path).to_string();
+    cors.push(("Content-Type".to_string(), content_type));
+    if let Some((start, end)) = range {
+        let start = start.min(size);
+        let end = end.unwrap_or(size.saturating_sub(1)).min(size.saturating_sub(1));
+        if start > end || size == 0 {
+            return (416, cors, Vec::new());
+        }
+        use std::io::{Read, Seek, SeekFrom};
+        let mut body = vec![0u8; (end - start + 1) as usize];
+        if file.seek(SeekFrom::Start(start)).is_err() || file.read_exact(&mut body).is_err() {
+            return (500, cors, Vec::new());
+        }
+        cors.push(("Content-Range".to_string(), format!("bytes {start}-{end}/{size}")));
+        return (206, cors, body);
+    }
+    use std::io::Read;
+    let mut body = Vec::with_capacity(size as usize);
+    if file.read_to_end(&mut body).is_err() {
+        return (500, cors, Vec::new());
+    }
+    (200, cors, body)
+}
+
 /// The folders the page may read from and the editor may write into.
 pub fn allowed_roots(data_root: &Path) -> Vec<PathBuf> {
     let mut roots = vec![data_root.to_path_buf()];
+    #[cfg(windows)]
     let videos = std::env::var("USERPROFILE").map(|home| PathBuf::from(home).join("Videos").join("BuffrX")).ok();
+    #[cfg(unix)]
+    let videos = std::env::var("HOME").map(|home| PathBuf::from(home).join("Videos").join("BuffrX")).ok();
     let config: Value = std::fs::read_to_string(data_root.join("config.json"))
         .ok()
         .and_then(|text| serde_json::from_str(text.trim_start_matches('\u{feff}')).ok())
         .unwrap_or(Value::Null);
-    let clips = config.get("clips_dir").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(PathBuf::from).or(videos);
+    let clips = config.get("clips_dir").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(native).or(videos);
     if let Some(clips) = clips {
         roots.push(clips);
     }
     for key in ["screenshots_dir", "recordings_dir"] {
         if let Some(dir) = config.get(key).and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
-            roots.push(PathBuf::from(dir));
+            roots.push(native(dir));
         }
     }
     roots
@@ -41,11 +231,17 @@ fn lexical(path: &Path) -> Option<String> {
     if path.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
         return None; // no walking out with ".."
     }
-    Some(path.to_string_lossy().replace('/', "\\").trim_end_matches('\\').to_lowercase())
+    #[cfg(windows)]
+    { Some(path.to_string_lossy().replace('/', "\\").trim_end_matches('\\').to_lowercase()) }
+    #[cfg(unix)]
+    { Some(path.to_string_lossy().replace('\\', "/").trim_end_matches('/').to_lowercase()) }
 }
 
 fn path_under(target: &str, root: &str) -> bool {
-    target.len() > root.len() && target.starts_with(root) && target.as_bytes()[root.len()] == b'\\'
+    #[cfg(windows)]
+    { target.len() > root.len() && target.starts_with(root) && target.as_bytes()[root.len()] == b'\\' }
+    #[cfg(unix)]
+    { target.len() > root.len() && target.starts_with(root) && target.as_bytes()[root.len()] == b'/' }
 }
 
 /// Whether `root` holds `path`. A local path is resolved, so a junction inside the folder cannot reach
@@ -72,9 +268,34 @@ fn within(root: &Path, path: &Path) -> bool {
 }
 
 fn normalised(path: &Path) -> Option<String> {
+    // The engine names files with Windows separators on every platform, and the page sends those names
+    // back unchanged. On Unix a backslash is an ordinary byte, so without this conversion the whole
+    // path is one long file name and every clip the page names is refused. It is the same rule the
+    // path shim applies at the syscall boundary (src/linux/pathshim.c).
+    #[cfg(unix)]
+    let path = &native(&path.to_string_lossy());
     if path.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
         return None; // no walking out with ".."
     }
+    #[cfg(unix)]
+    {
+        if !path.is_absolute() {
+            return None;
+        }
+        let mut existing = path.to_path_buf();
+        let mut rest = Vec::new();
+        while !existing.exists() {
+            rest.push(existing.file_name()?.to_os_string());
+            existing = existing.parent()?.to_path_buf();
+        }
+        let mut resolved = std::fs::canonicalize(&existing).ok()?;
+        for part in rest.iter().rev() {
+            resolved.push(part);
+        }
+        return Some(resolved.to_string_lossy().to_lowercase());
+    }
+    #[cfg(windows)]
+    {
     // Only a local drive path is a library file. `\\host\share` is not: calling `exists()` on it makes
     // Windows connect to that host (and offer the user's NTLM hash to it) before any allow-check.
     let mut drive = false;
@@ -106,6 +327,7 @@ fn normalised(path: &Path) -> Option<String> {
         resolved.push(part);
     }
     Some(resolved.to_string_lossy().to_lowercase())
+    }
 }
 
 /// Files the user dropped on the editor: allowed for reading even outside the BuffrX folders, because
@@ -175,6 +397,13 @@ pub fn percent_decode(s: &str) -> String {
 /// with a sharing violation against a handle that may write. The engine refuses the same files
 /// (`still_being_written`); the editor used to serve a recording that was still being written, and
 /// the page then played a moov-less MP4 or hung at its end.
+#[cfg(unix)]
+fn still_being_written(_path: &Path) -> bool {
+    // POSIX has no share-mode open. A recording is served as it grows; its fragmented MP4 index is
+    // written as it goes, so the page can read what exists.
+    false
+}
+
 #[cfg(windows)]
 fn still_being_written(path: &Path) -> bool {
     use std::os::windows::fs::OpenOptionsExt;
@@ -200,7 +429,7 @@ pub fn serve(data_root: &Path, request: &tauri::http::Request<Vec<u8>>) -> tauri
         .header("Access-Control-Allow-Origin", "*")
         .body(Vec::new()).unwrap();
     let raw = request.uri().path().trim_start_matches('/');
-    let path = PathBuf::from(percent_decode(raw).replace('/', "\\"));
+    let path = native(&percent_decode(raw));
     if !is_allowed_to_read(data_root, &path) {
         return respond(403);
     }
@@ -386,11 +615,13 @@ pub fn run(data_root: &Path, exports: &Exports, args: Vec<String>, id: Option<St
 
 /// A path in the allowed folders that does not exist yet: `name.mp4`, else `name-2.mp4`, `name-3.mp4`…
 pub fn unique_path(data_root: &Path, path: &Path) -> Result<PathBuf, String> {
-    if !is_allowed(data_root, path) {
+    // The check below answers engine-shaped paths, but `exists` and `parent` need the host's separator.
+    let path = native(&path.to_string_lossy());
+    if !is_allowed(data_root, &path) {
         return Err("that file is outside the BuffrX folders".into());
     }
     if !path.exists() {
-        return Ok(path.to_path_buf());
+        return Ok(path);
     }
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("edit");
     let ext = path.extension().and_then(|e| e.to_str()).map(|e| format!(".{e}")).unwrap_or_default();
@@ -747,7 +978,7 @@ pub fn start_export(app: AppHandle, data_root: &Path, exports: Arc<Exports>, job
     if !is_allowed(data_root, Path::new(&output)) {
         return Err("that file is outside the BuffrX folders".into());
     }
-    if let Some(parent) = Path::new(&output).parent() {
+    if let Some(parent) = native(&output).parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     let id = {
@@ -829,11 +1060,11 @@ pub fn preview_proxy(
     height: u32,
     sar: f64,
 ) -> Result<Value, String> {
-    let source = Path::new(input);
-    if !is_allowed_to_read(data_root, source) {
+    let source = native(input);
+    if !is_allowed_to_read(data_root, &source) {
         return Err("that file is outside the BuffrX folders".into());
     }
-    let metadata = std::fs::metadata(source).map_err(|e| e.to_string())?;
+    let metadata = std::fs::metadata(&source).map_err(|e| e.to_string())?;
     if !metadata.is_file() || metadata.len() == 0 {
         return Err("the file is empty".into());
     }
@@ -926,7 +1157,7 @@ fn prune_preview_cache(directory: &Path, keep: &Path) {
 /// A replace that was cancelled between the two renames leaves the original at `<output>.old-<engine pid>`
 /// and no output. Put the original back; with a new output already in place, the old one is let go.
 fn restore_cancelled_replace(output: &str, engine_pid: u32) {
-    let base = Path::new(output);
+    let base = native(output);
     // shortcut: a stale lower-numbered aside (a reused pid) makes the choice below restore the wrong
     // file; the engine would have to report its aside name to tell them apart.
     for n in 0..100 {
@@ -935,7 +1166,7 @@ fn restore_cancelled_replace(output: &str, engine_pid: u32) {
         } else {
             format!("{output}.old-{engine_pid}-{n}")
         };
-        let aside = Path::new(&name);
+        let aside = native(&name);
         if !aside.exists() {
             // The engine takes the first free name, so the lowest one on disk is the one this job set
             // aside.
@@ -957,9 +1188,10 @@ pub fn cancel_export(exports: &Exports, id: u64) {
         let _ = child.kill();
         let _ = child.wait();
         restore_cancelled_replace(&output, engine_pid);
-        let _ = std::fs::remove_file(format!("{output}.part"));
-        if let Some(ext) = Path::new(&output).extension().and_then(|e| e.to_str()) {
-            let _ = std::fs::remove_file(format!("{output}.part.{ext}"));
+        let native_output = native(&output);
+        let _ = std::fs::remove_file(format!("{}.part", native_output.display()));
+        if let Some(ext) = native_output.extension().and_then(|e| e.to_str()) {
+            let _ = std::fs::remove_file(format!("{}.part.{ext}", native_output.display()));
         }
     }
 }
