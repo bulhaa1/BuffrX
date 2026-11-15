@@ -75,9 +75,12 @@ bool checkbox(const char* id, bool on, bool disabled = false);
 bool segmented(const char* id, const std::vector<std::string>& labels, int& selected, float cell = 0.0f, float height = 28.0f,
                ImFont* font = nullptr, float padding = 12.0f, const std::vector<std::string>& hints = {});
 // `right`: a right-aligned second column per row, for a count beside a name.
+// `unavailable`: one flag per label; a flagged row is drawn grey and cannot be pressed, clicked or reached with the keys.
+// `fit_choices`: false keeps an explicit field width, for related fields that should match.
 bool select(const char* id, const std::vector<std::string>& labels, int& selected, float width = 220,
             bool disabled = false, const std::vector<std::string>& hints = {}, bool strong = false,
-            const std::vector<std::string>& right = {}, bool compact_rows = false);
+            const std::vector<std::string>& right = {}, bool compact_rows = false,
+            const std::vector<bool>& unavailable = {}, bool fit_choices = true);
 // Keycaps for a chord; clickable ones rebind it.
 bool chord_button(const char* id, const std::string& chord, const std::string& tip, bool clickable = true,
                   float height = 20, bool on_accent = false);

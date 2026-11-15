@@ -63,7 +63,7 @@ try {
         '-DCMAKE_SYSTEM_NAME=Windows' "-DCMAKE_MAKE_PROGRAM=$($tools.ninja)" "-DCMAKE_CXX_COMPILER=$($tools.clangxx)"
     }
     Invoke-Check 'build native logic tests' {
-      & $tools.cmake --build $build --parallel 2 --target buffrx-tests
+      & $tools.cmake --build $build --parallel 2 --target buffrx-tests buffrx-display-tests buffrx-ui-present-tests buffrx-canvas-tests
     }
     $previousData = $env:BUFFRX_DATA_ROOT
     $previousSource = $env:BUFFRX_SOURCE_DIR

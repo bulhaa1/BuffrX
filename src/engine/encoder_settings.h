@@ -27,31 +27,57 @@ struct EncoderSetting {
   Json value;
 };
 
-// The tier's family-correct defaults. Only quality-shaping keys live here; rate control and the
-// keyframe interval are applied by the host because they depend on the buffer budget.
-std::vector<EncoderSetting> encoder_tier_defaults(EncoderFamily family, const std::string& tier, const Config& config);
+// Facts about this machine's encoders that change a tier's table. The host reads them from libobs; the tests pass them in.
+// Switched on when an AMD compatibility report and swap test prove HQVBR, pre-analysis and AV1 highQuality (plan 009, phase 7).
+inline constexpr bool kAmfQualityExtrasProven = false;
+struct EncoderTraits {
+  // NVENC older than Ada (GTX 10/16, RTX 20/30): no NVENC AV1 encoder is registered (obs-nvenc registers AV1 only when the
+  // driver's own probe says the GPU supports it). Ada and Blackwell keep the measured table.
+  bool nvenc_pre_ada = false;
+  bool amf_quality_extras = kAmfQualityExtrasProven;
+};
+
+// The tier's family-correct defaults. Only quality-shaping keys live here; the rate's size and the keyframe interval are
+// applied by the host because they depend on the buffer budget. The frame-rate band is read from config.capture_fps.
+std::vector<EncoderSetting> encoder_tier_defaults(EncoderFamily family, const std::string& tier, const Config& config,
+                                                  const EncoderTraits& traits = EncoderTraits());
 
 // The speed tier ("performance", "balanced", "quality") an encoder mode runs: Fast, Balanced and Quality are the
 // tiers themselves whatever the quality level; Auto and Custom follow the level (quality_speed_tier).
 const char* encoder_mode_tier(const std::string& mode, const std::string& quality);
 bool encoder_mode_is_known(const std::string& mode);
 
-// What the governor (encoder_governor.h) asks of an encoder at `step` (0 asks for nothing, past the last
-// step is the last), as settings that replace whatever the level and the user chose for them: the speed
-// knobs only - preset, tuning, multipass, look-ahead, B-frames - never the rate or the quality.
+// What the controller's effort levels (encoder_controller.h) ask of an encoder at `step` (0 asks for nothing, past the last
+// step is the last): the speed knobs only - preset, tuning, multipass, look-ahead, B-frames, pre-analysis -
+// never the rate or the quality. apply_governor_relief decides which of them actually replace a setting.
 std::vector<EncoderSetting> governor_overrides(EncoderFamily family, int step);
 // Puts `overrides` over `settings`: a name in both takes the override, the rest is left alone.
 void apply_encoder_overrides(std::vector<EncoderSetting>& settings, const std::vector<EncoderSetting>& overrides);
+// Speed on the family's own scale: a larger rank is heavier (NVENC p1..p7, AMF speed..highQuality, QSV TU7..TU1,
+// x264 ultrafast..placebo, NVENC multipass disabled..fullres). -1 for a value the family does not name.
+int encoder_speed_rank(EncoderFamily family, const std::string& name, const std::string& value);
+// Relief, applied last in every mode: the governor's step over the settings a mode and the user produced. A speed
+// setting is replaced only by a lighter one, so a choice already faster than the step is kept; a value the family
+// does not name is kept as it is. Booleans and bf take the light value the step names. Never changes stored options.
+void apply_governor_relief(std::vector<EncoderSetting>& settings, EncoderFamily family, int step);
 
 // Explicit options win over the defaults, in the order they arrive. A null value removes the default
 // so "unset" is expressible; any other value replaces it in place, or appends when new.
 std::vector<EncoderSetting> merge_encoder_settings(std::vector<EncoderSetting> defaults, const Json& options);
 
 // The same quality, explicit options and governor layers used to build an encoder, without building one.
-std::vector<EncoderSetting> configured_encoder_settings(EncoderFamily family, const Config& config, int governor_step);
+std::vector<EncoderSetting> configured_encoder_settings(EncoderFamily family, const Config& config, int governor_step,
+                                                        const EncoderTraits& traits = EncoderTraits());
 
 // The value a key holds, or Null when the list does not carry it.
 Json encoder_setting_value(const std::vector<EncoderSetting>& settings, const std::string& name);
+
+// The encoder_options a row edit saves (the Advanced page's snapshot). Every stored option stays as it is, a null or an
+// unknown name included. A row in `keys` that is not stored yet takes its value from `requested` (the engine's `base`:
+// the person's own choice, relief left out) when that object carries it, so the edit keeps what the page showed. Then
+// `name` takes `value`. Running values never reach this: they carry the governor's relief.
+Json encoder_options_after_edit(const Json& stored, const Json& requested, const std::vector<std::string>& keys,
+                                const std::string& name, const Json& value);
 
 // How much video a configuration should be encoded at, in kbps.
 //

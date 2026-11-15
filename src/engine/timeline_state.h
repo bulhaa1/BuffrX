@@ -54,6 +54,19 @@ inline TimelineState timeline_next_state(const TimelineFacts& facts) {
 
 inline bool timeline_writes(TimelineState state) { return state == TimelineState::Writing; }
 
+// The stream layout a Timeline segment is written in: what a save's stream copy must find the same on both sides of a seam
+// (media_math.h's StreamSignature). Neither the effort an encoder runs at (an effort swap keeps the stream's header) nor the
+// frame rate (a save rescales across it, as a replay save does) is in it.
+inline std::string timeline_layout_key(const std::string& encoder, int width, int height, int audio_tracks) {
+  return encoder + "|" + std::to_string(width) + "x" + std::to_string(height) + "|" + std::to_string(audio_tracks);
+}
+
+// The epoch a segment opened in `layout` belongs to: the same one while the layout holds (a pause, a rotation, an effort swap),
+// the next one when it changed. A session's first segment has no layout before it and keeps the epoch it has.
+inline uint32_t next_timeline_epoch(uint32_t epoch, const std::string& previous_layout, const std::string& layout) {
+  return !previous_layout.empty() && previous_layout != layout ? epoch + 1 : epoch;
+}
+
 // The wall time between two ticks, in milliseconds. Unsigned arithmetic, so the tick clock's wrap every
 // 49.7 days gives the interval that really passed rather than a number near four billion.
 inline uint32_t timeline_gap_ms(uint32_t last_write_ms, uint32_t now_ms) {

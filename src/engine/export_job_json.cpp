@@ -35,6 +35,7 @@ bool export_job_from_json(const Json& spec, ExportJob& job, std::string& error) 
     return false;
   }
   job.replace_original = spec["replace_original"].as_bool(false);
+  job.fail_if_exists = spec["fail_if_exists"].as_bool(false);
   job.start = spec["start"].as_double(0.0);
   job.end = spec["end"].as_double(0.0);
   job.crop_x = static_cast<int>(spec["crop_x"].as_int(0));

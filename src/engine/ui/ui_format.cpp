@@ -10,6 +10,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <iterator>
 #include <string>
 #include <vector>
 #include <ctime>
@@ -310,6 +311,9 @@ StatusLine status_line(const Json& status, bool connected) {
   } else if (state == "stopping") {
     line.tone = Tone::busy;
     line.text = "Stopping the buffer\xE2\x80\xA6";
+  } else if (status["game_wait"].as_bool()) {
+    line.tone = Tone::idle;
+    line.text = "Waiting for a game";
   } else {
     line.tone = Tone::idle;
     line.text = "Buffer paused";
@@ -382,16 +386,31 @@ ChordCapture capture_chord(bool ctrl, bool alt, bool shift, bool win, unsigned v
   if (shift) modifiers |= MOD_SHIFT;
   if (win) modifiers |= MOD_WIN;
   capture.chord = format_chord(modifiers, virtual_key);
+  capture.lone_key = modifiers == 0;
   // Three parts at most: Ctrl, Alt and the key. A fourth modifier turns a hotkey into a contortion.
   const int parts = 1 + (ctrl ? 1 : 0) + (alt ? 1 : 0) + (shift ? 1 : 0) + (win ? 1 : 0);
   if (capture.chord.find('?') != std::string::npos) {
     capture.problem = "That key cannot be a hotkey";
   } else if (parts > 3) {
     capture.problem = "Up to 3 keys: Ctrl, Alt and the key";
-  } else if (modifiers == 0 && (virtual_key < VK_F13 || virtual_key > VK_F24)) {
-    capture.problem = "Add Ctrl, Alt or Shift, so it never fires while you type";
+  } else if (modifiers == 0 && !lone_key_allowed(virtual_key)) {
+    capture.problem = "Add Ctrl, Alt or Shift";
   }
   return capture;
+}
+
+std::string lone_key_warning(unsigned virtual_key) {
+  // One short line on what this key costs. Every lone key fires in every app, so that part is the lead; the rest
+  // is only what this kind of key takes with it.
+  switch (lone_key_kind(virtual_key)) {
+    case LoneKeyKind::function: return "Works in every app. Some games use F-keys.";
+    case LoneKeyKind::idle: return "Works in every app, games too.";
+    case LoneKeyKind::insert: return "Works in every app. Insert stops toggling overwrite.";
+    case LoneKeyKind::editing: return "Works in every app. This key stops editing text.";
+    case LoneKeyKind::keypad: return "Works in every app. This keypad key stops typing.";
+    case LoneKeyKind::character: return "Works in every app. You can no longer type this character.";
+    default: return "";
+  }
 }
 
 std::vector<int> limit_chips(int current_seconds) { return with_current({30, 60, 120, 300}, current_seconds); }
@@ -521,6 +540,35 @@ std::string record_hint(bool manual_active) {
 
 std::vector<int> share_limit_choices() { return {20, 50, 100, 500}; }
 
-std::vector<int> quick_clip_choices() { return {10, 15, 20, 30, 45, 60, 90}; }
+std::vector<int> quick_clip_choices() {
+  return std::vector<int>(std::begin(kQuickClipChoices), std::end(kQuickClipChoices));
+}
+
+QuickClipRow quick_clip_row(int quick_clip_seconds, int buffer_seconds) {
+  QuickClipRow row;
+  row.values = quick_clip_choices();
+  // A quick clip never asks for more than the buffer can keep. A length that is no longer valid falls to the closest
+  // listed length at or below the buffer; with none, nothing is chosen and every preset is greyed. No length outside
+  // the list is ever invented.
+  const int seconds = quick_clip_for_buffer(quick_clip_seconds, buffer_seconds);
+  for (int value : row.values) row.unavailable.push_back(value >= buffer_seconds);
+  row.selected = -1;
+  for (size_t i = 0; i < row.values.size(); ++i) {
+    if (row.values[i] == seconds) row.selected = static_cast<int>(i);
+  }
+  return row;
+}
+
+QuickClipPress quick_clip_press(int quick_clip_seconds, int buffer_seconds) {
+  QuickClipPress press;
+  press.seconds = quick_clip_for_buffer(quick_clip_seconds, buffer_seconds);
+  if (press.seconds <= 0) {
+    // 0 is not a length to save: the engine reads it as the whole buffer. Say why, and name the action that does keep
+    // everything on purpose.
+    press.refusal = "The buffer must be longer than " + std::to_string(kQuickClipChoices[0]) +
+                    " seconds for a quick clip. Use Save clip to keep the whole buffer.";
+  }
+  return press;
+}
 
 }  // namespace bx::ui

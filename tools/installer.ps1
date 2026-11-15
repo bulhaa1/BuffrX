@@ -1,6 +1,6 @@
 # Builds BuffrX-Setup.exe (Inno Setup 6) from dist\BuffrX-<version>, and the portable zip beside it.
 #
-#   powershell -File tools/installer.ps1 -Version 0.5.0
+#   powershell -File tools/installer.ps1 -Version 0.6.0
 #
 # Inno Setup is pinned and staged into work/toolchain like every other build tool. Nothing here touches
 # the machine outside the repository.
@@ -10,7 +10,7 @@
 # sake; trim from package.ps1 instead.
 
 param(
-  [string]$Version = '0.5.0',
+  [string]$Version = '0.6.0',
   [string]$OutDir = 'dist',
   [switch]$NoZip
 )

@@ -18,6 +18,10 @@
 
 namespace bx::ui {
 
+inline ImGuiContext* g_wheel_owner_context = nullptr;
+inline ImVec2 g_wheel_owner_min, g_wheel_owner_max;
+inline uint32_t g_wheel_owner_frame = 0;
+
 namespace anim_detail {
 // The motion maps are keyed by the ImGui context that drew the value: its address in the high 32 bits, the item's id
 // low. A window's context is destroyed with it and the next window may be given the same address, so its entries are
@@ -184,6 +188,10 @@ inline std::unordered_map<ImGuiID, Arrivals>& arrival_scopes() {
 // Safe with nullptr (no entry belongs to it).
 inline void anim_purge_context(ImGuiContext* context) {
   if (!context) return;
+  if (g_wheel_owner_context == context) {
+    g_wheel_owner_context = nullptr;
+    g_wheel_owner_frame = 0;
+  }
   const uint64_t owner = anim_detail::context_key(context);
   const auto drop = [owner](auto& slots) {
     for (auto it = slots.begin(); it != slots.end();)
@@ -344,6 +352,38 @@ inline void fade_since(ImDrawList* draw, int first_vertex, float alpha) {
   }
 }
 
+// True when the pointer is over a scrolling list inside this window (the app picker's own list): the wheel
+// belongs to that list, and the window around it must not glide as well - not even when the list has reached
+// its end, because moving the page under the pointer is exactly what a list end must not do.
+//
+// A list announces itself for the next frame (`wheel_owner_rect`) rather than being found by walking ImGui's
+// hovered window: a child inside an AutoResizeY body is not always the window ImGui reports, and the rule
+// here must not depend on a walk that a layout change can alter.
+inline void wheel_owner_rect(ImVec2 min, ImVec2 max) {
+  g_wheel_owner_context = ImGui::GetCurrentContext();
+  g_wheel_owner_min = min;
+  g_wheel_owner_max = max;
+  g_wheel_owner_frame = ImGui::GetFrameCount();
+}
+
+inline bool wheel_owned_by_child() {
+  const uint32_t frame = ImGui::GetFrameCount();
+  if (g_wheel_owner_context == ImGui::GetCurrentContext() && g_wheel_owner_frame != 0 &&
+      frame - g_wheel_owner_frame <= 2) {
+    const ImVec2 mouse = ImGui::GetIO().MousePos;
+    if (mouse.x >= g_wheel_owner_min.x && mouse.x < g_wheel_owner_max.x && mouse.y >= g_wheel_owner_min.y &&
+        mouse.y < g_wheel_owner_max.y) {
+      return true;
+    }
+  }
+  ImGuiContext& g = *ImGui::GetCurrentContext();
+  const ImGuiWindow* self = g.CurrentWindow;
+  for (ImGuiWindow* window = g.HoveredWindow; window && window != self; window = window->ParentWindow) {
+    if (window->ScrollMax.y > 0.0f) return true;
+  }
+  return false;
+}
+
 // Wheel scrolling that glides: call right after BeginChild of a list that has ImGuiWindowFlags_NoScrollWithMouse (the wheel
 // is read here instead). `step` is the distance of one wheel notch in pixels. A scroll set by anything else (the scroll bar, a
 // key, scroll_to) is followed, not fought. `wheel` false: a list inside this one has the wheel, and this one only glides.
@@ -359,7 +399,8 @@ inline void smooth_scroll(float step, bool wheel = true, float rate = kRateScrol
   if (std::fabs(current - last) > 0.5f) target = position = current;  // moved by someone else
   const ImGuiIO& io = ImGui::GetIO();
   bool precise = false;
-  if (wheel && io.MouseWheel != 0.0f && ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows)) {
+  if (wheel && io.MouseWheel != 0.0f && !wheel_owned_by_child() &&
+      ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows)) {
     target = std::clamp(target - io.MouseWheel * step, 0.0f, ImGui::GetScrollMaxY());
     // J1: a precision touchpad reports small deltas (a notch is 1.0): those move the list 1:1, with no glide on top of the finger's own.
     precise = std::fabs(io.MouseWheel) < 0.99f;

@@ -1,4 +1,4 @@
-﻿// BuffrX engine tests: the pure logic that has no GPU, no libobs and no window in it.
+// BuffrX engine tests: the pure logic that has no GPU, no libobs and no window in it.
 //
 // These are regression guards for behaviour that already exists and has been verified on hardware
 // (see ISSUES.md). They are deliberately not described as TDD: the code came first, so a passing run
@@ -51,13 +51,21 @@ static std::string source_root() {
 #include "../src/shared/files.h"
 #include "../src/engine/benchmark.h"
 #include "../src/engine/audio_meter.h"
+#include "../src/engine/audio_health.h"
+#include "../src/engine/audio_layout.h"
+#include "../src/engine/audio_routing.h"
 #include "../src/engine/buffer_watch.h"
 #include "../src/engine/encoder_watch.h"
-#include "../src/engine/encoder_governor.h"
+#include "../src/engine/driver_fault.h"
+#include "../src/engine/encoder_ladder.h"
+#include "../src/engine/hook_memory.h"
+#include "../src/engine/encoder_choice.h"
+#include "../src/engine/encoder_controller.h"
 #include "../src/engine/capacity_memory.h"
 #include "../src/engine/dir_listing.h"
 #include "../src/engine/file_final.h"
 #include "../src/engine/gamepad.h"
+#include "../src/engine/game_only.h"
 #include "../src/engine/idle_policy.h"
 #include "../src/engine/link_idle.h"
 #include "../src/engine/link.h"
@@ -92,6 +100,7 @@ static std::string source_root() {
 #include "../src/engine/display_target.h"
 #include "../src/engine/encoder_choice.h"
 #include "../src/engine/encoder_settings.h"
+#include "../src/engine/compat_report.h"
 #include "../src/engine/gpu.h"
 #include "../src/engine/work_queue.h"
 #include "../src/engine/library.h"
@@ -134,6 +143,7 @@ static std::string source_root() {
 #include "../src/engine/ui/ui_link_math.h"
 #include "../src/engine/ui/ui_live_math.h"
 #include "../src/engine/ui/ui_window_math.h"
+#include "../src/engine/ui/ui_display_math.h"
 #include "../src/engine/ui/ui_pad_nav.h"
 #include "../src/shared/json.h"
 #include "../src/shared/log.h"
@@ -396,6 +406,52 @@ void test_config() {
   check(round_tripped.recordings_dir == "D:\\Recordings", "the recordings folder survives");
   check(round_tripped.encoder_options["preset"].as_string() == "p1", "an explicit encoder option survives");
   check(round_tripped.muxer_settings == "movflags=+faststart", "custom muxer settings survive");
+
+  // A quick clip is a save from the same ring, so it never exceeds the buffer and is always one of the offered lengths.
+  // A buffer that shrinks brings the stored value to the closest length it can keep, once, at the same place every
+  // writer goes through, so the row, the tray menu and the hotkey cannot disagree.
+  bx::Json shrunk = bx::config_to_json(config);
+  shrunk.set("buffer_seconds", bx::Json(120));
+  shrunk.set("quick_clip_seconds", bx::Json(90));
+  bx::Config roomy;
+  bx::config_from_json(shrunk, roomy);
+  check(roomy.quick_clip_seconds == 90, "90 s is inside a 120 s buffer");
+  shrunk.set("buffer_seconds", bx::Json(60));
+  bx::Config tighter;
+  bx::config_from_json(shrunk, tighter);
+  check(tighter.quick_clip_seconds == 45, "a 60 s buffer brings a 90 s quick clip to 45, the longest one shorter than the buffer");
+  shrunk.set("buffer_seconds", bx::Json(30));
+  bx::Config tight;
+  bx::config_from_json(shrunk, tight);
+  check(tight.quick_clip_seconds == 20, "a 30 s buffer falls back to 20: a quick clip is shorter than the buffer");
+  shrunk.set("quick_clip_seconds", bx::Json(30));
+  shrunk.set("buffer_seconds", bx::Json(30));
+  bx::Config equal;
+  bx::config_from_json(shrunk, equal);
+  check(equal.quick_clip_seconds == 20, "a quick clip equal to the buffer is not kept: it falls to the next shorter length");
+  shrunk.set("quick_clip_seconds", bx::Json(75));
+  shrunk.set("buffer_seconds", bx::Json(120));
+  bx::Config unlisted;
+  bx::config_from_json(shrunk, unlisted);
+  check(unlisted.quick_clip_seconds == 90, "a length outside the list becomes the closest listed length the buffer can keep");
+  shrunk.set("quick_clip_seconds", bx::Json(20));
+  shrunk.set("buffer_seconds", bx::Json(10));
+  bx::Config shorter;
+  bx::config_from_json(shrunk, shorter);
+  check(shorter.quick_clip_seconds == 0, "a 10 s buffer has no quick clip: no preset is shorter");
+  shrunk.set("buffer_seconds", bx::Json(5));
+  bx::Config shortest;
+  bx::config_from_json(shrunk, shortest);
+  check(shortest.quick_clip_seconds == 0, "a buffer shorter than every preset has no quick clip, not 4 s");
+  // The 5 s buffer stored 0. Growing the buffer again must choose a listed length by itself: a patch is applied to
+  // the live config, so the value that comes back is the 0 the short buffer left, not the 20 typed before it.
+  bx::Config regrown = shortest;
+  regrown.buffer_seconds = 60;
+  bx::config_from_json(bx::Json::object(), regrown);
+  check(regrown.quick_clip_seconds == 45, "a buffer grown back to 60 chooses 45 again, never staying at 0");
+  regrown.buffer_seconds = 30;
+  bx::config_from_json(bx::Json::object(), regrown);
+  check(regrown.quick_clip_seconds == 20, "a buffer grown back to 30 chooses 20 again");
 
   // The pipe's config.set is the second writer of the audio fields. It parses the same names as a stored
   // file and holds them to the same floor and ceiling (config_apply_audio), so neither writer can drift.
@@ -710,6 +766,1005 @@ void test_config_change_bits() {
   check(bx::config_change_bits(before, after) == 0, "a notification switch rebuilds nothing");
 }
 
+// A save must never lose the automatic audio preferences, whatever the file's age: the engine writes its
+// config at startup (the first-start codec pick does exactly that) and on every change, so a program's
+// gain, mute, pin and exclude, the Other group's level and mute, and every unrelated key have to come back
+// after a load and a save. A file Windows will not let the engine replace still loads them and stays as it
+// was: a refused save is not a reset.
+void test_audio_prefs_persistence() {
+  std::printf("audio prefs persistence\n");
+  const std::string path = temp_directory() + "\\config-audio-prefs.json";
+  CreateDirectoryA(temp_directory().c_str(), nullptr);
+
+  bx::Config config;
+  bx::AutoAudioPref discord;
+  discord.volume = 0.35;
+  discord.muted = true;
+  bx::AutoAudioPref game;
+  game.volume = 0.5;
+  game.excluded = true;
+  bx::AutoAudioPref spotify;
+  spotify.volume = 0.3;
+  config.audio_app_prefs["discord.exe"] = discord;
+  config.audio_app_prefs["game.exe"] = game;
+  config.audio_app_prefs["spotify.exe"] = spotify;
+  config.audio_other_volume = 0.45;
+  config.audio_other_muted = true;
+  config.desktop_volume = 0.42;
+  config.mic_volume = 0.8;
+  config.buffer_seconds = 120;
+  config.theme = "clutch";
+  config.hotkey_save = "Ctrl+Shift+S";
+  std::string error;
+  check(bx::save_config(path, config, error), "a config with prefs saves");
+
+  bx::Config loaded;
+  check(bx::load_config(path, loaded, error), "a config with prefs reloads");
+  check(loaded.audio_app_prefs == config.audio_app_prefs, "every gain, mute and exclude reads back");
+  check(loaded.audio_other_volume == 0.45 && loaded.audio_other_muted, "the Other group's level and mute read back");
+  check(loaded.desktop_volume == 0.42 && loaded.mic_volume == 0.8 && loaded.buffer_seconds == 120 &&
+            loaded.theme == "clutch" && loaded.hotkey_save == "Ctrl+Shift+S",
+        "the keys the prefs were never asked about read back too");
+  check(loaded.config_version == bx::Config::kConfigVersion, "a saved file is the current config version");
+
+  // The startup write: what was loaded is saved again, and the same prefs come back.
+  check(bx::save_config(path, loaded, error), "the loaded settings save again, as the startup codec pick does");
+  bx::Config again;
+  check(bx::load_config(path, again, error), "the rewritten config reloads");
+  check(again.audio_app_prefs == config.audio_app_prefs, "prefs survive a load and a save at startup");
+  check(again.audio_other_volume == 0.45 && again.audio_other_muted && again.desktop_volume == 0.42 &&
+            again.buffer_seconds == 120 && again.theme == "clutch" && again.hotkey_save == "Ctrl+Shift+S",
+        "the group settings and unrelated keys survive the startup save");
+
+  // Read-only: the file the person has loads as it is, and the refused write changes nothing.
+  SetFileAttributesA(path.c_str(), FILE_ATTRIBUTE_READONLY);
+  auto bytes_of = [](const std::string& file) {
+    std::string text;
+    if (FILE* handle = std::fopen(file.c_str(), "rb")) {
+      char buffer[4096];
+      size_t read = 0;
+      while ((read = std::fread(buffer, 1, sizeof(buffer), handle)) > 0) text.append(buffer, read);
+      std::fclose(handle);
+    }
+    return text;
+  };
+  const std::string before = bytes_of(path);
+  bx::Config from_readonly;
+  check(bx::load_config(path, from_readonly, error), "the exact same file loads when it cannot be written");
+  check(from_readonly.audio_app_prefs == config.audio_app_prefs, "a read-only config loads its prefs");
+  bx::Config refused = from_readonly;
+  refused.audio_app_prefs.clear();
+  check(!bx::save_config(path, refused, error), "a read-only config refuses the write");
+  check(bytes_of(path) == before, "the refused write leaves the file exactly as it was");
+  bx::Config still_there;
+  check(bx::load_config(path, still_there, error) && still_there.audio_app_prefs == config.audio_app_prefs,
+        "the same file still loads its prefs after the refused write");
+  SetFileAttributesA(path.c_str(), FILE_ATTRIBUTE_NORMAL);
+
+  // A file written before automatic capture: the migration keeps the prefs it already carries and seeds
+  // only the programs its old routes list.
+  const std::string old_path = temp_directory() + "\\config-audio-prefs-old.json";
+  bx::Json old_file = bx::config_to_json(config);
+  old_file.set("config_version", bx::Json(11));
+  old_file.set("audio_capture_mode", bx::Json("apps"));
+  old_file.set("audio_capture_legacy_mode", bx::Json(""));
+  bx::Json routes = bx::Json::array();
+  bx::Json route = bx::Json::object();
+  route.set("window", bx::Json("Discord:Chrome_WidgetWin_1:Discord.exe"));
+  route.set("exe", bx::Json("Discord.exe"));
+  route.set("title", bx::Json("Discord"));
+  route.set("track", bx::Json(2));
+  routes.push(route);
+  old_file.set("audio_apps", routes);
+  bx::Json old_prefs = bx::Json::object();
+  bx::Json teams = bx::Json::object();
+  teams.set("volume", bx::Json(0.6));
+  teams.set("muted", bx::Json(true));
+  old_prefs.set("teams.exe", teams);
+  old_file.set("audio_app_prefs", old_prefs);
+  check(bx::write_file_atomic(old_path, old_file.dump()), "a version 11 config is written");
+  bx::Config migrated;
+  check(bx::load_config(old_path, migrated, error), "a version 11 config loads");
+  check(migrated.config_version == bx::Config::kConfigVersion && migrated.audio_capture_mode == "auto" &&
+            migrated.audio_capture_legacy_mode == "apps",
+        "a version 11 file moves to automatic capture and keeps the mode it recorded with");
+  check(migrated.audio_app_prefs["teams.exe"].volume == 0.6 && migrated.audio_app_prefs["teams.exe"].muted,
+        "the prefs the file already carried are kept by the migration");
+  check(migrated.audio_app_prefs["discord.exe"].volume == 1.0, "a route with no saved preference seeds one");
+  check(migrated.audio_app_prefs["teams.exe"].volume == 0.6 && migrated.audio_app_prefs["teams.exe"].muted,
+        "a preference the file already carried is never overwritten by a route");
+  check(bx::save_config(old_path, migrated, error), "the migrated config saves");
+  bx::Config migrated_again;
+  check(bx::load_config(old_path, migrated_again, error) &&
+            migrated_again.audio_app_prefs == migrated.audio_app_prefs,
+        "the migrated prefs survive the save that follows the migration");
+}
+
+// Application audio and the mixer plan (audio_routing.h): four slots on fixed tracks, the Current game
+// slot, the labels a multitrack file carries, legacy files, and the migration of an existing config.
+void test_audio_routing() {
+  std::printf("audio routing\n");
+  bx::AudioApp discord;
+  discord.window = "Discord:Chrome_WidgetWin_1:Discord.exe";
+  discord.exe = "Discord.exe";
+  discord.title = "Discord";
+  bx::AudioApp game;
+  game.window = "Counter-Strike 2:SDL_app:cs2.exe";
+  game.exe = "cs2.exe";
+  game.title = "Counter-Strike 2";
+  bx::AudioApp current;
+  current.kind = bx::kAudioGameKind;
+  current.title = "Current game";
+
+  // Duplicates by executable, an entry with no window and a second game slot would each build something
+  // nobody reads or capture one program twice. A file may hold more than four slots; it is read whole.
+  std::vector<bx::AudioApp> raw{discord, game, discord};
+  raw.push_back(bx::AudioApp{"x", "cs2.exe", "second cs2", "", 5});
+  raw.push_back(bx::AudioApp{"", "ghost.exe", "", "", 2});
+  raw.push_back(current);
+  raw.push_back(current);
+  const std::vector<bx::AudioApp> normalized = bx::normalize_audio_apps(raw);
+  check(normalized.size() == 3, "a duplicate executable, a route without a window and a second game slot are dropped");
+  check(bx::audio_app_is_game(normalized[2]), "the Current game slot is kept as one entry");
+  std::vector<bx::AudioApp> many;
+  for (int i = 0; i < 20; ++i) many.push_back(bx::AudioApp{"w" + std::to_string(i), "a" + std::to_string(i) + ".exe", "A", "", 2});
+  check(bx::normalize_audio_apps(many).size() == static_cast<size_t>(bx::kAudioAppStoredMax),
+        "a hand-edited file is read up to the stored ceiling, not truncated to the four slots");
+
+  // An existing config: the desktop loopback and the microphone keep exactly the tracks they always had.
+  bx::Config legacy;
+  legacy.separate_tracks = true;
+  legacy.audio_tracks = 3;
+  legacy.mic_enabled = true;
+  const bx::AudioRoutingPlan before = bx::plan_audio_routing(legacy);
+  check(before.track_count == 3 && before.desktop_captured, "an old config keeps its three tracks and the desktop");
+  check(before.desktop_mixers == ((1u << 0) | (1u << 1)), "desktop keeps the mix and track 2");
+  check(before.mic_mixers == ((1u << 0) | (1u << 2)), "the microphone keeps the mix and track 3");
+  check(bx::plan_audio_routing(bx::Config{}).desktop_captured, "a config with no app routes captures the desktop");
+
+  // Four slots: Discord on 3 and the game on 4 by position, each on its own mixer bit, both in the mix, the
+  // desktop loopback off. The stored `track` values are irrelevant: a four-route file's order was 3,4,5,6.
+  bx::Config routed = legacy;
+  routed.audio_capture_mode = "apps";
+  routed.audio_apps = {discord, game};
+  const bx::AudioRoutingPlan plan = bx::plan_audio_routing(routed);
+  check(plan.track_count == 4, "two slots ask for four encoders: mix, microphone and both apps");
+  check(!plan.desktop_captured && plan.desktop_mixers == (1u << 0),
+        "app tracks turn the desktop loopback off instead of recording those apps twice");
+  check(plan.app_mixers.size() == 2 && plan.app_mixers[0] == ((1u << 0) | (1u << 2)) &&
+            plan.app_mixers[1] == ((1u << 0) | (1u << 3)),
+        "each app writes the mix and only the track of its slot");
+  check(plan.mic_mixers == ((1u << 0) | (1u << 1)) && plan.tracks[1].role == "microphone" &&
+            plan.tracks[1].title == "BuffrX Microphone",
+        "with apps separate the microphone takes the free track 2, so 3 and 4 stay independent");
+  check(plan.tracks[0].title == "BuffrX Mix" && plan.tracks[2].title == "BuffrX Discord" &&
+            plan.tracks[3].title == "BuffrX cs2",
+        "each track has a stable label a file can carry");
+  check(plan.tracks[0].sources.size() == 3, "the mix lists the microphone and both apps");
+  bool desktop_in_app_plan = false;
+  for (const std::string& source : plan.tracks[0].sources) desktop_in_app_plan = desktop_in_app_plan || source == "desktop";
+  check(!desktop_in_app_plan, "nothing claims the desktop is in the mix while apps are separate");
+
+  // A four-route file written by the old build: same programs, same order, same tracks 3..6.
+  bx::Config four = routed;
+  four.audio_apps = {discord, game,
+                     bx::AudioApp{"w", "spotify.exe", "Spotify", "", 5},
+                     bx::AudioApp{"w", "chrome.exe", "Chrome", "", 6}};
+  const bx::AudioRoutingPlan four_plan = bx::plan_audio_routing(four);
+  check(four_plan.apps.size() == 4 && four_plan.apps[0].track == 3 && four_plan.apps[3].track == 6 &&
+            four_plan.track_count == 6,
+        "an existing four-route config records the same apps on the same tracks 3..6");
+
+  // Automatic assignment ignores a stored number: the order is the slot, never a hand-edited track.
+  bx::Config reordered = routed;
+  reordered.audio_apps[0].track = 6;
+  reordered.audio_apps[1].track = 3;
+  const bx::AudioRoutingPlan reordered_plan = bx::plan_audio_routing(reordered);
+  check(reordered_plan.apps[0].track == 3 && reordered_plan.apps[1].track == 4,
+        "a slot's track follows its position, not a stored number");
+
+  // Legacy files: entries past the fourth are kept in the file, reported as not recorded and never built.
+  bx::Config over = four;
+  over.audio_apps.push_back(bx::AudioApp{"w", "extra.exe", "Extra", "", 4});
+  over.audio_apps.push_back(bx::AudioApp{"w", "extra2.exe", "Extra 2", "", 5});
+  const bx::AudioRoutingPlan over_plan = bx::plan_audio_routing(over);
+  check(over_plan.apps.size() == 4 && bx::over_limit_audio_apps(over).size() == 2,
+        "a file with more than four slots records four and reports the rest");
+  check(over_plan.track_count == 6, "the extra legacy entries reserve no encoder");
+  check(bx::effective_audio_apps(over).size() == 4 && over.audio_apps.size() == 6,
+        "the plan takes four slots and the stored list keeps every entry");
+
+  // The Current game slot: one slot, on a fixed track, that is never filled with the desktop and whose label
+  // stays generic while the game changes, so a replay that spans two games is still described truthfully.
+  bx::Config with_game = routed;
+  with_game.audio_apps = {discord, current};
+  bx::GameAudioTarget target;
+  target.active = true;
+  target.exe = "cs2.exe";
+  target.window = "Counter-Strike 2:SDL_app:cs2.exe";
+  target.title = "Counter-Strike 2";
+  const bx::AudioRoutingPlan game_plan = bx::plan_audio_routing(with_game, target);
+  check(game_plan.game_slot == 1 && game_plan.game_track == 4, "the Current game slot takes the track of its position");
+  check(game_plan.tracks[3].title == "BuffrX Game" && game_plan.tracks[3].role == "application" &&
+            game_plan.tracks[3].sources.size() == 1 && game_plan.tracks[3].sources[0] == "app:game",
+        "the game track is labelled generically and named as this product's game source");
+  check(game_plan.tracks[0].sources.size() == 3, "the game is part of the mix like any other slot");
+  bx::GameAudioTarget other = target;
+  other.exe = "fortnite.exe";
+  other.window = "Fortnite:UnrealWindow:fortnite.exe";
+  other.title = "Fortnite";
+  const bx::AudioRoutingPlan other_plan = bx::plan_audio_routing(with_game, other);
+  check(other_plan.game_track == 4 && other_plan.tracks[3].title == "BuffrX Game",
+        "another game keeps the same logical game track and the same generic label");
+  const bx::AudioRoutingPlan waiting = bx::plan_audio_routing(with_game, bx::GameAudioTarget{});
+  check(waiting.game_slot == 1 && waiting.track_count == 4 &&
+            waiting.tracks[3].role == "application" && waiting.tracks[3].title == "BuffrX Game" &&
+            waiting.tracks[3].sources.size() == 1 && waiting.tracks[3].sources[0] == "app:game",
+        "a waiting game slot keeps its lane identity: the label is fixed when the encoders start, not when a game appears");
+  check(waiting.apps[1].exe.empty(), "a waiting game slot has no source identity to bind");
+  bool game_in_mix = false;
+  for (const std::string& source : waiting.tracks[0].sources) game_in_mix = game_in_mix || source == "app:game";
+  check(game_in_mix, "the game lane is part of the mix from the first frame, so a late game is never hidden from an editor");
+  bool desktop_for_game = false;
+  for (const std::string& source : waiting.tracks[0].sources) desktop_for_game = desktop_for_game || source == "desktop";
+  check(!desktop_for_game, "a waiting game slot never falls back to the desktop");
+
+  // No game, then game A, then game B, then no game again: every file describes the same lanes, so chunks
+  // joined across those transitions carry one honest layout instead of reopening as imports.
+  {
+    const std::string root = temp_directory() + "\\audio-game-transition";
+    CreateDirectoryA(root.c_str(), nullptr);
+    const bx::AudioRoutingPlan plans[3] = {waiting, game_plan, other_plan};
+    std::vector<bx::AudioLayout> layouts;
+    for (int i = 0; i < 3; ++i) {
+      const std::string file = root + "\\part" + std::to_string(i) + ".mp4";
+      bx::write_file_atomic(file, "chunk " + std::to_string(i));
+      check(bx::write_audio_sidecar(file, plans[i]), "each segment of a game transition writes its labels");
+      layouts.push_back(bx::read_audio_layout(file, plans[i].track_count));
+    }
+    check(layouts[0].buffrx && layouts[1].buffrx && layouts[2].buffrx &&
+              bx::same_audio_layout(layouts[0], layouts[1]) && bx::same_audio_layout(layouts[1], layouts[2]),
+          "a waiting, a captured and a changed game all describe the same lanes");
+    const bx::JoinAudioLayout joined = bx::join_audio_layout(layouts);
+    check(joined.carries && bx::same_audio_layout(joined.layout, layouts[0]),
+          "a save across game changes keeps one layout, so the game stem is not hidden and not doubled");
+  }
+
+  // A game already selected by name: the Current game lane makes no second capture.
+  bx::Config named_game = with_game;
+  named_game.audio_apps = {discord, current, bx::AudioApp{"w", "cs2.exe", "Counter-Strike 2", "", 0}};
+  const bx::AudioRoutingPlan named_plan = bx::plan_audio_routing(named_game, target);
+  check(named_plan.game_covered_slot == 2 && named_plan.apps[1].exe.empty(),
+        "a game selected by name covers the Current game slot, which then makes no source");
+  check(named_plan.tracks[4].title == "BuffrX cs2" && named_plan.tracks[3].title == "BuffrX Game" &&
+            named_plan.tracks[3].sources.size() == 1 && named_plan.tracks[3].sources[0] == "app:game",
+        "the captured program is recorded once, by its named lane; the game lane stays a silent stem");
+
+  // Performance mode owns a single mixed track; app routes stay stored and are ignored while it runs.
+  const bx::Config performed = bx::apply_performance_plan(routed, bx::performance_plan());
+  check(performed.audio_apps.empty() && performed.audio_tracks == 1 && !performed.separate_tracks &&
+            bx::plan_audio_routing(performed).desktop_captured,
+        "Performance mode records one mixed track with the desktop back, not split app tracks");
+
+  // Disabled devices keep their track assignments so enabling them live does not change the layout.
+  bx::Config quiet = legacy;
+  quiet.mic_enabled = false;
+  quiet.desktop_enabled = false;
+  const bx::AudioRoutingPlan quiet_plan = bx::plan_audio_routing(quiet);
+  check(quiet_plan.mic_mixers == ((1u << 0) | (1u << 2)) && quiet_plan.desktop_mixers == ((1u << 0) | (1u << 1)),
+        "disabled devices retain their routes for a live enable");
+  check(quiet_plan.tracks[2].role == "microphone", "a disabled microphone keeps its track label");
+  bx::Config two_tracks = quiet;
+  two_tracks.audio_tracks = 2;
+  bx::Config two_with_mic = two_tracks;
+  two_with_mic.mic_enabled = true;
+  check(bx::audio_track_count(two_tracks) == 2 && bx::audio_track_count(two_with_mic) == 3 &&
+            (bx::config_change_bits(two_tracks, two_with_mic) & bx::kConfigRebuilds),
+        "enabling a microphone on a two-track layout reserves its own track and rebuilds safely");
+
+  // One app slot needs track 3 even when the explicit count says one encoder.
+  bx::Config one_app = legacy;
+  one_app.audio_capture_mode = "apps";
+  one_app.audio_apps = {discord};
+  one_app.separate_tracks = false;
+  one_app.audio_tracks = 1;
+  check(bx::audio_track_count(one_app) == 3, "one app slot reserves mix, microphone and its own track");
+  check(bx::plan_audio_routing(one_app).tracks[1].role == "microphone" &&
+            bx::plan_audio_routing(one_app).tracks[2].title == "BuffrX Discord",
+        "adding an app isolates the microphone even when the old setting was mixed");
+
+  // The config file and the pipe: slots survive a round trip, normalize on the way in, and an old file has none.
+  bx::Config stored = routed;
+  stored.audio_apps.push_back(discord);  // a duplicate must not survive the file either
+  bx::Config back;
+  bx::config_from_json(bx::config_to_json(stored), back);
+  check(back.audio_apps.size() == 2 && back.audio_apps[0].exe == "Discord.exe" && back.audio_apps[1].exe == "cs2.exe",
+        "application slots survive a config round trip");
+  bx::Config stored_game = with_game;
+  bx::Config game_back;
+  bx::config_from_json(bx::config_to_json(stored_game), game_back);
+  check(game_back.audio_apps.size() == 2 && bx::audio_app_is_game(game_back.audio_apps[1]),
+        "the Current game slot survives a config round trip as a game slot");
+  bx::Json old = bx::config_to_json(legacy);
+  old.erase("audio_apps");
+  bx::Config old_back;
+  bx::config_from_json(old, old_back);
+  check(old_back.audio_apps.empty() && old_back.separate_tracks && old_back.audio_tracks == 3,
+        "a file written before app slots keeps its old audio layout exactly");
+  bx::Json nested = bx::Json::object();
+  nested.set("apps", bx::audio_apps_json(routed.audio_apps));
+  bx::Config piped;
+  bx::config_apply_audio(nested, piped);
+  check(piped.audio_apps.size() == 2 && piped.audio_apps[1].exe == "cs2.exe",
+        "audio.set accepts the apps field audio.get returns");
+
+  bx::Config swapped = routed;
+  std::swap(swapped.audio_apps[0], swapped.audio_apps[1]);
+  check((bx::config_change_bits(routed, swapped) & bx::kConfigRebuilds) != 0,
+        "reordering the slots rebuilds the audio encoders");
+  bx::Config retitled = routed;
+  retitled.audio_apps[0].title = "Discord | #general";
+  check((bx::config_change_bits(routed, retitled) & bx::kConfigRebuilds) == 0,
+        "a window title changing does not rebuild the buffer");
+
+  // The recording mode: Everything records the output loopback and keeps saved slots for later; they must
+  // not add encoders, sources or a rebuild while they are not recording.
+  bx::Config kept = legacy;
+  kept.audio_apps = {discord, game};
+  const bx::AudioRoutingPlan kept_plan = bx::plan_audio_routing(kept);
+  check(kept.audio_capture_mode == "desktop" && kept_plan.desktop_captured && kept_plan.apps.empty(),
+        "desktop mode records the loopback even with saved app slots");
+  check(kept_plan.track_count == 3 && kept_plan.desktop_mixers == ((1u << 0) | (1u << 1)) &&
+            kept_plan.mic_mixers == ((1u << 0) | (1u << 2)),
+        "desktop mode keeps the desktop on track 2 and the microphone on 3");
+  bx::Config inactive;
+  inactive.audio_tracks = 1;
+  inactive.audio_apps.push_back(bx::AudioApp{"x", "cs2.exe", "CS2", "", 5});
+  check(bx::audio_track_count(inactive) == 1 && bx::plan_audio_routing(inactive).track_count == 1,
+        "a saved slot does not build encoders while desktop mode records");
+  bx::Config inactive_more = inactive;
+  inactive_more.audio_apps.push_back(discord);
+  check((bx::config_change_bits(inactive, inactive_more) & bx::kConfigRebuilds) == 0,
+        "editing saved slots in desktop mode does not restart the buffer");
+  bx::Config switch_to_apps = inactive;
+  switch_to_apps.audio_capture_mode = "apps";
+  check((bx::config_change_bits(inactive, switch_to_apps) & bx::kConfigRebuilds) != 0,
+        "switching to Selected apps rebuilds the audio encoders");
+  check(bx::config_change_bits(inactive, inactive) == 0, "an unchanged desktop config changes nothing");
+
+  // Apps mode with no selection never falls back to the desktop: only the microphone is recorded.
+  bx::Config no_apps;
+  no_apps.audio_capture_mode = "apps";
+  no_apps.audio_tracks = 3;
+  no_apps.mic_enabled = true;
+  const bx::AudioRoutingPlan no_apps_plan = bx::plan_audio_routing(no_apps);
+  check(!no_apps_plan.desktop_captured && no_apps_plan.apps.empty(),
+        "Selected apps with nothing chosen does not silently capture the desktop");
+  check(no_apps_plan.desktop_mixers == (1u << 0), "the unused desktop loopback writes no track");
+  check(no_apps_plan.mic_mixers == ((1u << 0) | (1u << 1)) && no_apps_plan.tracks[1].role == "microphone",
+        "with no apps the microphone takes track 2 and still records");
+  bool desktop_in_empty = false;
+  for (const std::string& source : no_apps_plan.tracks[0].sources) desktop_in_empty = desktop_in_empty || source == "desktop";
+  check(!desktop_in_empty, "the mix of an empty app layout names no desktop source");
+
+  // Switching back and forth keeps the saved slots: only what records changes.
+  bx::Config back_to_apps = kept;
+  back_to_apps.audio_capture_mode = "apps";
+  check(bx::plan_audio_routing(back_to_apps).apps.size() == 2 &&
+            !bx::plan_audio_routing(back_to_apps).desktop_captured,
+        "choosing Selected apps again restores the saved slots");
+
+  // An unknown mode is not a fourth behaviour: it changes nothing, and a fresh config is desktop.
+  bx::Json unknown_mode = bx::config_to_json(routed);
+  unknown_mode.set("audio_capture_mode", bx::Json("everything"));
+  bx::Config parsed_unknown = routed;
+  bx::config_from_json(unknown_mode, parsed_unknown);
+  check(parsed_unknown.audio_capture_mode == "apps", "an unknown recording mode is ignored");
+  check(bx::Config{}.audio_capture_mode == "desktop", "a new config records desktop audio");
+
+  // The migration: a file with slots recorded them until now, so it starts in Selected apps; a file without
+  // slots starts in Everything; a file that already chose a mode keeps it.
+  bx::Config old_routes;
+  old_routes.config_version = 9;
+  old_routes.audio_apps = {discord};
+  old_routes.audio_capture_mode = "desktop";
+  bx::migrate_config(old_routes);
+  check(old_routes.audio_capture_mode == "auto" && old_routes.audio_capture_legacy_mode == "apps" &&
+            old_routes.config_version == bx::Config::kConfigVersion,
+        "an existing config with app slots moves to automatic capture and keeps the old mode");
+  bx::Config old_plain;
+  old_plain.config_version = 9;
+  bx::migrate_config(old_plain);
+  check(old_plain.audio_capture_mode == "auto" && old_plain.audio_capture_legacy_mode == "desktop",
+        "an existing config without slots moves to automatic capture too");
+  bx::Config chosen_mode;
+  chosen_mode.config_version = 10;
+  chosen_mode.audio_apps = {discord};
+  chosen_mode.audio_capture_mode = "desktop";
+  bx::migrate_config(chosen_mode);
+  check(chosen_mode.audio_capture_mode == "auto" && chosen_mode.audio_capture_legacy_mode == "desktop",
+        "a version 10 file moves to automatic capture with its old mode kept");
+  bx::Config older_choice;
+  older_choice.config_version = 9;
+  older_choice.audio_apps = {discord};
+  older_choice.audio_capture_mode = "desktop";
+  bx::migrate_config(older_choice, true);
+  check(older_choice.audio_capture_mode == "auto" && older_choice.audio_capture_legacy_mode == "desktop" &&
+            older_choice.config_version == bx::Config::kConfigVersion,
+        "a stored mode is kept as history when the file moves to automatic capture");
+  const std::string mode_path = temp_directory() + "\\config-audio-mode.json";
+  CreateDirectoryA(temp_directory().c_str(), nullptr);
+  bx::Json older_file = bx::config_to_json(older_choice);
+  older_file.set("config_version", bx::Json(9));  // what a downgraded or hand-edited file still says
+  bx::write_file_atomic(mode_path, older_file.dump());
+  bx::Config mode_from_disk;
+  std::string mode_error;
+  check(bx::load_config(mode_path, mode_from_disk, mode_error) && mode_from_disk.audio_capture_mode == "auto" &&
+            mode_from_disk.audio_apps.size() == 1,
+        "a file read from disk moves to automatic capture and its saved slots survive");
+
+  // The mode rides the config file and the pipe beside the slots.
+  bx::Config mode_back;
+  bx::config_from_json(bx::config_to_json(kept), mode_back);
+  check(mode_back.audio_capture_mode == "desktop" && mode_back.audio_apps.size() == 2,
+        "the mode and its saved slots survive a config round trip");
+  bx::Json mode_patch = bx::Json::object();
+  mode_patch.set("audio_capture_mode", bx::Json("apps"));
+  bx::Config piped_mode;
+  bx::config_apply_audio(mode_patch, piped_mode);
+  check(piped_mode.audio_capture_mode == "apps", "audio.set accepts the mode audio.get returns");
+
+  // Performance mode overrides the effective mode but leaves the stored choice and slots alone.
+  const bx::Config performed_apps = bx::apply_performance_plan(kept, bx::performance_plan());
+  check(performed_apps.audio_capture_mode == "desktop" && performed_apps.audio_apps.empty() &&
+            bx::plan_audio_routing(performed_apps).desktop_captured,
+        "Performance mode records desktop + microphone and ignores saved app slots");
+  check(kept.audio_capture_mode == "desktop" && kept.audio_apps.size() == 2,
+        "Performance mode does not rewrite the stored audio mode or slots");
+
+  // The sidecar contract: 1-based tracks, roles and titles, written only for a multitrack file.
+  const bx::Json sidecar = bx::audio_track_metadata(game_plan);
+  check(sidecar["version"].as_int(0) == 2 && sidecar["tracks"].items().size() == 4,
+        "the sidecar names every track");
+  check(sidecar["tracks"].items()[0]["index"].as_int(0) == 1 &&
+            sidecar["tracks"].items()[0]["role"].as_string() == "mix" &&
+            sidecar["tracks"].items()[3]["index"].as_int(0) == 4,
+        "the sidecar counts tracks from 1 like the mixer");
+  const std::string root = temp_directory() + "\\audio";
+  CreateDirectoryA(root.c_str(), nullptr);
+  const std::string clip = root + "\\multitrack.mp4";
+  bx::write_file_atomic(clip, "recorded bytes");
+  check(bx::write_audio_sidecar(clip, game_plan), "a multitrack clip gets its sidecar");
+  const bx::AudioLayout round_trip = bx::read_audio_layout(clip, 4);
+  check(round_trip.buffrx && round_trip.tracks[3].title == "BuffrX Game" &&
+            round_trip.tracks[3].sources.size() == 1 && round_trip.tracks[3].sources[0] == "app:game",
+        "the game track reads back generically, with no stale executable in it");
+  check(GetFileAttributesA((clip + bx::kAudioSidecarSuffix).c_str()) != INVALID_FILE_ATTRIBUTES,
+        "the sidecar sits beside the media file");
+  check(bx::write_audio_sidecar(root + "\\single.mp4", bx::plan_audio_routing(bx::Config{})) &&
+            GetFileAttributesA((root + "\\single.mp4" + bx::kAudioSidecarSuffix).c_str()) == INVALID_FILE_ATTRIBUTES,
+        "a single-track clip writes no sidecar, so an old file is never mistaken for a BuffrX mix");
+}
+
+// What the page and the one card say about the selected slots (audio_health.h): a program that is simply
+// closed is quiet, a captured game with no slot is said once, and recovery earns a new notice.
+void test_audio_health() {
+  std::printf("audio health\n");
+  bx::AudioHealthFacts facts;
+  facts.apps_mode = true;
+  facts.capture_active = true;
+  bx::AudioHealthSlot discord;
+  discord.exe = "Discord.exe";
+  bx::AudioHealthSlot game_slot;
+  game_slot.game = true;
+  facts.slots = {discord};
+
+  check(bx::audio_health_problem(facts) == bx::AudioProblem::all_unavailable,
+        "every selected slot silent while recording is a problem");
+  facts.slots[0].connected = true;
+  check(bx::audio_health_problem(facts) == bx::AudioProblem::none, "a connected slot is quiet");
+  facts.capture_active = false;
+  facts.slots[0].connected = false;
+  check(bx::audio_health_problem(facts) == bx::AudioProblem::none, "nothing is said while the buffer is off");
+  facts.capture_active = true;
+
+  facts.captured_game_exe = "cs2.exe";
+  check(bx::audio_health_problem(facts) == bx::AudioProblem::game_missing,
+        "a captured game that is not one of the selected apps is the more important problem");
+  const bx::AudioHealthFacts missing = facts;
+  facts.slots.push_back(bx::AudioHealthSlot{false, "cs2.exe", false});
+  check(bx::audio_health_problem(facts) == bx::AudioProblem::game_waiting,
+        "the game's program selected but not connected is 'not connected', not 'not selected'");
+  facts.slots = missing.slots;
+  facts.slots.push_back(game_slot);
+  check(bx::audio_health_problem(facts) == bx::AudioProblem::game_waiting,
+        "a Current game slot waiting for its game is its own problem");
+  facts.slots[1].connected = true;
+  check(bx::audio_health_problem(facts) == bx::AudioProblem::none, "a connected game slot covers the game");
+  facts.slots = missing.slots;
+  facts.slots[0].connected = true;
+  facts.captured_game_exe = "Discord.exe";
+  check(bx::audio_health_problem(facts) == bx::AudioProblem::none,
+        "the captured game being one of the selected programs needs no card");
+
+  // Connected is what covers a game: a selected game program that never hooked is a problem even when
+  // another app is recording, because hooked state is the only evidence that its sound is being captured.
+  bx::AudioHealthFacts named_waiting;
+  named_waiting.apps_mode = true;
+  named_waiting.capture_active = true;
+  named_waiting.captured_game_exe = "cs2.exe";
+  named_waiting.slots = {bx::AudioHealthSlot{false, "Discord.exe", true},
+                         bx::AudioHealthSlot{false, "cs2.exe", false}};
+  check(bx::audio_health_problem(named_waiting) == bx::AudioProblem::game_waiting,
+        "a selected game whose audio never connected warns although another app is connected");
+  named_waiting.slots[1].connected = true;
+  check(bx::audio_health_problem(named_waiting) == bx::AudioProblem::none,
+        "the same game once connected is quiet");
+  // A Current game slot covered by a connected named route: its own lane waits but nothing is missing.
+  bx::AudioHealthFacts covered;
+  covered.apps_mode = true;
+  covered.capture_active = true;
+  covered.captured_game_exe = "cs2.exe";
+  covered.slots = {bx::AudioHealthSlot{false, "Discord.exe", true},
+                   bx::AudioHealthSlot{true, "cs2.exe", false},
+                   bx::AudioHealthSlot{false, "cs2.exe", true}};
+  check(bx::audio_health_problem(covered) == bx::AudioProblem::none,
+        "a game covered by a named slot is not a second warning");
+  covered.slots[2].connected = false;
+  covered.slots[0].connected = false;
+  check(bx::audio_health_problem(covered) == bx::AudioProblem::game_waiting,
+        "a covered game that has no connected route at all still warns");
+
+  // New selections start empty: a game that plays while nothing is selected records no game audio either, so the
+  // one card and the standing line still say so. It stops the moment something records, the game stops, or another
+  // mode (or Performance mode's override) is what records.
+  bx::AudioHealthFacts empty_selection;
+  empty_selection.apps_mode = true;
+  empty_selection.capture_active = true;
+  empty_selection.captured_game_exe = "cs2.exe";
+  check(bx::audio_health_problem(empty_selection) == bx::AudioProblem::game_missing,
+        "an empty selection while a game plays is missing game audio");
+  check(bx::audio_health_key(empty_selection, bx::AudioProblem::game_missing) ==
+            bx::audio_health_key(missing, bx::AudioProblem::game_missing),
+        "the empty selection is the same once-per-game problem, not a second warning");
+  empty_selection.capture_active = false;
+  check(bx::audio_health_problem(empty_selection) == bx::AudioProblem::none,
+        "nothing records, so an empty selection says nothing");
+  empty_selection.capture_active = true;
+  empty_selection.captured_game_exe.clear();
+  check(bx::audio_health_problem(empty_selection) == bx::AudioProblem::none,
+        "no game and no selection is quiet");
+  empty_selection.captured_game_exe = "cs2.exe";
+  empty_selection.apps_mode = false;
+  check(bx::audio_health_problem(empty_selection) == bx::AudioProblem::none,
+        "desktop audio and Performance mode's override are not app-selection problems");
+  empty_selection.apps_mode = true;
+  empty_selection.slots = {bx::AudioHealthSlot{false, "cs2.exe", true}};
+  check(bx::audio_health_problem(empty_selection) == bx::AudioProblem::none,
+        "selecting the game's own program recovers the empty-selection warning");
+
+  // Which game a card may name: the one the picture holds, from the detectors' evidence. A display capture shows
+  // whatever is on that screen, a window capture only its own program, and a game capture only its game. The
+  // warning target is not the Current game routing target, so a display capture with nothing routed still warns.
+  bx::AudioCoverage coverage;
+  coverage.capture_mode = "display";
+  coverage.detected_game_exe = "cs2.exe";
+  check(bx::audio_warning_game(coverage) == "cs2.exe",
+        "a display capture names the game the detectors see, with no game-captured target at all");
+  coverage.captured_game_exe = "fortnite.exe";
+  check(bx::audio_warning_game(coverage) == "cs2.exe",
+        "the routing target of another game is not what a display capture is told about");
+  coverage.detected_game_exe.clear();
+  check(bx::audio_warning_game(coverage).empty(), "no game known and no game detected names nothing");
+  coverage.capture_mode = "window";
+  coverage.detected_game_exe = "cs2.exe";
+  coverage.window_exe = "Discord.exe";
+  check(bx::audio_warning_game(coverage).empty(),
+        "a window capture of another program does not cover the game, so it says nothing about it");
+  coverage.window_exe.clear();
+  check(bx::audio_warning_game(coverage).empty(), "a window capture whose program is unknown names nothing");
+  coverage.window_exe = "CS2.exe";
+  check(bx::audio_warning_game(coverage) == "cs2.exe",
+        "a window capture of the game itself covers it, whatever the case of the name");
+  coverage.capture_mode = "game";
+  coverage.captured_game_exe.clear();
+  check(bx::audio_warning_game(coverage).empty(),
+        "a game capture with no game running names nothing, even when a detector sees one");
+  coverage.captured_game_exe = "fortnite.exe";
+  check(bx::audio_warning_game(coverage) == "fortnite.exe", "a game capture names the game it is on");
+  coverage.capture_mode = "display";
+  check(bx::audio_warning_game(coverage) == "cs2.exe",
+        "leaving the game capture hands the display its own detector's game");
+
+  // The two halves joined: an empty selection, a buffer, and the game a display capture holds is the same once-
+  // per-game problem the captured-game path raises.
+  bx::AudioHealthFacts covered_game;
+  covered_game.apps_mode = true;
+  covered_game.capture_active = true;
+  bx::AudioCoverage display;
+  display.capture_mode = "display";
+  display.detected_game_exe = "cs2.exe";
+  covered_game.captured_game_exe = bx::audio_warning_game(display);
+  check(bx::audio_health_problem(covered_game) == bx::AudioProblem::game_missing,
+        "a display capture over an unselected game warns exactly as a game capture does");
+  check(bx::audio_health_key(covered_game, bx::AudioProblem::game_missing) ==
+            bx::audio_health_key(missing, bx::AudioProblem::game_missing),
+        "and it is the same problem key, so switching modes is not a second card");
+
+  facts.apps_mode = false;
+  check(bx::audio_health_problem(facts) == bx::AudioProblem::none, "desktop mode has no slot problem");
+
+  // What status.audio publishes: the same policy under a wire name, and a steady gate so a game that is still
+  // starting or a route that is still connecting never flashes a line under the slots.
+  check(std::string(bx::audio_problem_name(bx::AudioProblem::game_missing)) == "game_missing" &&
+            std::string(bx::audio_problem_name(bx::AudioProblem::game_waiting)) == "game_waiting" &&
+            std::string(bx::audio_problem_name(bx::AudioProblem::all_unavailable)) == "all_unavailable" &&
+            std::string(bx::audio_problem_name(bx::AudioProblem::none)).empty(),
+        "each audio problem has its wire name, and none has none");
+  check(!bx::audio_problem_steady(bx::AudioProblem::game_missing, 1499) &&
+            bx::audio_problem_steady(bx::AudioProblem::game_missing, 1500) &&
+            !bx::audio_problem_steady(bx::AudioProblem::none, 60000),
+        "the persistent line waits out a start and never draws when nothing is wrong");
+
+  // One card per unresolved problem: after the grace, once; recovery forgets it; another game is new.
+  bx::AudioNoticeState state;
+  const std::string key = bx::audio_health_key(missing, bx::AudioProblem::game_missing);
+  check(!bx::audio_notice_due(state, bx::AudioProblem::game_missing, key, 1000, 10000), "no card inside the grace");
+  check(!bx::audio_notice_due(state, bx::AudioProblem::game_missing, key, 9000, 10000), "still inside the grace");
+  check(bx::audio_notice_due(state, bx::AudioProblem::game_missing, key, 11000, 10000), "the card comes once after it");
+  check(!bx::audio_notice_due(state, bx::AudioProblem::game_missing, key, 60000, 10000), "and never repeats");
+  check(!bx::audio_notice_due(state, bx::AudioProblem::none, std::string(), 61000, 10000), "recovery clears it");
+  check(!bx::audio_notice_due(state, bx::AudioProblem::game_missing, key, 62000, 10000), "a new occurrence waits again");
+  check(bx::audio_notice_due(state, bx::AudioProblem::game_missing, key, 73000, 10000), "then it is told once more");
+  bx::AudioHealthFacts other_game = missing;
+  other_game.captured_game_exe = "fortnite.exe";
+  check(bx::audio_notice_due(state, bx::AudioProblem::game_missing,
+                             bx::audio_health_key(other_game, bx::AudioProblem::game_missing), 74000, 10000) == false,
+        "another game restarts the grace, it is not a repeat of the old problem");
+}
+
+
+// A file's own audio layout (audio_layout.h): which tracks it has, whether track 1 is an aggregate mix,
+// and whether that mix can be rebuilt from the tracks after it - the decision the preview and the export
+// both make, from the file, never from the capture settings of today.
+void test_audio_layout() {
+  std::printf("audio layout\n");
+  const std::string root = temp_directory() + "\\audio-layout";
+  CreateDirectoryA(root.c_str(), nullptr);
+
+  // A desktop + microphone recording: mix, desktop, microphone.
+  bx::Config config;
+  config.separate_tracks = true;
+  config.audio_tracks = 3;
+  config.mic_enabled = true;
+  config.desktop_enabled = true;
+  const bx::AudioRoutingPlan plan = bx::plan_audio_routing(config);
+  const auto layout_of = [](const bx::AudioRoutingPlan& routing) {
+    bx::AudioLayout layout;
+    layout.buffrx = true;
+    for (const bx::AudioTrackInfo& track : routing.tracks) {
+      bx::AudioTrackLabel label;
+      label.index = track.track;
+      label.role = track.role;
+      label.title = track.title;
+      label.sources = track.sources;
+      layout.tracks.push_back(label);
+    }
+    return layout;
+  };
+  const bx::AudioLayout expected = layout_of(plan);
+  // A manual recording or a replay save: the file is final before its labels are written.
+  const std::string clip = root + "\\desktop-mic.mp4";
+  bx::write_file_atomic(clip, "final desktop and microphone bytes");
+  check(bx::write_audio_sidecar(clip, plan), "a desktop and microphone clip writes its sidecar");
+  const bx::AudioLayout layout = bx::read_audio_layout(clip, 3);
+  check(layout.buffrx && layout.aggregate && layout.complete, "the recorded layout is an aggregate mix that can be rebuilt");
+  check(layout.tracks.size() == 3 && layout.tracks[1].role == "desktop" && layout.tracks[2].sources.size() == 1,
+        "each track keeps its role and its sources");
+  const bx::AudioGains flat = bx::audio_gains({}, {}, {}, 3);
+  check(!flat.changed && flat.values.size() == 3 && flat.values[0] == 1.0, "untouched levels are unity");
+
+  // A mute is a zero, a solo silences everything else, and the export's own ceiling applies.
+  const bx::AudioGains muted = bx::audio_gains({1.0, 1.0, 1.0}, {false, true, false}, {}, 3);
+  check(muted.changed && muted.values[1] == 0.0 && muted.values[0] == 1.0, "a mute is the track's own zero");
+  const bx::AudioGains soloed = bx::audio_gains({1.0, 2.0, 1.0}, {}, {false, true, false}, 3);
+  check(soloed.values[0] == 0.0 && soloed.values[1] == 2.0 && soloed.values[2] == 0.0, "a solo silences the others");
+  check(bx::audio_gains({9.0}, {}, {}, 1).values[0] == 4.0, "a level is held to the export's ceiling");
+
+  std::string error;
+  check(std::string(bx::kAudioLayoutSuffix) == bx::kAudioSidecarSuffix,
+        "the editor's sidecar name is the recorder's, so one file is never two");
+  // An export writes its own output, then binds the labels to that final file.
+  const std::string mirrored = root + "\\mirrored.mp4";
+  bx::write_file_atomic(mirrored, "an exported clip");
+  check(bx::write_audio_layout(mirrored, layout), "the editor writer writes a layout");
+  check(bx::same_audio_layout(bx::read_audio_layout(mirrored, 3), layout), "the export's round trip is the same layout");
+
+  check(bx::audio_mix_plan(layout, flat, error) == bx::AudioMixPlan::keep && error.empty(),
+        "an untouched aggregate keeps its recorded mix");
+  check(bx::audio_mix_plan(layout, muted, error) == bx::AudioMixPlan::recompute,
+        "an edited aggregate is rebuilt from its sources");
+
+  // An import: no sidecar, or one that does not match the file, is generic and never an aggregate.
+  const std::string imported = root + "\\imported.mp4";
+  bx::write_file_atomic(imported, "an imported file");
+  const bx::AudioLayout from_nothing = bx::read_audio_layout(imported, 3);
+  check(!from_nothing.buffrx && !from_nothing.aggregate && from_nothing.tracks.size() == 3 &&
+            from_nothing.tracks[2].role == "track",
+        "a file without a sidecar is an import with generic tracks");
+  check(bx::audio_mix_plan(from_nothing, muted, error) == bx::AudioMixPlan::keep,
+        "an import's own tracks are levelled as they are, with nothing inferred");
+  check(bx::read_audio_layout(clip, 4).tracks.size() == 4 && !bx::read_audio_layout(clip, 4).buffrx,
+        "a sidecar that does not match the file's tracks is stale, not believed");
+
+  // Identity, not track count: the same number of streams in a different file must not inherit a mix.
+  const std::string replaced = root + "\\replaced.mp4";
+  bx::write_file_atomic(replaced, "AAAA");
+  check(bx::write_audio_layout(replaced, expected), "a clip is bound to its own bytes");
+  bx::MediaIdentity bound;
+  check(bx::media_identity(replaced, bound) && bound.valid, "its identity can be measured");
+  bx::write_file_atomic(replaced, "BBBB");  // same size, same stream count, different file
+  auto set_mtime = [](const std::string& path, int64_t ticks) {
+    HANDLE file = CreateFileA(path.c_str(), FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                              nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return false;
+    FILETIME time{static_cast<DWORD>(ticks), static_cast<DWORD>(static_cast<uint64_t>(ticks) >> 32)};
+    const bool ok = SetFileTime(file, nullptr, nullptr, &time) != 0;
+    CloseHandle(file);
+    return ok;
+  };
+  check(set_mtime(replaced, bound.mtime), "the replacement keeps the old last-write time");
+  check(!bx::read_audio_layout(replaced, 3).buffrx,
+        "media replaced with the same track count, size and time is refused, not described by the old sidecar");
+  check(GetFileAttributesA((replaced + bx::kAudioLayoutSuffix).c_str()) != INVALID_FILE_ATTRIBUTES,
+        "the old labels are left where they were, and the media is untouched");
+
+  const std::string sized = root + "\\sized.mp4";
+  bx::write_file_atomic(sized, "12345");
+  check(bx::write_audio_layout(sized, expected), "a sized clip is bound");
+  bx::write_file_atomic(sized, "123456");
+  check(!bx::read_audio_layout(sized, 3).buffrx, "a file whose size changed is not the file the sidecar names");
+  const std::string timed = root + "\\timed.mp4";
+  bx::write_file_atomic(timed, "unchanged bytes");
+  check(bx::write_audio_layout(timed, expected), "a timed clip is bound");
+  bx::MediaIdentity timed_identity;
+  check(bx::media_identity(timed, timed_identity) && set_mtime(timed, timed_identity.mtime + 10000000),
+        "its last-write time is moved by one second");
+  check(!bx::read_audio_layout(timed, 3).buffrx, "a file whose last-write time changed is not believed");
+
+  // A legacy sidecar cannot name its bytes. It stays on disk, and the clip is an import.
+  const std::string legacy = root + "\\legacy.mp4";
+  bx::write_file_atomic(legacy, "legacy bytes");
+  bx::write_file_atomic(legacy + bx::kAudioLayoutSuffix,
+                        R"({"version":1,"generator":"BuffrX","tracks":[
+                            {"index":1,"role":"mix","title":"BuffrX Mix","sources":["desktop"]},
+                            {"index":2,"role":"desktop","title":"BuffrX Desktop","sources":["desktop"]}]})");
+  check(!bx::read_audio_layout(legacy, 2).buffrx && !bx::read_audio_layout(legacy, 2).aggregate,
+        "a version 1 sidecar without media identity reads as an import");
+  check(GetFileAttributesA((legacy + bx::kAudioLayoutSuffix).c_str()) != INVALID_FILE_ATTRIBUTES,
+        "the unverifiable sidecar is kept, not deleted");
+
+  // A chunk's labels are written while it grows, and bound when its writer closes. Unbound is an import.
+  const std::string pending = root + "\\pending.mp4";
+  bx::write_file_atomic(pending, "a chunk still growing");
+  check(bx::write_audio_sidecar_pending(pending, plan), "a growing chunk writes its labels pending");
+  check(!bx::read_audio_layout(pending, 3).buffrx, "pending labels are not believed until the file is final");
+  check(bx::bind_audio_layout(pending), "the labels bind once the writer has closed");
+  check(bx::read_audio_layout(pending, 3).buffrx, "a bound chunk describes its final bytes");
+
+  // A foreign or broken file is not BuffrX either, and is never deleted or overwritten.
+  const std::string foreign = root + "\\foreign.mp4";
+  bx::write_file_atomic(foreign, "somebody else's media");
+  const std::string foreign_text = R"({"version":1,"generator":"Other","tracks":[]})";
+  bx::write_file_atomic(foreign + bx::kAudioLayoutSuffix, foreign_text);
+  check(!bx::read_audio_layout(foreign, 1).buffrx, "another program's sidecar is not read as BuffrX");
+  check(!bx::audio_sidecar_is_ours(foreign), "a stranger's sidecar is not treated as this product's");
+  check(bx::audio_sidecar_is_ours(clip), "this product's sidecar is recognised for cleanup or a recycle");
+  check(!bx::write_audio_layout(foreign, expected), "a new clip does not overwrite a stranger's sidecar");
+  std::string kept;
+  if (FILE* file = std::fopen((foreign + bx::kAudioLayoutSuffix).c_str(), "rb")) {
+    char buffer[512];
+    size_t read = 0;
+    while ((read = std::fread(buffer, 1, sizeof(buffer), file)) > 0) kept.append(buffer, read);
+    std::fclose(file);
+  }
+  check(kept == foreign_text, "and that file keeps every byte");
+  std::string media_kept;
+  if (FILE* file = std::fopen(foreign.c_str(), "rb")) {
+    char buffer[512];
+    size_t read = 0;
+    while ((read = std::fread(buffer, 1, sizeof(buffer), file)) > 0) media_kept.append(buffer, read);
+    std::fclose(file);
+  }
+  check(media_kept == "somebody else's media", "a failed label write leaves the media valid");
+  bx::remove_audio_layout(foreign);
+  check(GetFileAttributesA((foreign + bx::kAudioLayoutSuffix).c_str()) != INVALID_FILE_ATTRIBUTES,
+        "a file this product did not write is left alone");
+  bx::write_file_atomic(imported + bx::kAudioLayoutSuffix, "{not json");
+  check(!bx::read_audio_layout(imported, 3).buffrx, "a broken sidecar reads as an import");
+
+  // A mix that names a source no track holds cannot be rebuilt, and a level change is refused rather
+  // than written to a file whose ordinary sound would then be wrong.
+  const std::string partial_file = root + "\\partial.mp4";
+  bx::write_file_atomic(partial_file, "partial mix bytes");
+  bx::AudioLayout partial_layout = expected;
+  partial_layout.tracks[2].sources.clear();
+  partial_layout.tracks[2].role = "empty";
+  partial_layout.tracks[2].title = "BuffrX Track 3";
+  check(bx::write_audio_layout(partial_file, partial_layout), "an incomplete mix is still this product's layout");
+  const bx::AudioLayout partial = bx::read_audio_layout(partial_file, 3);
+  check(partial.buffrx && partial.aggregate && !partial.complete, "a source without a track is an incomplete mix");
+  check(bx::audio_mix_plan(partial, flat, error) == bx::AudioMixPlan::keep, "its recorded mix is kept untouched");
+  check(bx::audio_mix_plan(partial, muted, error) == bx::AudioMixPlan::refuse && !error.empty(),
+        "changing its levels is refused with a reason, never silently dropped");
+
+  // The same source on two tracks is ambiguous: its contribution cannot be known, so it is not rebuilt.
+  const std::string duplicate_file = root + "\\duplicate.mp4";
+  bx::write_file_atomic(duplicate_file, "duplicate source bytes");
+  bx::AudioLayout duplicate_layout = expected;
+  duplicate_layout.tracks[1].role = "desktop";
+  duplicate_layout.tracks[1].sources = {"desktop"};
+  duplicate_layout.tracks[2].role = "desktop";
+  duplicate_layout.tracks[2].title = "BuffrX Desktop";
+  duplicate_layout.tracks[2].sources = {"desktop"};
+  check(bx::write_audio_layout(duplicate_file, duplicate_layout), "a duplicated source is still written");
+  check(!bx::read_audio_layout(duplicate_file, 3).complete, "a source on two tracks is not a decomposition");
+
+  // A join carries one sidecar over only when every clip described the same tracks.
+  check(bx::same_audio_layout(layout, layout), "the same layout is the same layout");
+  const bx::AudioLayout other = bx::read_audio_layout(clip, 3);
+  check(bx::same_audio_layout(other, layout), "a re-read of one file is unchanged");
+  check(bx::write_audio_layout(clip, layout), "a layout is written back beside its file");
+  check(bx::read_audio_layout(clip, 3).tracks[0].title == "BuffrX Mix", "and read again the same way");
+
+  // A rename moves the labels with the clip; a sidecar already at the target is never replaced.
+  {
+    const std::string rename_root = root + "\\rename";
+    CreateDirectoryA(rename_root.c_str(), nullptr);
+    bx::LibraryPaths paths;
+    paths.clips_dir = rename_root;
+    paths.screenshots_dir = rename_root + "\\screenshots";
+    paths.thumbnails_dir = rename_root + "\\thumbs";
+    bx::library_init(paths);
+    const std::string source = rename_root + "\\source.mp4";
+    bx::write_file_atomic(source, "a clip that renames");
+    check(bx::write_audio_layout(source, expected), "the clip to rename has bound labels");
+    std::string renamed;
+    check(bx::library_rename(source, "renamed", renamed), "a clip with labels renames");
+    check(GetFileAttributesA((renamed + bx::kAudioLayoutSuffix).c_str()) != INVALID_FILE_ATTRIBUTES &&
+              bx::read_audio_layout(renamed, 3).buffrx,
+          "the labels follow the rename and still bind to the same bytes");
+    check(GetFileAttributesA((source + bx::kAudioLayoutSuffix).c_str()) == INVALID_FILE_ATTRIBUTES,
+          "nothing is left beside the old name");
+    const std::string taken_sidecar = rename_root + "\\taken.mp4" + bx::kAudioLayoutSuffix;
+    bx::write_file_atomic(taken_sidecar, R"({"version":1,"generator":"Other","tracks":[]})");
+    std::string refused;
+    check(!bx::library_rename(renamed, "taken", refused), "a rename refuses a target whose sidecar belongs to another file");
+    check(GetFileAttributesA(renamed.c_str()) != INVALID_FILE_ATTRIBUTES &&
+              bx::read_audio_layout(renamed, 3).buffrx,
+          "the refusal leaves the clip and its labels where they were");
+    check(GetFileAttributesA(taken_sidecar.c_str()) != INVALID_FILE_ATTRIBUTES, "the other file is never replaced");
+  }
+
+  const std::string removable = root + "\\removable.mp4";
+  bx::write_file_atomic(removable, "bytes that go");
+  check(bx::write_audio_layout(removable, expected), "a clip that will be removed has bound labels");
+  bx::remove_audio_layout(removable);
+  check(GetFileAttributesA((removable + bx::kAudioLayoutSuffix).c_str()) == INVALID_FILE_ATTRIBUTES,
+        "a BuffrX sidecar goes when its file does");
+}
+
+// A join's labels (audio_layout.h): what several clips' layouts can honestly become when their streams are
+// copied in order. A Game route that changed games keeps one generic lane; a changing lane gets a logical
+// id; mixes and imports cannot be combined without changing how the join sounds.
+void test_audio_join_layout() {
+  std::printf("audio join layout\n");
+  bx::AudioLayout one;
+  one.buffrx = true;
+  one.aggregate = true;
+  one.complete = true;
+  for (int track = 1; track <= 4; ++track) {
+    bx::AudioTrackLabel label;
+    label.index = track;
+    label.role = track == 1 ? "mix" : track == 2 ? "microphone" : "application";
+    label.title = track == 1 ? "BuffrX Mix" : track == 2 ? "BuffrX Microphone" : track == 3 ? "BuffrX Discord" : "BuffrX Game";
+    if (track > 1) label.sources.push_back(track == 2 ? "microphone" : track == 3 ? "app:Discord.exe" : "app:game");
+    one.tracks.push_back(std::move(label));
+  }
+  one.tracks[0].sources = {"microphone", "app:Discord.exe", "app:game"};
+
+  // The same layout in every chunk: the output carries it unchanged.
+  bx::JoinAudioLayout same = bx::join_audio_layout({one, one, one});
+  check(same.carries && !same.error.empty() == false && bx::same_audio_layout(same.layout, one),
+        "a join of identical layouts carries the labels unchanged");
+
+  // A cosmetic title difference on a lane whose source never changed keeps the lane's identity.
+  bx::AudioLayout retitled = one;
+  retitled.tracks[1].title = "Microphone (USB)";
+  bx::JoinAudioLayout titles = bx::join_audio_layout({one, retitled});
+  check(titles.carries && titles.layout.tracks[1].role == "microphone" &&
+            titles.layout.tracks[1].sources.size() == 1 && titles.layout.tracks[1].title == "BuffrX Microphone",
+        "a title-only difference keeps the lane as the source it always was");
+
+  // The Game route changed executable between chunks: its lane names the same generic source, so the lane
+  // stays a Game lane rather than becoming a different program's.
+  bx::AudioLayout other_game = one;
+  other_game.tracks[3].sources = {"app:game"};
+  other_game.tracks[3].title = "BuffrX Game";
+  check(bx::same_audio_layout(other_game, one), "a game change keeps the same lane identity");
+
+  // A lane that carried a different program in each chunk is named by its position, never by one input's
+  // name: a synthetic source, and the mix can still be rebuilt from the output's own stems.
+  bx::AudioLayout changed = one;
+  changed.tracks[2].sources = {"app:Spotify.exe"};
+  changed.tracks[2].title = "BuffrX Spotify";
+  changed.tracks[0].sources = {"microphone", "app:Spotify.exe", "app:game"};
+  bx::JoinAudioLayout lanes = bx::join_audio_layout({one, changed});
+  check(lanes.carries && lanes.layout.complete && lanes.layout.tracks[2].role == "combined" &&
+            lanes.layout.tracks[2].sources.size() == 1 &&
+            lanes.layout.tracks[2].sources[0] == "join:track:3" &&
+            lanes.layout.tracks[3].sources[0] == "app:game",
+        "a changing lane gets a positional identity while an unchanged lane keeps its own");
+
+  // Automatic buses retain their identity while their occupants change across chunks.
+  bx::AudioLayout automatic = one;
+  automatic.tracks[2].sources = {"auto:bus:3"};
+  automatic.tracks[2].title = "BuffrX ProbeA";
+  automatic.tracks[0].sources = {"microphone", "auto:bus:3", "app:game"};
+  bx::AudioLayout transition = automatic;
+  transition.tracks[2].title = "BuffrX ProbeA + ProbeD";
+  bx::AudioLayout departed = automatic;
+  departed.tracks[2].title = "BuffrX ProbeD";
+  const bx::JoinAudioLayout automatic_join = bx::join_audio_layout({automatic, transition, departed});
+  check(automatic_join.carries && automatic_join.layout.complete &&
+            automatic_join.layout.tracks[2].title == "BuffrX ProbeA + ProbeD" &&
+            automatic_join.layout.tracks[2].sources == automatic.tracks[2].sources,
+        "an automatic bus join keeps every occupant name once and its stable editable identity");
+  const bx::JoinAudioLayout automatic_again = bx::join_audio_layout({automatic_join.layout, departed});
+  check(automatic_again.layout.tracks[2].title == "BuffrX ProbeA + ProbeD",
+        "joining an automatic bus again does not duplicate occupant names");
+
+  // An incomplete input (the mix holds sound no stem carries) keeps the mix-first meaning, says so, and
+  // every level change stays refused.
+  bx::AudioLayout partial = one;
+  partial.tracks[0].sources = {"microphone", "app:Discord.exe"};  // the game's stem is not listed in the mix
+  partial.complete = false;
+  bx::JoinAudioLayout incomplete = bx::join_audio_layout({one, partial});
+  const bool unlisted = std::find(incomplete.layout.tracks[0].sources.begin(), incomplete.layout.tracks[0].sources.end(),
+                                  "join:unlisted") != incomplete.layout.tracks[0].sources.end();
+  check(incomplete.carries && !incomplete.layout.complete && unlisted,
+        "an incomplete input marks the joined mix incomplete instead of claiming all its stems");
+
+  // A mix and an import cannot share the first stream's meaning: no sidecar can describe the result.
+  bx::AudioLayout imported = bx::imported_audio_layout(4);
+  bx::JoinAudioLayout mixed = bx::join_audio_layout({one, imported});
+  check(!mixed.carries && !mixed.error.empty(), "mixes joined with imports are refused, with a reason");
+  bx::JoinAudioLayout imports = bx::join_audio_layout({imported, imported});
+  check(!imports.carries && imports.error.empty(), "imports joined with imports carry no sidecar, unchanged");
+  bx::AudioLayout single = bx::imported_audio_layout(1);
+  check(!bx::join_audio_layout({single, single}).carries, "a single stream has no mix to describe");
+
+  // The labels describe the chunks a join really copies. A range that crossed a settings change drops the
+  // part before it, and the dropped part's layout must not be read at all: a different stream count cannot
+  // be combined with the retained run, and a same-count chunk with another lane would mark the kept part's
+  // mix incomplete. The retained tail on its own is the layout the copy really has.
+  const bx::AudioLayout six = bx::imported_audio_layout(6);
+  const bx::JoinAudioLayout dropped_streams = bx::join_audio_layout({six, one});
+  check(!dropped_streams.carries && !dropped_streams.error.empty(),
+        "a dropped chunk with another stream count is not part of the labels");
+  const bx::JoinAudioLayout kept_only = bx::join_audio_layout({one});
+  check(kept_only.carries && kept_only.layout.complete && bx::same_audio_layout(kept_only.layout, one),
+        "the retained tail alone carries its own complete layout");
+  const bx::JoinAudioLayout contaminated = bx::join_audio_layout({partial, one});
+  const bool dropped_name = std::find(contaminated.layout.tracks[0].sources.begin(),
+                                      contaminated.layout.tracks[0].sources.end(),
+                                      "join:unlisted") != contaminated.layout.tracks[0].sources.end();
+  check(contaminated.carries && !contaminated.layout.complete && dropped_name,
+        "a dropped same-width chunk with another lane would contaminate the kept part's labels");
+  check(kept_only.carries && kept_only.layout.complete && kept_only.layout.tracks[0].sources.size() == 3,
+        "while the retained tail alone stays the complete mix it recorded");
+}
+
 // The Timeline's retention window: off until the user picks one of the four lengths, and anything else -
 // a hand-edited file, a version 5 file that predates the field - is off. Four windows, so the engine
 // never has to guess what 45 minutes would mean.
@@ -829,6 +1884,54 @@ void test_chords() {
             (modifiers & MOD_CONTROL) && (modifiers & MOD_SHIFT),
         "multi-modifier function key parses");
   check(!bx::parse_chord("C", modifiers, key, problem), "a lone letter is rejected");
+  // Issue 3: skippable keys (F1-F24, Pause, Scroll Lock) may stand alone; every typing or navigation key may not.
+  check(bx::parse_chord("F8", modifiers, key, problem) && key == VK_F8 && (modifiers & MOD_NOREPEAT) && problem.empty(),
+        "F8 alone is accepted, with MOD_NOREPEAT");
+  check(bx::parse_chord("Pause", modifiers, key, problem) && key == VK_PAUSE && problem.empty(), "Pause alone is accepted");
+  check(bx::parse_chord("ScrollLock", modifiers, key, problem) && key == VK_SCROLL && problem.empty(),
+        "Scroll Lock alone is accepted");
+  check(bx::parse_chord("Ctrl+F8", modifiers, key, problem) && key == VK_F8 && (modifiers & MOD_CONTROL),
+        "a modifier plus F8 still parses");
+  check(!bx::parse_chord("1", modifiers, key, problem), "a lone digit is rejected");
+  check(!bx::parse_chord("Space", modifiers, key, problem), "a lone space is rejected");
+  check(!bx::parse_chord("Tab", modifiers, key, problem), "a lone tab is rejected");
+  check(!bx::parse_chord("Left", modifiers, key, problem), "a lone arrow is rejected");
+  check(bx::parse_chord("Delete", modifiers, key, problem) && key == VK_DELETE && problem.empty(),
+        "Delete alone is accepted: the owner chose the editing keys");
+  check(!bx::parse_chord("Enter", modifiers, key, problem) && !bx::parse_chord("Backspace", modifiers, key, problem) &&
+            !bx::parse_chord("Esc", modifiers, key, problem) && !bx::parse_chord("Up", modifiers, key, problem),
+        "Enter, Backspace, Esc and the arrows stay refused alone");
+  check(!bx::parse_chord("F25", modifiers, key, problem), "a function key beyond F24 is rejected");
+  check(!bx::parse_chord("F8junk", modifiers, key, problem), "a function key with trailing text is rejected");
+  check(!bx::parse_chord("F8+", modifiers, key, problem), "a lone key with a dangling separator is rejected");
+  check(bx::lone_key_allowed(VK_F1) && bx::lone_key_allowed(VK_F24) && bx::lone_key_allowed(VK_PAUSE) &&
+            bx::lone_key_allowed(VK_SCROLL),
+        "the lone-key policy names F1-F24, Pause and Scroll Lock");
+  check(bx::lone_key_allowed(VK_INSERT) && bx::lone_key_allowed(VK_NUMPAD0) && bx::lone_key_allowed(VK_NUMPAD9) &&
+            bx::parse_chord("Num5", modifiers, key, problem) && key == VK_NUMPAD5 && problem.empty() &&
+            bx::parse_chord("Insert", modifiers, key, problem) && key == VK_INSERT,
+        "Insert and the numpad digits may stand alone");
+  {
+    // The owner's list (2026-11-15): editing keys, numpad operators, and . , [ ]. Each names itself and comes back.
+    const char* alone[] = {"Home", "End", "PageUp", "PageDown", "Delete", "NumMul", "NumDiv", "NumAdd", "NumSub", "NumDot",
+                           "Period", "Comma", "LBracket", "RBracket"};
+    bool all_alone = true;
+    for (const char* name : alone) {
+      UINT mods = 0, vk = 0;
+      std::string why;
+      if (!bx::parse_chord(name, mods, vk, why) || !bx::lone_key_allowed(vk) || bx::format_chord(mods & ~MOD_NOREPEAT, vk) != name)
+        all_alone = false;
+    }
+    check(all_alone, "every owner-chosen lone key parses alone and is written back under the same name");
+    check(bx::parse_chord("Ctrl+Period", modifiers, key, problem) && key == VK_OEM_PERIOD && (modifiers & MOD_CONTROL),
+          "a modifier plus a punctuation key still parses");
+  }
+  check(!bx::lone_key_allowed('K') && !bx::lone_key_allowed('1') && !bx::lone_key_allowed(VK_LEFT) &&
+            !bx::lone_key_allowed(VK_TAB) && !bx::lone_key_allowed(VK_SPACE),
+        "letters, digits and navigation keys are not lone keys");
+  const bool shifted_f8 = bx::parse_chord("Shift+F8", modifiers, key, problem) && (modifiers & MOD_SHIFT) &&
+                          (modifiers & MOD_NOREPEAT);
+  check(shifted_f8, "an existing modified F-key chord stays valid");
   check(!bx::parse_chord("Ctrl+NotAKey", modifiers, key, problem), "an unknown key is rejected");
   check(!bx::parse_chord("Ctrl+", modifiers, key, problem), "a dangling modifier is rejected");
   check(bx::format_chord(MOD_CONTROL | MOD_ALT, 'Z') == "Ctrl+Alt+Z", "chords format back");
@@ -1268,7 +2371,9 @@ void test_display_target() {
   // The name survives a rearrange; a stale index would pick a different screen.
   check(bx::pick_display(list, 0, "\\\\.\\DISPLAY3").device == "\\\\.\\DISPLAY3", "display: name wins over the index");
   check(bx::pick_display(list, 1, "").id == 1, "display: index picks when no name is saved");
-  check(bx::pick_display(list, 2, "\\\\.\\DISPLAY9").id == 2, "display: a name that is gone falls back to the index");
+  const bx::DisplayPick missing_named = bx::pick_display(list, 2, "\\\\.\\DISPLAY9");
+  check(missing_named.found && missing_named.primary_fallback && missing_named.id == 0,
+        "display: a name that is gone falls back to the primary");
   // Out of range: the primary keeps the buffer working, and the caller is told it was not the choice.
   const bx::DisplayPick missing = bx::pick_display(list, 7, "");
   check(missing.found && missing.primary_fallback && missing.id == 0, "display: an absent index captures the primary");
@@ -1290,18 +2395,34 @@ void test_display_target() {
   before.display_id = 1;
   before.display_name = "\\\\.\\DISPLAY2";
   bx::Config after = before;
-  check(!bx::display_switch_needs_replan(before, after, 1920, 1080, 2560, 1440, false), "display: no switch, no rebuild");
+  check(!bx::display_switch_needs_replan(before, after, 1920, 1080, 2560, 1440, false, true),
+        "display: no switch, no rebuild");
   after.display_id = 0;
   after.display_name = "\\\\.\\DISPLAY1";
-  check(bx::display_switch_needs_replan(before, after, 2560, 1440, 1920, 1080, false),
+  check(bx::display_switch_needs_replan(before, after, 2560, 1440, 1920, 1080, false, true),
         "display: a switch to another size rebuilds the canvas");
-  check(!bx::display_switch_needs_replan(before, after, 1920, 1080, 1920, 1080, false),
-        "display: a switch to the same size keeps the buffer");
-  check(!bx::display_switch_needs_replan(before, after, 2560, 1440, 1920, 1080, true),
+  check(!bx::display_switch_needs_replan(before, after, 1920, 1080, 1920, 1080, false, true),
+        "display: a switch to the same size keeps the buffer when the device already sees it");
+  // The 2026-11-12 report: a screen on another card, or one attached after the device was made, is not in
+  // the device's DXGI outputs. Swapping only the source leaves the capture on the wrong card, where libobs
+  // falls to Windows Graphics Capture - which has delivered no frame at all, so the ring writes black.
+  check(bx::display_switch_needs_replan(before, after, 1920, 1080, 1920, 1080, false, false),
+        "display: a same-size switch to a display the device cannot see moves the device");
+  check(bx::display_switch_needs_replan(before, after, 2560, 1440, 1920, 1080, true, false),
+        "display: another card moves the device even when performance mode owns the canvas");
+  check(!bx::display_switch_needs_replan(before, before, 1920, 1080, 1920, 1080, false, false),
+        "display: the same choice never rebuilds, even for a display the device cannot see");
+  check(bx::device_outputs_have({"\\\\.\\DISPLAY1", "\\\\.\\DISPLAY2"}, "\\\\.\\DISPLAY2"),
+        "display: a device's own output list covers its screens");
+  check(!bx::device_outputs_have({"\\\\.\\DISPLAY1"}, "\\\\.\\DISPLAY2"),
+        "display: a screen on another card is not in the list");
+  check(!bx::device_outputs_have({}, "\\\\.\\DISPLAY1"), "display: no listed output covers nothing");
+  check(!bx::device_outputs_have({"\\\\.\\DISPLAY1"}, ""), "display: an unresolved display is not an output");
+  check(!bx::display_switch_needs_replan(before, after, 2560, 1440, 1920, 1080, true, true),
         "display: performance mode owns the canvas");
   bx::Config game = before;
   game.capture_mode = "game";
-  check(!bx::display_switch_needs_replan(game, after, 2560, 1440, 1920, 1080, false),
+  check(!bx::display_switch_needs_replan(game, after, 2560, 1440, 1920, 1080, false, true),
         "display: leaving a game does not replan");
 }
 
@@ -1670,6 +2791,21 @@ void test_media_math() {
   job.start = 2.0;
   job.end = 8.0;
   check(bx::export_plan(job) == bx::ExportPlan::copy, "a plain cut is a stream copy");
+  for (int option = 0; option < 3; ++option) {
+    bx::ExportJob audio_format;
+    if (option == 0) audio_format.audio_rate = 44100;
+    if (option == 1) audio_format.audio_channels = 1;
+    if (option == 2) audio_format.audio_kbps = 96;
+    check(bx::export_plan(audio_format) == bx::ExportPlan::audio_only, "an explicit audio format is honoured without a volume edit");
+  }
+  {
+    bx::ExportJob picture_format;
+    picture_format.fps = 30.0;
+    check(bx::export_plan(picture_format) == bx::ExportPlan::reencode, "an explicit frame rate cannot be a stream copy");
+    picture_format = {};
+    picture_format.video_codec = "h264";
+    check(bx::export_plan(picture_format) == bx::ExportPlan::reencode, "a forced codec cannot be a stream copy");
+  }
   job.volumes = {1.0, 1.0};
   check(bx::export_plan(job) == bx::ExportPlan::copy, "unchanged volumes are still a copy");
   job.volumes = {1.0, 0.5};
@@ -1927,6 +3063,18 @@ void test_media_join_spec() {
   check(request.files.size() == 2 && request.output == "out.mp4" && request.start_in_first_seconds == 1.5 &&
             request.end_in_last_seconds == 9.0,
         "the files, the output and both cuts are read");
+  check(!request.carry_audio_labels, "a spec that says nothing carries no labels");
+
+  // A caller that owns the join's output as a finished file asks the child to carry the inputs' track labels
+  // over to it. The flag has to reach the child, or the labels are decided in the parent from every planned
+  // chunk - including the chunks a settings change dropped - with the output's stream count as if it described
+  // them (Timeline save, clips.export_range).
+  bx::Json carrying;
+  check(bx::Json::parse(
+            R"({"files":["a.mp4","b.mp4"],"output":"out.mp4","end_in_last":9.0,"carry_audio_labels":true})",
+            carrying, parse_error) &&
+            bx::parse_media_join_request(carrying, request, error) && request.carry_audio_labels,
+        "a join asked to carry the audio labels says so");
 
   bx::Json no_output;
   check(bx::Json::parse(R"({"files":["a.mp4"]})", no_output, parse_error) &&
@@ -2332,12 +3480,12 @@ void test_links() {
 
   const std::string page_link = bx::link_url("https://example.github.io/buffrx/l/", ticket);
   check(page_link == "https://example.github.io/buffrx/l/#" + payload, "a link page link puts the payload in the fragment");
-  const std::string named_link = bx::link_url("https://example.github.io/buffrx/l/", ticket, "Jude R");
-  check(named_link == page_link + "?n=Jude%20R", "a sender name rides after the payload, percent-encoded");
+  const std::string named_link = bx::link_url("https://example.github.io/buffrx/l/", ticket, "Sender A");
+  check(named_link == page_link + "?n=Sender%20A", "a sender name rides after the payload, percent-encoded");
   check(bx::parse_link_url(named_link, back) && back.expires == ticket.expires, "a link with a sender name reads back");
   check(bx::parse_link_url(named_link + ").", back), "punctuation after a sender name is ignored");
-  check(bx::link_url("", ticket, "Jude") == "buffrx://l/" + payload, "a buffrx:// link carries no sender name");
-  check(bx::link_sender_name("  Jude\n") == "Jude" && bx::link_sender_name(" \t\r\n") == std::string(),
+  check(bx::link_url("", ticket, "Sender") == "buffrx://l/" + payload, "a buffrx:// link carries no sender name");
+  check(bx::link_sender_name("  Sender\n") == "Sender" && bx::link_sender_name(" \t\r\n") == std::string(),
         "a sender name is trimmed and control characters are dropped");
   check(bx::link_sender_name(std::string(40, 'a')).size() == 32, "a sender name is at most 32 bytes");
   std::string accented;
@@ -2402,7 +3550,7 @@ void test_links() {
 
   // The short-link service is asked about the ticket, never the whole address, and a code is dropped by the
   // same ticket the service stored: today's link can carry a different relay after a restarted helper.
-  check(bx::link_fragment("https://buffrx.app/l/#abc?n=Jude") == "abc?n=Jude",
+  check(bx::link_fragment("https://buffrx.app/l/#abc?n=Sender") == "abc?n=Sender",
         "a link's ticket is the text after its #");
   check(bx::link_fragment("https://buffrx.app/l/").empty() && bx::link_fragment("https://buffrx.app/l/#").empty() &&
             bx::link_fragment("").empty(),
@@ -2609,6 +3757,36 @@ void test_encoder_candidates() {
   const std::vector<std::string> unknown{"ffmpeg_av1_svt", "com.apple.videotoolbox", "something_else"};
   check(bx::encoder_candidates(unknown, "h264", "auto").empty(),
         "FFmpeg-built and foreign encoders are never candidates");
+
+  // The ids OBS 33.0.1 really registers (its obs-ffmpeg, obs-nvenc and obs-qsv11 modules). AMD's HEVC is h265_*, and it
+  // must be offered for HEVC and never as H.264: before the codec helper it was the H.264 candidate and HEVC was empty.
+  const std::vector<std::string> obs_ids{"obs_x264",          "obs_nvenc_h264_tex", "obs_nvenc_hevc_tex", "obs_nvenc_av1_tex",
+                                         "h264_texture_amf",  "h264_fallback_amf",  "h265_texture_amf",   "h265_fallback_amf",
+                                         "av1_texture_amf",   "av1_fallback_amf",   "obs_qsv11_v2",       "obs_qsv11_hevc",
+                                         "obs_qsv11_av1",     "ffmpeg_av1_svt"};
+  check(bx::encoder_codec("h264_texture_amf") == "h264" && bx::encoder_codec("h264_fallback_amf") == "h264" &&
+            bx::encoder_codec("obs_x264") == "h264" && bx::encoder_codec("obs_qsv11_v2") == "h264",
+        "H.264 ids are read as H.264");
+  check(bx::encoder_codec("h265_texture_amf") == "hevc" && bx::encoder_codec("h265_fallback_amf") == "hevc" &&
+            bx::encoder_codec("obs_nvenc_hevc_tex") == "hevc" && bx::encoder_codec("obs_qsv11_hevc") == "hevc",
+        "the AMD h265 ids and the NVENC and QSV hevc ids are HEVC");
+  check(bx::encoder_codec("av1_texture_amf") == "av1" && bx::encoder_codec("obs_nvenc_av1_tex") == "av1" &&
+            bx::encoder_codec("obs_qsv11_av1") == "av1",
+        "the AV1 ids are AV1");
+  check(bx::encoder_candidates(obs_ids, "hevc", "auto") ==
+            std::vector<std::string>{"obs_nvenc_hevc_tex", "h265_texture_amf", "h265_fallback_amf", "obs_qsv11_hevc"},
+        "HEVC auto: the real OBS ids, NVENC then AMD (texture, then fallback) then QSV");
+  check(bx::encoder_candidates(obs_ids, "hevc", "amf") == std::vector<std::string>{"h265_texture_amf", "h265_fallback_amf"},
+        "AMD HEVC is offered for an explicit AMD HEVC choice");
+  check(bx::encoder_candidates(obs_ids, "h264", "amf") == std::vector<std::string>{"h264_texture_amf", "h264_fallback_amf"},
+        "AMD H.264 never includes the h265 ids");
+  check(bx::encoder_candidates(obs_ids, "h264", "auto") ==
+            std::vector<std::string>{"obs_nvenc_h264_tex", "h264_texture_amf", "h264_fallback_amf", "obs_qsv11_v2", "obs_x264"},
+        "H.264 auto: no HEVC or AV1 id enters the list");
+  check(bx::encoder_candidates(obs_ids, "av1", "auto") ==
+            std::vector<std::string>{"obs_nvenc_av1_tex", "av1_texture_amf", "av1_fallback_amf", "obs_qsv11_av1"},
+        "AV1 auto: the AV1 ids only, and the FFmpeg software encoder stays out");
+  check(bx::encoder_candidates(obs_ids, "hevc", "software").empty(), "no software HEVC encoder exists to be chosen");
 }
 
 void test_save_check() {
@@ -3449,6 +4627,7 @@ void test_command_policy() {
   check(bx::command_needs_engine_lock("recording.start"), "starting a recording holds the engine lock");
   check(bx::command_needs_engine_lock("not.a.command"), "an unknown command is locked by default");
   check(!bx::command_needs_engine_lock("clips.list"), "listing the library does not stall the tick");
+  check(!bx::command_needs_engine_lock("audio.sessions"), "reading Windows audio sessions cannot block capture or a hotkey save");
   check(!bx::command_needs_engine_lock("clips.export_range"), "a range export does not stall the tick");
   check(!bx::command_needs_engine_lock("ui.frame_stats"), "reading the frame numbers does not wait for the tick");
   check(!bx::command_needs_engine_lock("timeline.edit_source"), "reading editor footage never holds the engine lock");
@@ -3530,6 +4709,26 @@ void test_session_store() {
   check(bx::session_store_delete(tampered, error), "a session with only an outside chunk still deletes");
   check(GetFileAttributesA(keep_file.c_str()) != INVALID_FILE_ATTRIBUTES,
         "a chunk path outside the session is left alone");
+
+  // A chunk that goes takes this product's labels and leaves a stranger's file alone.
+  SessionEntry labelled;
+  check(bx::session_store_begin("timeline", labelled, error), "a session begins for the label cleanup");
+  const std::string own_chunk = bx::session_media_dir(labelled.id) + "\\own.mp4";
+  const std::string foreign_chunk = bx::session_media_dir(labelled.id) + "\\foreign.mp4";
+  write_bytes(own_chunk, 32);
+  write_bytes(foreign_chunk, 32);
+  check(index_test_chunk(labelled, own_chunk, 1000, 2000, error) &&
+            index_test_chunk(labelled, foreign_chunk, 2000, 3000, error),
+        "both chunks are indexed");
+  bx::write_file_atomic(own_chunk + bx::kAudioLayoutSuffix,
+                        R"({"version":1,"generator":"BuffrX","tracks":[]})");
+  const std::string foreign_labels = R"({"version":1,"generator":"Other","tracks":[]})";
+  bx::write_file_atomic(foreign_chunk + bx::kAudioLayoutSuffix, foreign_labels);
+  check(bx::session_store_delete(labelled, error), "the labelled session deletes");
+  check(GetFileAttributesA((own_chunk + bx::kAudioLayoutSuffix).c_str()) == INVALID_FILE_ATTRIBUTES,
+        "this product's chunk labels go with the session");
+  check(GetFileAttributesA((foreign_chunk + bx::kAudioLayoutSuffix).c_str()) != INVALID_FILE_ATTRIBUTES,
+        "a file somebody else put at the label name is not deleted");
 
   // A text prefix is not containment: a chunk path inside the session by spelling but holding `..`
   // resolved outside it, so a tampered index could delete any file the account can reach.
@@ -4545,6 +5744,21 @@ void test_timeline_thumbs() {
 // Task 8: the chunks of one join must carry the same stream. A settings change between the chunks
 // produces two readable files that cannot be concatenated, and the copy has to refuse it before it
 // creates the output: a broken clip on disk is worse than an error.
+// A Timeline segment's epoch moves only where a save's copy could not join: another encoder, picture, kept rate or track count.
+void test_timeline_epoch() {
+  std::printf("timeline epoch\n");
+  const std::string base = bx::timeline_layout_key("obs_nvenc_h264_tex", 2560, 1440, 1);
+  check(bx::next_timeline_epoch(0, "", base) == 0, "timeline epoch: a session's first segment keeps epoch 0");
+  check(bx::next_timeline_epoch(0, base, base) == 0,
+        "timeline epoch: a resume in the same layout (a pause, an effort swap, a frame-rate step) stays");
+  check(bx::next_timeline_epoch(3, base, bx::timeline_layout_key("obs_nvenc_h264_tex", 2560, 1440, 6)) == 4,
+        "timeline epoch: another number of audio tracks is a new epoch");
+  check(bx::next_timeline_epoch(0, base, bx::timeline_layout_key("obs_nvenc_h264_tex", 1920, 1080, 1)) == 1,
+        "timeline epoch: another picture size is a new epoch");
+  check(bx::next_timeline_epoch(0, base, bx::timeline_layout_key("obs_x264", 2560, 1440, 1)) == 1,
+        "timeline epoch: another encoder (the fallback ladder) is a new epoch");
+}
+
 void test_stream_compatibility() {
   std::printf("stream compatibility\n");
   {
@@ -4564,6 +5778,20 @@ void test_stream_compatibility() {
     check(bx::trailing_compatible_run({h264, h264, av1, av1}) == 2, "the run that holds the end starts after the change");
     check(bx::trailing_compatible_run({h264, av1, h264}) == 2, "a change back is a change: only the last chunk is the end's layout");
     check(bx::trailing_compatible_run({}) == 0 && bx::trailing_compatible_run({av1}) == 0, "nothing, or one chunk, has no change");
+    // A switch between desktop sound (one or two tracks) and app capture (six) mid-session is a layout change: the save keeps
+    // the part after it instead of failing the whole join on a stream count the copy cannot map.
+    bx::StreamSignature apps = h264;
+    apps.audio_streams = 6;
+    h264.audio_streams = 2;
+    check(!bx::streams_compatible(h264, apps), "a different number of audio streams is refused");
+    check(bx::trailing_compatible_run({h264, h264, apps}) == 2, "a change of audio track count keeps the run after it");
+    // A frame-rate step (the controller's divisor) is joined by a rescaling copy; a layout change still splits it.
+    bx::StreamSignature half = h264;
+    half.frame_rate = {30, 1};
+    half.time_base = {1, 30000};
+    check(bx::trailing_compatible_run({h264, half}) == 1, "a plain copy splits at a frame-rate change");
+    check(bx::trailing_compatible_run({h264, half, h264}, true) == 0, "a rescaling copy joins across frame-rate changes, both ways");
+    check(bx::trailing_compatible_run({h264, half, apps}, true) == 2, "and still splits where the sound changes");
   }
   bx::StreamSignature base;
   base.codec_id = 27;  // AV_CODEC_ID_H264, as an int: the test links no FFmpeg
@@ -4849,7 +6077,7 @@ void test_buffer_stop_route() {
         "buffer.stop goes through the helper that ends the session");
   check(route.find("host_.stop_buffer()") == std::string::npos,
         "buffer.stop does not take the internal path that keeps the session");
-  const size_t toggle = source.find("if (host_.buffer_wanted()) {");
+  const size_t toggle = source.find("if (host_.buffer_wanted() || game_wait_) {");
   check(toggle != std::string::npos && source.find("stop_buffer_with_timeline(host_);", toggle) != std::string::npos,
         "the buffer toggle (hotkey, tray, panel) is the same manual stop");
 }
@@ -4943,7 +6171,7 @@ void test_window_thread_routes() {
         "the queued quit stops the Timeline and the recording under the engine lock");
 
   // B3: the startup start keeps the engine lock open across host.start_buffer.
-  const size_t startup = main_source.find("if (config.start_buffering && !restarted)");
+  const size_t startup = main_source.find("if ((config.start_buffering || relaunched) && !restarted)");
   const size_t startup_end = startup == std::string::npos ? std::string::npos : main_source.find("} else {", startup);
   const std::string startup_block =
       startup == std::string::npos ? std::string() : main_source.substr(startup, startup_end - startup);
@@ -5027,7 +6255,8 @@ void test_ui_host_lifetimes() {
   check(host.find("PROCESS_TERMINATE") != std::string::npos, "the editor is opened with the right to end it");
 
   // B16: a removed or reset device is noticed, and the next pass rebuilds it instead of drawing into it.
-  check(host.find("DXGI_ERROR_DEVICE_REMOVED") != std::string::npos && host.find("DXGI_ERROR_DEVICE_RESET") != std::string::npos,
+  check(body("void UiHost::render").find("classify_present") != std::string::npos &&
+            body("void UiHost::render").find("PresentOutcome::lost") != std::string::npos,
         "a removed or reset device is noticed");
   check(body("void UiHost::frame").find("device_lost_") != std::string::npos &&
             body("void UiHost::frame").find("release_device();") != std::string::npos,
@@ -5301,7 +6530,7 @@ void test_lifetime_guards() {
 
   // B10: starting on a running game switches Performance mode only when no manual recording is being written;
   // otherwise the switch split the recording, which is the deferral update_performance_for_game already has.
-  const size_t start = commands.find("void Protocol::start_on_running_game()");
+  const size_t start = commands.find("bool Protocol::start_on_running_game()");
   const size_t start_end = start == std::string::npos ? std::string::npos : commands.find("\n}", start);
   const std::string start_body = start == std::string::npos ? std::string() : commands.substr(start, start_end - start);
   const size_t deferred = start_body.find("host_.recording_busy()");
@@ -7827,9 +9056,180 @@ void test_encoder_modes() {
   pending.encoder_options.set("preset", bx::Json("p6"));
   pending.encoder_options.set("lookahead", bx::Json(true));
   planned = bx::configured_encoder_settings(bx::EncoderFamily::Nvenc, pending, 3);
-  check(bx::encoder_setting_value(planned, "preset").as_string() == "p6" &&
-            bx::encoder_setting_value(planned, "lookahead").as_bool(),
-        "custom settings survive and are not overwritten by the Auto governor");
+  check(pending.encoder_options["preset"].as_string() == "p6" && pending.encoder_options["lookahead"].as_bool(),
+        "custom: the saved options are not rewritten by relief");
+  check(bx::encoder_setting_value(planned, "preset").as_string() == "p2" &&
+            !bx::encoder_setting_value(planned, "lookahead").as_bool(),
+        "custom: the effective settings get the relief at step 3 (p6 to p2, look-ahead off)");
+
+  // Relief is the last layer in every mode, and only ever lightens a setting: a choice already faster than the step
+  // is kept, and a value the family does not name is kept as it is.
+  auto planned_for = [](const std::string& mode, bx::EncoderFamily family, int step) {
+    bx::Config c;
+    c.quality = "high";
+    c.encoder_mode = mode;
+    return bx::configured_encoder_settings(family, c, step);
+  };
+  auto value_of = [](const std::vector<bx::EncoderSetting>& list, const char* name) { return bx::encoder_setting_value(list, name); };
+  using bx::EncoderFamily;
+  check(value_of(planned_for("quality", EncoderFamily::Nvenc, 0), "preset").as_string() == "p7", "no step: Maximum keeps p7");
+  check(value_of(planned_for("auto", EncoderFamily::Nvenc, 1), "preset").as_string() == "p5", "Auto step 1: balanced p5 stays p5");
+  check(value_of(planned_for("auto", EncoderFamily::Nvenc, 2), "preset").as_string() == "p4", "Auto step 2 steps to p4 in every mode");
+  check(value_of(planned_for("fast", EncoderFamily::Nvenc, 1), "preset").as_string() == "p3",
+        "Fast's p3 is kept at step 1: the p5 relief would make it heavier");
+  check(value_of(planned_for("fast", EncoderFamily::Nvenc, 1), "multipass").as_string() == "disabled",
+        "Fast's disabled multipass is kept at step 1: qres would be heavier");
+  check(value_of(planned_for("fast", EncoderFamily::Nvenc, 3), "preset").as_string() == "p2", "Fast steps to p2 at step 3");
+  check(value_of(planned_for("quality", EncoderFamily::Nvenc, 1), "preset").as_string() == "p5" &&
+            value_of(planned_for("quality", EncoderFamily::Nvenc, 1), "multipass").as_string() == "qres",
+        "Maximum's p7 and full-resolution multipass step down at step 1");
+  check(!value_of(planned_for("quality", EncoderFamily::Nvenc, 1), "lookahead").as_bool(),
+        "Maximum's look-ahead is off at step 1");
+  bx::Config custom_fast;
+  custom_fast.quality = "high";
+  custom_fast.encoder_mode = "custom";
+  custom_fast.encoder_options.set("preset", bx::Json("p1"));
+  check(value_of(bx::configured_encoder_settings(EncoderFamily::Nvenc, custom_fast, 3), "preset").as_string() == "p1",
+        "Custom p1 (already the fastest) is kept at the deepest step");
+  bx::Config custom_unknown;
+  custom_unknown.quality = "high";
+  custom_unknown.encoder_mode = "custom";
+  custom_unknown.encoder_options.set("preset", bx::Json("pX"));
+  check(value_of(bx::configured_encoder_settings(EncoderFamily::Nvenc, custom_unknown, 1), "preset").as_string() == "pX",
+        "a value the family does not name is kept, not guessed at");
+
+  check(value_of(planned_for("fast", EncoderFamily::Amf, 1), "preset").as_string() == "speed",
+        "AMF Fast (speed) is kept at step 1: balanced would be heavier");
+  check(value_of(planned_for("quality", EncoderFamily::Amf, 1), "preset").as_string() == "balanced" &&
+            value_of(planned_for("quality", EncoderFamily::Amf, 2), "preset").as_string() == "speed",
+        "AMF Maximum (quality) steps to balanced, then speed");
+  check(!value_of(planned_for("auto", EncoderFamily::Amf, 0), "pre_analysis").as_bool(true),
+        "pre-analysis is off by default: the tier writes it explicitly (plan 009)");
+  check(!value_of(planned_for("auto", EncoderFamily::Amf, 1), "pre_analysis").as_bool() &&
+            value_of(planned_for("auto", EncoderFamily::Amf, 1), "pre_analysis").is_bool(),
+        "a relief step turns pre-analysis off");
+  bx::Config custom_amf;
+  custom_amf.quality = "high";
+  custom_amf.encoder_mode = "custom";
+  custom_amf.encoder_options.set("pre_analysis", bx::Json(true));
+  check(value_of(bx::configured_encoder_settings(EncoderFamily::Amf, custom_amf, 0), "pre_analysis").as_bool(),
+        "a pre-analysis the person chose stays on while no relief is on");
+  check(!value_of(bx::configured_encoder_settings(EncoderFamily::Amf, custom_amf, 1), "pre_analysis").as_bool() &&
+            custom_amf.encoder_options["pre_analysis"].as_bool(),
+        "relief turns the chosen pre-analysis off in the effective list; the saved option stays on");
+  check(value_of(planned_for("fast", EncoderFamily::Qsv, 1), "target_usage").as_string() == "TU7",
+        "QSV Fast (TU7, the fastest) is kept at step 1");
+  check(value_of(planned_for("balanced", EncoderFamily::Qsv, 1), "target_usage").as_string() == "TU5" &&
+            value_of(planned_for("balanced", EncoderFamily::Qsv, 2), "target_usage").as_string() == "TU6",
+        "QSV Balanced (TU4) steps to TU5, then TU6");
+  check(value_of(planned_for("quality", EncoderFamily::Qsv, 3), "target_usage").as_string() == "TU7",
+        "QSV Maximum (TU2) steps to TU7 at step 3");
+  check(value_of(planned_for("fast", EncoderFamily::X264, 1), "preset").as_string() == "veryfast" &&
+            value_of(planned_for("fast", EncoderFamily::X264, 3), "preset").as_string() == "ultrafast",
+        "x264 Fast (veryfast) keeps veryfast at step 1 and steps to ultrafast at step 3");
+  check(value_of(planned_for("balanced", EncoderFamily::X264, 1), "preset").as_string() == "veryfast" &&
+            value_of(planned_for("quality", EncoderFamily::X264, 2), "preset").as_string() == "superfast",
+        "x264 medium and slow step down by the same rule");
+  bx::Config custom_x264;
+  custom_x264.quality = "high";
+  custom_x264.encoder_mode = "custom";
+  custom_x264.encoder_options.set("preset", bx::Json("ultrafast"));
+  check(value_of(bx::configured_encoder_settings(EncoderFamily::X264, custom_x264, 3), "preset").as_string() == "ultrafast",
+        "x264 custom ultrafast is kept at the deepest step");
+
+  // The family orders the relief compares by: a larger rank is heavier, and an unnamed value has none.
+  check(bx::encoder_speed_rank(EncoderFamily::Nvenc, "preset", "p1") < bx::encoder_speed_rank(EncoderFamily::Nvenc, "preset", "p7") &&
+            bx::encoder_speed_rank(EncoderFamily::Qsv, "target_usage", "TU7") < bx::encoder_speed_rank(EncoderFamily::Qsv, "target_usage", "TU1") &&
+            bx::encoder_speed_rank(EncoderFamily::Amf, "preset", "speed") < bx::encoder_speed_rank(EncoderFamily::Amf, "preset", "highQuality") &&
+            bx::encoder_speed_rank(EncoderFamily::X264, "preset", "ultrafast") < bx::encoder_speed_rank(EncoderFamily::X264, "preset", "placebo"),
+        "each family's speed order runs from its fastest to its slowest");
+  check(bx::encoder_speed_rank(EncoderFamily::Nvenc, "preset", "p9") == -1 && bx::encoder_speed_rank(EncoderFamily::Amf, "preset", "turbo") == -1 &&
+            bx::encoder_speed_rank(EncoderFamily::Qsv, "target_usage", "balanced") == -1,
+        "a value the family does not name has no rank");
+
+  // The Advanced page saves a row edit as encoder_options_after_edit writes it: the person's own choices for the rows the
+  // encoder lists (`snap_choice`, the host's `base`, relief left out), every stored option kept as it is, and the edited
+  // row last. Running values, which carry the relief, must never reach the saved options.
+  const std::vector<std::string> snap_rows{"preset", "multipass", "lookahead", "adaptive_quantization", "target_usage",
+                                           "pre_analysis"};
+  auto snap_choice = [](bx::EncoderFamily family, const bx::Config& c) {
+    bx::Json base = bx::Json::object();
+    for (const bx::EncoderSetting& setting : bx::configured_encoder_settings(family, c, 0)) base.set(setting.name, setting.value);
+    return base;
+  };
+  auto snap_custom = [](bx::Config c, const bx::Json& options) {
+    c.encoder_mode = "custom";
+    c.encoder_options = options;
+    return c;
+  };
+  bx::Config snap_maximum;
+  snap_maximum.quality = "high";
+  snap_maximum.encoder_mode = "quality";
+  const bx::Json snap_nvenc = snap_choice(bx::EncoderFamily::Nvenc, snap_maximum);
+
+  // Maximum on NVENC at relief step 2 runs p4, multipass off and look-ahead off. Editing one switch saves the choices,
+  // and none of the relieved values.
+  const bx::Json snap_after = bx::encoder_options_after_edit(bx::Json::object(), snap_nvenc, snap_rows, "adaptive_quantization", bx::Json(false));
+  check(snap_after["preset"].as_string() == "p7" && snap_after["multipass"].as_string() == "fullres" && snap_after["lookahead"].as_bool() &&
+            !snap_after["adaptive_quantization"].as_bool() && !snap_after.has("target_usage"),
+        "a row edit saves the chosen p7, full multipass and look-ahead, never the relieved values; a row not listed is not written");
+  const auto snap_running = bx::configured_encoder_settings(bx::EncoderFamily::Nvenc, snap_custom(snap_maximum, snap_after), 2);
+  check(bx::encoder_setting_value(snap_running, "preset").as_string() == "p4" && !bx::encoder_setting_value(snap_running, "lookahead").as_bool() &&
+            !bx::encoder_setting_value(snap_running, "adaptive_quantization").as_bool(),
+        "the saved choices still run through the relief at step 2 (p4, look-ahead off), and the chosen switch is off");
+
+  // With no relief an edit changes the row it was made on and nothing else.
+  const auto snap_before_list = bx::configured_encoder_settings(bx::EncoderFamily::Nvenc, snap_maximum, 0);
+  const auto snap_edited_list = bx::configured_encoder_settings(
+      bx::EncoderFamily::Nvenc, snap_custom(snap_maximum, bx::encoder_options_after_edit(bx::Json::object(), snap_nvenc, snap_rows, "lookahead", bx::Json(false))), 0);
+  bool snap_only_one_row = true;
+  for (const bx::EncoderSetting& setting : snap_before_list) {
+    const bx::Json expected = setting.name == "lookahead" ? bx::Json(false) : setting.value;
+    if (bx::encoder_setting_value(snap_edited_list, setting.name).dump() != expected.dump()) snap_only_one_row = false;
+  }
+  check(snap_only_one_row, "zero relief: a row edit changes its own row and no other setting");
+
+  // A switch saved on that the relief holds off: the page shows the saved choice, so one click saves the opposite of
+  // it, and that is what runs at every step. The second row edit below keeps the saved on while the relief runs off.
+  bx::Config snap_amf;
+  snap_amf.quality = "high";
+  snap_amf.encoder_mode = "custom";
+  snap_amf.encoder_options.set("pre_analysis", bx::Json(true));
+  const bx::Json snap_amf_choice = snap_choice(bx::EncoderFamily::Amf, snap_amf);
+  check(snap_amf_choice["pre_analysis"].as_bool() && !bx::encoder_setting_value(bx::configured_encoder_settings(bx::EncoderFamily::Amf, snap_amf, 1), "pre_analysis").as_bool(),
+        "saved on, running off under relief: the choice reads on and the encoder runs off");
+  const bx::Json snap_toggled = bx::encoder_options_after_edit(snap_amf.encoder_options, snap_amf_choice, snap_rows, "pre_analysis",
+                                                              bx::Json(!snap_amf_choice["pre_analysis"].as_bool()));
+  check(!snap_toggled["pre_analysis"].as_bool() &&
+            !bx::encoder_setting_value(bx::configured_encoder_settings(bx::EncoderFamily::Amf, snap_custom(snap_amf, snap_toggled), 0), "pre_analysis").as_bool(),
+        "one toggle saves off, and the saved choice reads off at every step");
+  const bx::Json snap_kept = bx::encoder_options_after_edit(snap_amf.encoder_options, snap_amf_choice, snap_rows, "preset", bx::Json("quality"));
+  check(snap_kept["pre_analysis"].as_bool() && snap_kept["preset"].as_string() == "quality" &&
+            bx::encoder_setting_value(bx::configured_encoder_settings(bx::EncoderFamily::Amf, snap_custom(snap_amf, snap_kept), 0), "pre_analysis").as_bool() &&
+            !bx::encoder_setting_value(bx::configured_encoder_settings(bx::EncoderFamily::Amf, snap_custom(snap_amf, snap_kept), 1), "pre_analysis").as_bool(),
+        "another row's edit keeps the saved on while the relief runs it off");
+
+  // Stored options the page does not show survive an edit: an explicit null (the encoder's own default) stays null, and a
+  // name no row lists stays as it was. A stored value the encoder refuses is kept too, and the Custom switch writes the
+  // choice over it (the fallback: NVENC's p6 stored, x264 running).
+  bx::Json snap_stored = bx::Json::object();
+  snap_stored.set("lookahead", bx::Json());
+  snap_stored.set("tuning", bx::Json("hq"));
+  const bx::Json snap_odd = bx::encoder_options_after_edit(snap_stored, snap_nvenc, snap_rows, "adaptive_quantization", bx::Json(false));
+  check(snap_odd.has("lookahead") && snap_odd["lookahead"].is_null() && snap_odd["tuning"].as_string() == "hq" &&
+            bx::encoder_setting_value(bx::configured_encoder_settings(bx::EncoderFamily::Nvenc, snap_custom(snap_maximum, snap_odd), 0), "lookahead").is_null(),
+        "stored null and a name no row lists survive an unrelated edit, and the null still means the encoder's default");
+  bx::Json snap_p6 = bx::Json::object();
+  snap_p6.set("preset", bx::Json("p6"));
+  const bx::Json snap_p6_edit = bx::encoder_options_after_edit(snap_p6, snap_nvenc, snap_rows, "lookahead", bx::Json(false));
+  check(snap_p6_edit["preset"].as_string() == "p6", "a stored value is not replaced by the choice through another row's edit");
+  bx::Config snap_x264;
+  snap_x264.quality = "high";
+  snap_x264.encoder_mode = "custom";
+  const bx::Json snap_x264_choice = snap_choice(bx::EncoderFamily::X264, snap_x264);
+  const bx::Json snap_custom_switch = bx::encoder_options_after_edit(snap_p6, snap_x264_choice, snap_rows, "preset", snap_x264_choice["preset"]);
+  check(snap_custom_switch["preset"].as_string() == "medium" && !snap_custom_switch.has("lookahead") && !snap_custom_switch.has("pre_analysis"),
+        "choosing Custom on the x264 fallback writes x264's own preset over stored p6, and no row x264 does not list");
 
   // Stored settings: a new file starts Auto; an older file's own speed rows are kept as Custom; keys that never
   // worked (blank values written for integer lists) are dropped.
@@ -7907,20 +9307,7 @@ void test_gpu_adapter_choice() {
 // recording a clip with a third of its frames missing. The rules here are the whole decision.
 void test_encoder_governor() {
   std::printf("encoder governor\n");
-  using buffrx::governor_should_step;
-  const uint32_t cool = buffrx::kGovernorCooldownMs;
-  check(!governor_should_step(0, false, 100000, 0), "an encoder that keeps up is left alone");
-  check(governor_should_step(0, true, 100000, 0), "behind, never stepped: step");
-  check(!governor_should_step(1, true, 100000 + cool - 1, 100000), "a step's encoder gets its cooldown to settle");
-  check(governor_should_step(1, true, 100000 + cool, 100000), "behind again after the cooldown: the next step");
-  check(governor_should_step(buffrx::kMaxGovernorStep, true, 900000, 100000), "the ladder continues past the encoder rungs");
-  check(!governor_should_step(buffrx::kMaxReliefStep, true, 900000, 100000), "the relief ladder's last rung is the floor");
-  check(!governor_should_step(0, true, 900000, 0, true), "a manual recording in progress holds the ladder");
-  check(governor_should_step(0, true, 900000, 0, false), "the ladder resumes once the recording has ended");
-  check(buffrx::relief_capture_fps(120, 3) == 120, "encoder rungs leave the frame rate alone");
-  check(buffrx::relief_capture_fps(120, 4) == 60 && buffrx::relief_capture_fps(60, 4) == 60, "the fourth rung is 60 fps");
-  check(buffrx::relief_capture_fps(60, 5) == 30 && buffrx::relief_capture_fps(120, 5) == 30, "the fifth is 30 fps");
-  check(governor_should_step(2, true, 0u - 5u, 0u - 5u - cool), "the tick clock wrapping does not stall the governor");
+  // The steps are the controller's effort levels now (encoder_controller.h, tested in test_encoder_controller); this part keeps what each one asks of the encoder.
 
   // What each step asks of the encoder, per family. Step 0 asks for nothing.
   using bx::EncoderFamily;
@@ -7935,8 +9322,8 @@ void test_encoder_governor() {
             !bx::encoder_setting_value(two, "lookahead").as_bool(true),
         "NVENC step 2 is p4 with no multipass and no look-ahead");
   const auto three = bx::governor_overrides(EncoderFamily::Nvenc, 3);
-  check(bx::encoder_setting_value(three, "preset").as_string() == "p2" && bx::encoder_setting_value(three, "bf").as_int(9) == 0,
-        "NVENC step 3 is p2 without B-frames");
+  check(bx::encoder_setting_value(three, "preset").as_string() == "p2" && bx::encoder_setting_value(three, "bf").is_null(),
+        "NVENC step 3 is p2 and leaves B-frames alone, so the pieces of a clip across a swap stay joinable");
   check(bx::encoder_setting_value(bx::governor_overrides(EncoderFamily::Nvenc, 9), "preset").as_string() == "p2", "past the last step is the last step");
   check(bx::encoder_setting_value(bx::governor_overrides(EncoderFamily::X264, 1), "preset").as_string() == "veryfast" &&
             bx::encoder_setting_value(bx::governor_overrides(EncoderFamily::X264, 3), "preset").as_string() == "ultrafast",
@@ -7956,21 +9343,19 @@ void test_encoder_governor() {
   check(bx::encoder_setting_value(chosen, "preset").as_string() == "p5" && bx::encoder_setting_value(chosen, "tune").as_string() == "hq",
         "the step replaces the slow settings");
   check(bx::encoder_setting_value(chosen, "adaptive_quantization").as_bool(false), "and keeps the ones it has no opinion on");
+  // An older version's step is ignored (main clears it) and never written back: the memory is capacity.json, keyed by GPU and driver.
   bx::Config remembered;
   remembered.encoder_speed_step = 2;
+  bx::Json written = bx::config_to_json(remembered);
+  check(!written.has("encoder_speed_step"), "config.json no longer carries the encoder step");
   bx::Config reread;
-  bx::config_from_json(bx::config_to_json(remembered), reread);
-  check(reread.encoder_speed_step == 2, "the step BuffrX settled on is remembered across runs");
-  bx::Json silly = bx::Json::object();
-  silly.set("encoder_speed_step", bx::Json(77));
-  bx::config_from_json(silly, reread);
-  check(reread.encoder_speed_step == buffrx::kMaxReliefStep, "and kept inside the steps that exist");
-  remembered.encoder_speed_step = 4;
-  bx::config_from_json(bx::config_to_json(remembered), reread);
-  check(reread.encoder_speed_step == 4, "a machine that settled at 60 fps still reads back as 60 fps");
-  remembered.encoder_speed_step = 5;
-  bx::config_from_json(bx::config_to_json(remembered), reread);
-  check(reread.encoder_speed_step == 5, "and a machine at 30 fps as 30 fps");
+  bx::Json older = bx::Json::object();
+  older.set("encoder_speed_step", bx::Json(3));
+  bx::config_from_json(older, reread);
+  check(reread.encoder_speed_step == 3, "an older config's step still parses, so it can be cleared");
+  older.set("encoder_speed_step", bx::Json(77));
+  bx::config_from_json(older, reread);
+  check(reread.encoder_speed_step == 5, "and kept inside the levels that can exist");
 }
 
 // capacity.json outlived the old reset: "Start from full speed again" zeroed the config step, the
@@ -8021,6 +9406,18 @@ void test_encoder_watch() {
   }
   check(!watch.behind && !changed, "an encoder that keeps up is never reported behind");
   check(watch.ratio > 0.97, "and its ratio is near one");
+  check(watch.measured_rendered == 240 && watch.measured_encoded == 238,
+        "diagnostics uses completed-window counters rather than unequal lifetime counters");
+  {
+    buffrx::EncoderWatch restarted;
+    buffrx::encoder_watch_feed(restarted, 0, 1000000, 0, true);
+    buffrx::encoder_watch_feed(restarted, 2000, 1000240, 240, true);
+    check(restarted.measured_rendered == 240 && restarted.measured_encoded == 240,
+          "a fresh encoder on an old canvas reports its actual measured speed");
+    buffrx::encoder_watch_feed(restarted, 2250, 1000270, 270, false);
+    check(restarted.measured_rendered == 0 && restarted.measured_encoded == 0,
+          "stopping the encoder clears the diagnostic sample");
+  }
 
   // Falls behind: 70% of the frames, sustained past the window.
   buffrx::EncoderWatch slow;
@@ -8059,6 +9456,216 @@ void test_encoder_watch() {
   check(!rebuilt.behind, "a counter reset is not a behind encoder");
 }
 
+void test_encoder_frozen() {
+  std::printf("encoder frozen verdict\n");
+  // A dead encoder (a driver reset: 0% of the frames) is frozen, never behind, and the governor has nothing to act on.
+  buffrx::EncoderWatch dead;
+  bool changed = false;
+  for (uint32_t t = 0; t <= 12000; t += 250) {
+    changed |= buffrx::encoder_watch_feed(dead, t, static_cast<uint64_t>(t) * 60 / 1000, 0, true);
+  }
+  check(dead.frozen && !dead.behind && changed, "an encoder that produced nothing is frozen, not behind");
+  check(dead.ratio < buffrx::kEncoderFrozenRatio, "with the ratio it managed");
+  // The same two-window rule: one dead window is not a verdict.
+  buffrx::EncoderWatch blip;
+  uint64_t video = 0, encoded = 0;
+  for (uint32_t t = 0; t <= 20000; t += 250) {
+    video += 15;
+    encoded += (t >= 4000 && t < 6000) ? 0 : 15;
+    buffrx::encoder_watch_feed(blip, t, video, encoded, true);
+  }
+  check(!blip.frozen && !blip.behind, "a two second dead window is not frozen");
+  // 50% is slow, not dead.
+  buffrx::EncoderWatch half;
+  for (uint32_t t = 0; t <= 12000; t += 250) {
+    buffrx::encoder_watch_feed(half, t, static_cast<uint64_t>(t) * 60 / 1000, static_cast<uint64_t>(t) * 30 / 1000, true);
+  }
+  check(half.behind && !half.frozen, "an encoder at half speed is behind, not frozen");
+  // It clears when the encoder comes back.
+  for (uint32_t t = 12250; t <= 24000; t += 250) {
+    buffrx::encoder_watch_feed(dead, t, static_cast<uint64_t>(t) * 60 / 1000, (static_cast<uint64_t>(t) - 12000) * 60 / 1000, true);
+  }
+  check(!dead.frozen && !dead.behind, "a frozen encoder that recovers is cleared");
+}
+
+void test_driver_fault() {
+  std::printf("driver fault rules\n");
+  // Log limiter: five per format per window, the rest counted, said once when the window rolls.
+  buffrx::LogLimiter limiter;
+  const char* format_a = "a";
+  const char* format_b = "b";
+  int suppressed = 0;
+  int admitted = 0;
+  for (int i = 0; i < 20; ++i) admitted += limiter.admit(format_a, 1000 + i, suppressed) ? 1 : 0;
+  check(admitted == buffrx::kLogLinesPerWindow, "five lines of one format get through in a window");
+  check(limiter.admit(format_b, 1100, suppressed) && suppressed == 0, "another format is not limited by the first");
+  check(limiter.admit(format_a, 1000 + buffrx::kLogWindowMs + 5, suppressed) && suppressed == 15,
+        "the next window reports what the last one swallowed");
+  check(limiter.admit(format_a, 1000 + buffrx::kLogWindowMs + 6, suppressed) && suppressed == 0, "and reports it once");
+  buffrx::LogLimiter crowded;
+  static char keys[40];
+  bool all = true;
+  for (int i = 0; i < 40; ++i) all = all && crowded.admit(&keys[i], 5000 + i, suppressed);
+  check(all, "more call sites than slots still log their first line");
+
+  check(buffrx::is_device_lost_line("Device Remove/Reset!  Rebuilding all assets..."), "the d3d11 device-lost line is recognised");
+  check(!buffrx::is_device_lost_line("Device is fine") && !buffrx::is_device_lost_line(nullptr), "other lines are not");
+
+  // Holds.
+  check(!buffrx::governor_held(100000, 0), "no fault, no hold");
+  check(buffrx::governor_held(100000, 90000) && !buffrx::governor_held(150001, 90000), "the governor holds for 60 s after a fault");
+  check(buffrx::stall_restart_held(100000, 95000) && !buffrx::stall_restart_held(105001, 95000) && !buffrx::stall_restart_held(100000, 0),
+        "the stall restart holds for 10 s after the device was lost");
+  check(buffrx::governor_held(5, 0xFFFFFFF0u), "the hold survives the tick count wrapping");
+
+  // Backoff: 2, 4, 8, 16, 32, 60, 60.
+  buffrx::VideoInitBackoff backoff;
+  check(buffrx::video_init_allowed(backoff, 10), "the first try is always allowed");
+  uint32_t now = 1000;
+  const uint32_t expected[] = {2000, 4000, 8000, 16000, 32000, 60000, 60000};
+  for (uint32_t wait : expected) {
+    buffrx::video_init_failed(backoff, now);
+    check(!buffrx::video_init_allowed(backoff, now + wait - 1) && buffrx::video_init_allowed(backoff, now + wait),
+          "each failure doubles the wait up to a minute");
+    now += wait;
+  }
+  buffrx::video_init_failed(backoff, now);
+  check(buffrx::video_init_wait_ms(backoff, now) == 60000, "the wait is capped at 60 s");
+  buffrx::video_init_allow_now(backoff);
+  check(buffrx::video_init_allowed(backoff, now), "a press may try once at once");
+  buffrx::video_init_failed(backoff, now);
+  check(!buffrx::video_init_allowed(backoff, now + 1000), "and its failure sets the deadline again");
+  buffrx::video_init_ok(backoff);
+  check(buffrx::video_init_allowed(backoff, now) && backoff.failures == 0, "success resets it");
+
+  // Crash policy.
+  check(buffrx::crash_decide({}, true, 1000).relaunch, "a crash with a capture wanted relaunches");
+  check(!buffrx::crash_decide({}, false, 1000).relaunch, "a crash with nothing wanted does not");
+  const buffrx::CrashDecision again = buffrx::crash_decide({{900, true}}, true, 1000);
+  check(!again.relaunch && again.repeated, "a second crash within ten minutes of a relaunch gives up");
+  check(buffrx::crash_decide({{100, true}}, true, 1000).relaunch, "a relaunch more than ten minutes ago does not count");
+  check(buffrx::crash_decide({{900, false}}, true, 1000).relaunch, "a crash that did not relaunch does not count");
+  check(std::string(buffrx::crash_card_for({true, false})) == "restarted" &&
+            std::string(buffrx::crash_card_for({false, true})) == "repeated" &&
+            std::string(buffrx::crash_card_for({false, false})) == "closed",
+        "the card follows the decision");
+  buffrx::CrashMarker marker;
+  marker.history = {{10, true}, {100000, true}};
+  const buffrx::CrashMarker next = buffrx::crash_marker_after(marker, "Failed to recreate D3D11: x (887A0005)", true, 100100,
+                                                              buffrx::crash_decide(marker.history, true, 100100));
+  check(next.history.size() == 2 && next.history.back().at_s == 100100 && !next.history.back().relaunched,
+        "old history drops and the repeat is not a relaunch");
+  check(next.card == "repeated", "the marker asks for the repeated card");
+  const std::string marker_path =
+      std::string(std::getenv("TEMP") ? std::getenv("TEMP") : ".") + "\\buffrx-driver-crash-test.json";
+  bx::write_file_atomic(marker_path, buffrx::crash_marker_to_json(next).dump(2));
+  buffrx::CrashMarker back;
+  check(buffrx::crash_marker_read(marker_path, back) && back.card == "repeated" && back.history.size() == 2 &&
+            back.message == next.message && back.capture_wanted && back.time_s == 100100,
+        "the marker survives a file round trip");
+  std::remove(marker_path.c_str());
+  check(!buffrx::crash_marker_read(marker_path, back), "no marker, nothing to read");
+  const std::string reset = "Failed to recreate D3D11: device creation failed (887A0005)";
+  check(buffrx::crash_card_text("restarted", reset).title == "BuffrX restarted after a graphics driver reset" &&
+            buffrx::crash_card_text("repeated", reset).detail.find("H.264") != std::string::npos &&
+            buffrx::crash_card_text("repeated", reset).detail.find("Window capture") != std::string::npos,
+        "the cards say what happened and what to try");
+  check(buffrx::crash_card_text("restarted", "Out of memory while trying to allocate 64 bytes").title.find("driver") ==
+                std::string::npos &&
+            buffrx::crash_card_text("repeated", "Failed to create thread").detail.find("H.264") == std::string::npos,
+        "a libobs crash that is not a driver reset is not called one");
+}
+
+void test_encoder_ladder() {
+  std::printf("encoder ladder\n");
+  buffrx::EncoderDeaths deaths;
+  check(!buffrx::encoder_death_note(deaths, "av1_texture_amf", 1000), "one death is not a pattern");
+  check(!buffrx::encoder_death_note(deaths, "av1_texture_amf", 5000), "the same reset's second symptom is the same death");
+  check(buffrx::encoder_death_note(deaths, "av1_texture_amf", 60000), "the second death inside ten minutes steps down");
+  check(!buffrx::encoder_death_note(deaths, "av1_texture_amf", 90000), "and the count starts over");
+  check(!buffrx::encoder_death_note(deaths, "av1_texture_amf", 90000 + buffrx::kEncoderDeathWindowMs + 1),
+        "deaths ten minutes apart do not add up");
+  buffrx::EncoderDeaths other;
+  buffrx::encoder_death_note(other, "a", 1000);
+  check(!buffrx::encoder_death_note(other, "b", 100000), "a different encoder id is its own count");
+
+  check(buffrx::ladder_next_rung(0, true, false, false) == 1, "a registered system variant is the first rung");
+  check(buffrx::ladder_next_rung(0, false, false, false) == 2, "without one, H.264 on the vendor");
+  check(buffrx::ladder_next_rung(0, false, true, false) == 3, "H.264 already: straight to software");
+  check(buffrx::ladder_next_rung(1, true, false, false) == 2 && buffrx::ladder_next_rung(2, true, false, false) == 3,
+        "one rung at a time");
+  check(buffrx::ladder_next_rung(3, true, false, false) == 3 && buffrx::ladder_next_rung(0, true, false, true) == 0,
+        "software is the bottom");
+
+  const buffrx::LadderLayer l1 = buffrx::ladder_layer(1, "amf", "av1", "auto");
+  check(l1.codec == "av1" && l1.system_first, "rung 1 keeps the codec and prefers system memory");
+  const buffrx::LadderLayer l2 = buffrx::ladder_layer(2, "amf", "av1", "auto");
+  check(l2.codec == "h264" && l2.encoder == "amf" && !l2.system_first, "rung 2 is H.264 on the same vendor");
+  check(buffrx::ladder_layer(2, "", "av1", "auto").encoder == "auto", "an unknown vendor keeps the configured one");
+  const buffrx::LadderLayer l3 = buffrx::ladder_layer(3, "amf", "av1", "auto");
+  check(l3.codec == "h264" && l3.encoder == "software", "rung 3 is x264");
+  const std::vector<std::string> ids = {"av1_texture_amf", "av1_fallback_amf"};
+  check(buffrx::ladder_order_ids(ids, true).front() == "av1_fallback_amf" &&
+            buffrx::ladder_order_ids(ids, false).front() == "av1_texture_amf",
+        "rung 1 puts the fallback id first");
+  check(buffrx::encoder_is_system_memory("obs_nvenc_h264_soft") && buffrx::encoder_is_system_memory("h265_fallback_amf") &&
+            buffrx::encoder_is_system_memory("obs_qsv11_soft_v2") && !buffrx::encoder_is_system_memory("obs_nvenc_av1_tex") &&
+            !buffrx::encoder_is_system_memory("h264_texture_amf"),
+        "system-memory encoder ids are told from texture ones");
+  check(buffrx::encoder_vendor_of("av1_texture_amf") == "amf" && buffrx::encoder_vendor_of("obs_x264") == "software",
+        "vendor from id");
+  check(buffrx::ladder_key("AMD RX 7800", "31.0", "av1", "auto") != buffrx::ladder_key("AMD RX 7800", "32.0", "av1", "auto"),
+        "a new driver asks again");
+
+  // The rung is remembered in the capacity file's format.
+  const std::string path = std::string(std::getenv("TEMP") ? std::getenv("TEMP") : ".") + "\\buffrx-ladder-test.json";
+  std::remove(path.c_str());
+  const std::string key = buffrx::ladder_key("gpu", "1", "av1", "auto");
+  bx::capacity_write_step(path, key, 2);
+  check(bx::capacity_read_step(path, key) == 2, "the rung is remembered");
+  bx::capacity_forget_key(path, key);
+  check(bx::capacity_read_step(path, key) == 0, "and forgotten");
+  std::remove(path.c_str());
+
+  // The one-time codec move.
+  check(bx::codec_default_migration_due("av1", true, false, false), "auto-picked AV1 off NVENC moves to H.264");
+  check(!bx::codec_default_migration_due("av1", true, false, true), "AV1 on NVENC stays");
+  check(!bx::codec_default_migration_due("av1", true, true, false), "it never runs twice");
+  check(!bx::codec_default_migration_due("av1", false, false, false) && !bx::codec_default_migration_due("hevc", true, false, false),
+        "only an auto-picked AV1 moves");
+}
+
+void test_hook_memory() {
+  std::printf("hook memory\n");
+  std::vector<buffrx::HookEntry> memory;
+  const std::string exe = buffrx::hook_exe_of("War Thunder:DagorWClass:Aces.exe");
+  check(exe == "aces.exe", "the executable is the last part of the window id");
+  const int64_t day = 24 * 3600;
+  buffrx::hook_memory_record(memory, exe, 1000);
+  check(!buffrx::hook_memory_skips_hook(memory, exe, 2000), "one failed capture is not remembered yet");
+  buffrx::hook_memory_record(memory, exe, 5000);
+  check(buffrx::hook_memory_skips_hook(memory, exe, 6000), "two failed captures are");
+  check(!buffrx::hook_memory_skips_hook(memory, "other.exe", 6000), "another game is not");
+  {
+    std::vector<buffrx::HookEntry> slow = memory;
+    check(buffrx::hook_memory_forget(slow, exe) && !buffrx::hook_memory_skips_hook(slow, exe, 6000),
+          "a hook that delivers forgets the game's earlier misses");
+    check(!buffrx::hook_memory_forget(slow, exe), "forgetting a game that is not listed changes nothing");
+  }
+  check(!buffrx::hook_memory_skips_hook(memory, exe, 5000 + 14 * day), "an entry expires after 14 days");
+  buffrx::hook_memory_record(memory, exe, 5000 + 15 * day);
+  check(!buffrx::hook_memory_skips_hook(memory, exe, 5000 + 15 * day + 1), "a stale entry starts over from one failure");
+  const std::string path = std::string(std::getenv("TEMP") ? std::getenv("TEMP") : ".") + "\\buffrx-hook-memory-test.json";
+  std::vector<buffrx::HookEntry> two;
+  buffrx::hook_memory_record(two, exe, 100);
+  buffrx::hook_memory_record(two, exe, 200);
+  buffrx::hook_memory_save(path, two);
+  const std::vector<buffrx::HookEntry> loaded = buffrx::hook_memory_load(path, 300);
+  check(loaded.size() == 1 && buffrx::hook_memory_skips_hook(loaded, exe, 300), "the memory survives a file round trip");
+  check(buffrx::hook_memory_load(path, 300 + 15 * day).empty(), "expired entries are not loaded");
+  std::remove(path.c_str());
+}
+
 void test_buffer_watch() {
   using buffrx::WatchdogAction;
   check(buffrx::watchdog_action(true, true, false) == WatchdogAction::none, "a healthy buffer is left alone");
@@ -8082,6 +9689,46 @@ void test_buffer_watch() {
 
 // Game detection: the denylist must be a denylist (an unknown fullscreen app is a game), and the
 // capture switch must need two consecutive polls so a brief alt-tab does not swap sources.
+// "Games only": the buffer is wanted but runs only while a game is on screen.
+void test_game_only() {
+  using namespace buffrx;
+  GameOnlyView view;
+  view.enabled = true;
+  view.buffer_wanted = true;
+  view.game_here = true;
+  check(game_only_decide(view) == GameOnlyAction::none, "a game on screen keeps the buffer running");
+  view.game_here = false;
+  view.no_game_ms = kGameOnlyPauseMs - 1;
+  check(game_only_decide(view) == GameOnlyAction::none, "a game gone for a moment does not pause the buffer (a loading screen, an alt-tab)");
+  view.no_game_ms = kGameOnlyPauseMs;
+  check(game_only_decide(view) == GameOnlyAction::pause, "no game for the pause time pauses the buffer");
+  view.recording_busy = true;
+  check(game_only_decide(view) == GameOnlyAction::none, "a manual recording is never ended by the policy");
+  view.recording_busy = false;
+  view.buffer_wanted = false;
+  check(game_only_decide(view) == GameOnlyAction::none, "a buffer the person turned off is left off");
+  GameOnlyView waiting;
+  waiting.enabled = true;
+  waiting.waiting = true;
+  check(game_only_decide(waiting) == GameOnlyAction::none, "waiting stays waiting while there is no game");
+  waiting.game_here = true;
+  check(game_only_decide(waiting) == GameOnlyAction::resume, "a game on screen starts the waiting buffer");
+  waiting.game_here = false;
+  waiting.enabled = false;
+  check(game_only_decide(waiting) == GameOnlyAction::resume, "turning the mode off brings the waiting buffer back");
+  GameOnlyView off;
+  off.buffer_wanted = true;
+  off.no_game_ms = 600000;
+  check(game_only_decide(off) == GameOnlyAction::none, "with the mode off nothing is ever paused");
+
+  bx::Config config;
+  check(!config.game_only, "games only is off by default: the display is still the fallback");
+  bx::Json patch = bx::Json::object();
+  patch.set("game_only", bx::Json(true));
+  bx::config_from_json(patch, config);
+  check(config.game_only && bx::config_to_json(config)["game_only"].as_bool(), "games only survives a save and a load");
+}
+
 void test_idle_policy() {
   using namespace buffrx;
   // The regression this guards: an engine with nothing to do still ran libobs's video thread at the capture
@@ -9006,7 +10653,9 @@ void test_ring_disk() {
   check(GetFileAttributesA(placed.path.c_str()) != INVALID_FILE_ATTRIBUTES, "it exists while open");
   bx::RingFile second;
   check(!second.open(placed.path, 3 * bx::kSpillBlockBytes, error), "a second open of the same file is refused: it is held exclusively");
-  check(bx::alloc_aligned_block() != nullptr, "an aligned block can be had");
+  uint8_t* probe_block = bx::alloc_aligned_block();
+  check(probe_block != nullptr, "an aligned block can be had");
+  bx::free_aligned_block(probe_block);
 
   uint8_t* out = bx::alloc_aligned_block();
   uint8_t* in = bx::alloc_aligned_block();
@@ -9028,6 +10677,17 @@ void test_ring_disk() {
   check(GetFileAttributesA(placed.path.c_str()) == INVALID_FILE_ATTRIBUTES, "closing the handle removes the file: nothing is left behind");
   bx::free_aligned_block(out);
   bx::free_aligned_block(in);
+
+  {
+    bx::RingFile cancelled;
+    cancelled.cancel();  // a stop can arrive before the spill worker reserves its file
+    check(cancelled.open(placed.path, bx::kSpillBlockBytes, error), "a cancelled spill can finish opening safely");
+    uint8_t* block = bx::alloc_aligned_block();
+    check(block && !cancelled.write_block(0, block), "a cancel before open still refuses later transfers");
+    bx::free_aligned_block(block);
+    cancelled.close();
+    check(!cancelled.is_open(), "a failed or cancelled spill closes before its owner is destroyed");
+  }
 
   const std::string stale = folder + "\\replay-1.ring";
   HANDLE leftover = CreateFileA(stale.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -9320,7 +10980,7 @@ void test_ui_format() {
   const ChordCapture modifier_only = capture_chord(true, false, false, false, VK_CONTROL);
   check(modifier_only.waiting, "a modifier alone keeps waiting");
   const ChordCapture alt_one = capture_chord(false, true, false, false, '1');
-  check(!alt_one.waiting && alt_one.chord == "Alt+1" && alt_one.problem.empty(), "Alt+1 is captured");
+  check(!alt_one.waiting && alt_one.chord == "Alt+1" && alt_one.problem.empty() && !alt_one.lone_key, "Alt+1 is captured");
   const ChordCapture bare = capture_chord(false, false, false, false, 'K');
   check(bare.chord == "K" && !bare.problem.empty(), "a bare key is refused with a reason");
   check(capture_chord(true, true, false, false, '1').problem.empty(), "Ctrl+Alt+1 is three parts and allowed");
@@ -9328,6 +10988,45 @@ void test_ui_format() {
   check(too_many.chord == "Ctrl+Alt+Shift+1" && !too_many.problem.empty(),
         "a fourth part is refused with a reason");
   check(capture_chord(false, false, false, false, VK_F13).problem.empty(), "F13 alone is allowed");
+  // Issue 3: the recorder accepts every key the engine's own parser accepts alone, and marks it for the warning.
+  const ChordCapture f8 = capture_chord(false, false, false, false, VK_F8);
+  check(f8.problem.empty() && f8.lone_key && f8.chord == "F8", "F8 alone is captured and marked as a lone key");
+  const ChordCapture f12 = capture_chord(false, false, false, false, VK_F12);
+  check(f12.problem.empty() && f12.lone_key, "F12 alone is captured; Windows may still refuse to register it");
+  check(capture_chord(false, false, false, false, VK_PAUSE).problem.empty(), "Pause alone is allowed");
+  check(capture_chord(false, false, false, false, VK_SCROLL).problem.empty(), "Scroll Lock alone is allowed");
+  check(capture_chord(false, false, false, false, VK_NUMPAD3).problem.empty(), "a lone numpad digit is allowed");
+  check(lone_key_warning(VK_NUMPAD3).find("keypad") != std::string::npos &&
+            lone_key_warning(VK_INSERT).find("Insert") != std::string::npos &&
+            lone_key_warning(VK_F8).find("F-keys") != std::string::npos &&
+            lone_key_warning(VK_DELETE).find("editing") != std::string::npos &&
+            lone_key_warning(VK_OEM_COMMA).find("character") != std::string::npos &&
+            lone_key_warning(VK_PAUSE) != lone_key_warning(VK_F8),
+        "each kind of lone key says what it costs");
+  bool warnings_short = true;
+  for (unsigned key_code : {static_cast<unsigned>(VK_F8), static_cast<unsigned>(VK_PAUSE), static_cast<unsigned>(VK_INSERT),
+                            static_cast<unsigned>(VK_HOME), static_cast<unsigned>(VK_NUMPAD1), static_cast<unsigned>(VK_OEM_4)}) {
+    if (lone_key_warning(key_code).empty() || lone_key_warning(key_code).size() > 64) warnings_short = false;
+  }
+  check(warnings_short, "a lone-key warning is one short line");
+  check(!capture_chord(false, false, false, false, '1').problem.empty(), "a lone digit is refused");
+  check(!capture_chord(false, false, false, false, VK_LEFT).problem.empty(), "a lone arrow is refused");
+  check(!capture_chord(false, false, false, false, VK_TAB).problem.empty(), "a lone tab is refused");
+  // One policy: every key the recorder lets stand alone is one the engine's parser accepts alone, and back.
+  bool lone_parity = true;
+  for (UINT key = VK_F1; key <= VK_F24; ++key) {
+    const ChordCapture captured = capture_chord(false, false, false, false, key);
+    UINT mods = 0, parsed = 0;
+    std::string why;
+    if (!captured.problem.empty() || !bx::parse_chord(captured.chord, mods, parsed, why) || parsed != key) lone_parity = false;
+  }
+  for (UINT key : {static_cast<UINT>(VK_PAUSE), static_cast<UINT>(VK_SCROLL)}) {
+    const ChordCapture captured = capture_chord(false, false, false, false, key);
+    UINT mods = 0, parsed = 0;
+    std::string why;
+    if (!captured.problem.empty() || !bx::parse_chord(captured.chord, mods, parsed, why) || parsed != key) lone_parity = false;
+  }
+  check(lone_parity, "the recorder and the engine agree on every lone key, F1-F24, Pause and Scroll Lock");
   const ChordCapture numpad = capture_chord(true, false, true, false, VK_NUMPAD3);
   UINT modifiers = 0, key = 0;
   std::string parse_problem;
@@ -9337,6 +11036,53 @@ void test_ui_format() {
 
   check(limit_chips(60) == std::vector<int>({30, 60, 120, 300}) && limit_chips(90) == std::vector<int>({30, 60, 90, 120, 300}),
         "buffer chips add the current value");
+  // The quick clip is a save from the same ring, so it never exceeds the buffer and is always one of the offered
+  // lengths. The regression this guards: a 90 s quick clip was shown and chosen while the buffer kept 60 s, and a save
+  // quietly kept the whole ring.
+  const auto quick_off = [](const QuickClipRow& row, int value) {
+    for (size_t i = 0; i < row.values.size(); ++i) {
+      if (row.values[i] == value) return static_cast<bool>(row.unavailable[i]);
+    }
+    return true;  // not offered at all
+  };
+  const QuickClipRow quick_short = quick_clip_row(90, 60);
+  check(quick_short.values == quick_clip_choices(), "the row is the offered list and nothing else");
+  check(quick_short.values[static_cast<size_t>(quick_short.selected)] == 45,
+        "a 90 s quick clip falls to 45, the longest one shorter than a 60 s buffer");
+  check(!quick_off(quick_short, 45) && quick_off(quick_short, 60) && quick_off(quick_short, 90),
+        "with a 60 s buffer 45 is available and 60 and 90 are greyed");
+  const QuickClipRow quick_30 = quick_clip_row(90, 30);
+  check(quick_30.values[static_cast<size_t>(quick_30.selected)] == 20 && !quick_off(quick_30, 20) &&
+            quick_off(quick_30, 30),
+        "a 30 s buffer falls back to 20 and greys 30");
+  const QuickClipRow quick_equal = quick_clip_row(30, 30);
+  check(quick_equal.values[static_cast<size_t>(quick_equal.selected)] == 20 && quick_off(quick_equal, 30),
+        "a quick clip equal to the buffer is greyed and falls to the next shorter one");
+  const QuickClipRow quick_fit = quick_clip_row(30, 60);
+  check(quick_fit.values[static_cast<size_t>(quick_fit.selected)] == 30 && !quick_off(quick_fit, 30),
+        "a quick clip already inside the buffer is kept and chosen");
+  const QuickClipRow quick_room = quick_clip_row(90, 120);
+  check(quick_room.values[static_cast<size_t>(quick_room.selected)] == 90 && !quick_off(quick_room, 90),
+        "a buffer longer than the quick clip leaves 90 s available");
+  const QuickClipRow quick_tiny = quick_clip_row(20, 5);
+  check(quick_tiny.selected == -1 && quick_off(quick_tiny, 10) &&
+            std::find(quick_tiny.unavailable.begin(), quick_tiny.unavailable.end(), false) == quick_tiny.unavailable.end(),
+        "a buffer shorter than every preset chooses nothing and greys them all");
+  const QuickClipRow quick_unset = quick_clip_row(0, 60);
+  check(quick_unset.values[static_cast<size_t>(quick_unset.selected)] == 45,
+        "a buffer grown after being too short chooses the longest preset shorter than it, with no invented length");
+  // What a Quick clip press does. 0 is never handed to the engine: buffer.save reads it as the whole buffer, which is
+  // Save clip's job, so a buffer too short for every preset refuses the press and says what to use instead.
+  const QuickClipPress press_ok = quick_clip_press(20, 60);
+  check(press_ok.seconds == 20 && press_ok.refusal.empty(), "a quick clip inside the buffer saves its own length");
+  const QuickClipPress press_none = quick_clip_press(20, 5);
+  check(press_none.seconds == 0 && !press_none.refusal.empty(),
+        "a buffer too short for every preset refuses the quick clip instead of saving the whole buffer");
+  check(press_none.refusal.find("Save clip") != std::string::npos,
+        "the refusal names Save clip, which keeps the whole buffer");
+  const QuickClipPress press_unset = quick_clip_press(0, 60);
+  check(press_unset.seconds == 45 && press_unset.refusal.empty(),
+        "a press after the buffer grew back saves the longest preset, never 0");
   check(clamp_buffer_seconds(1) == 5 && clamp_buffer_seconds(9999) == 1800 && clamp_buffer_seconds(900) == 900 &&
             clamp_buffer_seconds(75) == 75,
         "buffer clamp agrees with the config's own 5..1800");
@@ -10017,6 +11763,37 @@ void test_card_grid() {
         "a library narrower than one card keeps the whole width");
 }
 
+void test_display_card_layout() {
+  using namespace bx::ui;
+  check(display_card_layout(0, 0, 700).slots.empty(), "no monitors produce no cards");
+  for (const float width : {100.0f, 400.0f, 556.0f, 700.0f, 1200.0f}) {
+    for (const size_t count : {1u, 2u, 3u, 4u, 8u, 32u, 128u}) {
+      const size_t primary = count - 1;
+      const auto layout = display_card_layout(count, primary, width);
+      check(layout.slots.size() == count, "every monitor gets a card, including large desks");
+      check(layout.slots.front().index == primary &&
+                std::abs(layout.slots.front().x + layout.width / 2 - width / 2) < 0.01f,
+            "the primary stays centered regardless of enumeration order");
+      std::vector<bool> seen(count, false);
+      bool fits = true, separate = true;
+      for (const auto& slot : layout.slots) {
+        fits = fits && slot.index < count && !seen[slot.index] && slot.x >= -0.01f &&
+               slot.x + layout.width <= width + 0.01f && slot.y + 52 <= layout.height + 0.01f;
+        seen[slot.index] = true;
+        for (const auto& other : layout.slots) {
+          if (slot.index == other.index) continue;
+          separate = separate && (slot.y + 52 <= other.y || other.y + 52 <= slot.y ||
+                                  slot.x + layout.width <= other.x || other.x + layout.width <= slot.x);
+        }
+      }
+      check(fits && separate, "all monitor cards fit without duplicates, overlap or clipping");
+    }
+  }
+  const auto three = display_card_layout(3, 0, 700);
+  check(three.slots[1].x > three.slots[0].x && three.slots[2].x < three.slots[0].x,
+        "secondary monitors flank the primary on both sides");
+}
+
 // The icon paths (ui_icons.h): parsed once into segments the interface strokes at any size.
 // The path a shell API is handed (shared/files.h native_path): the engine mixes libobs's `/` with the
 // library's `\`, and the Recycle Bin's IShellItem refuses the mixture with E_INVALIDARG.
@@ -10438,6 +12215,327 @@ private:
   std::vector<int64_t> last_;
 };
 
+// The encoder controller (plan 008): every rule of encoder_controller.h, driven with counters the way the tick feeds them.
+struct ControllerRig {
+  buffrx::ControllerState state;
+  std::vector<buffrx::EncoderLevel> levels;
+  buffrx::ControllerHolds holds;
+  uint32_t now = 100000;
+  uint64_t rendered = 0, encoded = 0, skipped = 0, lagged = 0;
+  int fps = 120;
+  explicit ControllerRig(const buffrx::LevelFacts& facts, int start = 0) {
+    levels = buffrx::controller_levels(facts);
+    buffrx::controller_start(state, levels.size(), start, now, 0);
+  }
+  // `seconds` of video at `ratio` of the pictures encoded (and `lag` of them missed by the video thread), a window every two seconds.
+  // Stops at the first decision and applies it as the host would (moved), so a test can read where it ended.
+  buffrx::ControllerDecision run(int seconds, double ratio, double lag = 0.0) {
+    buffrx::ControllerDecision out;
+    for (int t = 0; t < seconds; t += 2) {
+      now += 2000;
+      rendered += static_cast<uint64_t>(fps) * 2;
+      encoded += static_cast<uint64_t>(fps * 2 * ratio);
+      skipped += static_cast<uint64_t>(fps * 2 * (1.0 - ratio));
+      lagged += static_cast<uint64_t>(fps * 2 * lag);
+      out = buffrx::controller_feed(state, levels, now, buffrx::ControllerWindow{rendered, encoded, skipped, lagged}, holds);
+      if (out.move == buffrx::Move::down || out.move == buffrx::Move::up) {
+        buffrx::controller_moved(state, levels, out.to, now, 0);
+        return out;
+      }
+      if (out.move == buffrx::Move::floor_reached) return out;
+    }
+    return out;
+  }
+};
+
+buffrx::LevelFacts controller_facts(int fps, int /*height*/, bool effort = true) {
+  buffrx::LevelFacts facts;
+  facts.fps = fps;
+  if (effort) facts.effort_changes[1] = facts.effort_changes[2] = facts.effort_changes[3] = true;
+  return facts;
+}
+
+void test_encoder_controller() {
+  using buffrx::LevelKind;
+  using buffrx::Move;
+  {
+    buffrx::ControllerState state;
+    buffrx::controller_start(state, 2, 0, UINT32_MAX - 20000, 10000);
+    buffrx::controller_grace(state, UINT32_MAX - 15000, 30000);
+    check(buffrx::controller_in_grace(state, 1000), "controller: extending grace across tick wrap keeps its full duration");
+    check(!buffrx::controller_in_grace(state, 16000), "controller: wrapped grace expires");
+    buffrx::controller_grace(state, 20000, 30000);
+    check(buffrx::controller_in_grace(state, 49000), "controller: a new grace replaces an expired deadline");
+    buffrx::controller_grace(state, 21000, 1000);
+    check(buffrx::controller_in_grace(state, 49000), "controller: a shorter grace does not shorten an active hold");
+    check(!buffrx::controller_in_grace(state, 50000), "controller: extending grace never pins the controller");
+  }
+  // The table: relative to what runs, level 0 the person's own, a level that lowers nothing is not one.
+  {
+    const std::vector<buffrx::EncoderLevel> full = buffrx::controller_levels(controller_facts(120, 1440));
+    check(full.size() == 1 + 3 + 2 + 6, "controller levels: effort 1-3, fps /2 and /3 above 90, no resolution level");
+    check(full[0].kind == LevelKind::base && full[0].effort == 0 && full[0].divisor == 1, "controller levels: level 0 is the person's settings");
+    check(full[4].divisor == 2 && full[4].effort == 3 && full[5].divisor == 3, "controller levels: the frame-rate levels keep the effort already given up");
+    const std::vector<buffrx::EncoderLevel> sixty = buffrx::controller_levels(controller_facts(60, 1080));
+    check(sixty.size() == 1 + 3, "controller levels: at 60 fps there is no frame-rate level on a hardware encoder");
+    buffrx::LevelFacts x264 = controller_facts(60, 1080);
+    x264.half_rate_allowed = true;
+    const std::vector<buffrx::EncoderLevel> half = buffrx::controller_levels(x264);
+    check(half.size() == 1 + 3 + 1 + 3 && half.back().divisor == 2, "controller levels: x264 and Performance mode may go from 60 to 30, last");
+    buffrx::LevelFacts x264_30 = controller_facts(30, 1080);
+    x264_30.half_rate_allowed = true;
+    check(buffrx::controller_levels(x264_30).size() == 1 + 3, "controller levels: 30 fps never halves to 15, even on x264");
+    buffrx::LevelFacts fast = controller_facts(90, 720, false);
+    fast.effort_changes[3] = true;
+    const std::vector<buffrx::EncoderLevel> few = buffrx::controller_levels(fast);
+    check(few.size() == 1 + 1 + 1 + 1, "controller levels: steps that change nothing are skipped");
+    buffrx::LevelFacts refused = controller_facts(144, 1080);
+    refused.divisor_ok = false;
+    check(buffrx::controller_levels(refused).size() == 1 + 3, "controller levels: a vendor that refused a divisor has no frame-rate levels");
+  }
+  // Down: the fast bar and the slow bar, one level a move, thirty seconds between moves.
+  {
+    ControllerRig rig(controller_facts(120, 1440));
+    check(rig.run(60, 0.99).move == Move::none, "controller: a healthy encoder is left alone");
+    check(rig.run(8, 0.80).move == Move::none, "controller: eight seconds under 85% is not yet a verdict");
+    const buffrx::ControllerDecision down = rig.run(4, 0.80);
+    check(down.move == Move::down && down.to == 1, "controller: ten seconds under 85% steps down one level");
+    check(rig.run(20, 0.50).move == Move::none, "controller: nothing moves twice within thirty seconds, however bad");
+    check(rig.run(12, 0.50).move == Move::down && rig.state.level == 2, "controller: then one level more, never three at once");
+  }
+  {
+    ControllerRig rig(controller_facts(120, 1440));
+    check(rig.run(28, 0.93).move == Move::none, "controller: 93% for 28 s is not yet a verdict");
+    check(rig.run(4, 0.93).move == Move::down, "controller: thirty seconds under 95% steps down");
+    ControllerRig mixed(controller_facts(120, 1440));
+    mixed.run(16, 0.93);
+    mixed.run(2, 0.99);
+    check(mixed.run(14, 0.93).move == Move::none, "controller: one good window breaks the run");
+  }
+  // Frame rate: thirty seconds, and one change per five minutes.
+  {
+    ControllerRig rig(controller_facts(120, 1440), 3);  // at full effort-down: the next level is /2
+    check(rig.run(28, 0.90).move == Move::none, "controller: a frame-rate level needs thirty seconds of struggle");
+    const buffrx::ControllerDecision down = rig.run(4, 0.90);
+    check(down.move == Move::down && rig.levels[static_cast<size_t>(down.to)].divisor == 2, "controller: the frame rate halves");
+    check(rig.run(120, 0.90).move == Move::none, "controller: a second frame-rate change waits five minutes");
+    check(rig.run(200, 0.90).move == Move::down && rig.levels[static_cast<size_t>(rig.state.level)].divisor == 3, "controller: after five minutes it may change again");
+  }
+  // Up: back one level at a time, the last lowered first, after three minutes (effort) or five (frame rate) at 99%.
+  {
+    ControllerRig rig(controller_facts(120, 1440), 2);
+    check(rig.run(176, 0.995).move == Move::none, "controller: three minutes are three minutes");
+    const buffrx::ControllerDecision up = rig.run(8, 0.995);
+    check(up.move == Move::up && up.to == 1, "controller: healthy for three minutes returns one effort level");
+    check(rig.run(120, 0.995).move == Move::none, "controller: the next one waits too");
+    check(rig.run(120, 0.995).move == Move::up && rig.state.level == 0, "controller: and the first level is the person's again");
+    check(rig.run(600, 0.995).move == Move::none, "controller: level 0 is the ceiling");
+    ControllerRig fps(controller_facts(120, 1440), 4);  // the first frame-rate level
+    check(fps.run(280, 0.995).move == Move::none, "controller: a frame-rate level takes five minutes to return from");
+    check(fps.run(30, 0.995).move == Move::up && fps.state.level == 3, "controller: and returns to the effort level it came from");
+    ControllerRig between(controller_facts(120, 1440), 2);
+    between.run(170, 0.995);
+    between.run(2, 0.97);
+    check(between.run(30, 0.995).move == Move::none, "controller: a window under 99% starts the healthy count again");
+  }
+  // A failed try up: down again within two minutes doubles that level's wait.
+  {
+    ControllerRig rig(controller_facts(120, 1440), 2);
+    check(rig.run(200, 0.995).move == Move::up, "controller: the try up");
+    check(rig.run(40, 0.5).move == Move::down && rig.state.level == 2, "controller: down again within two minutes: the try failed");
+    check(rig.run(200, 0.995).move == Move::none, "controller: the level now waits six minutes, not three");
+    check(rig.run(200, 0.995).move == Move::up, "controller: six minutes are enough");
+    ControllerRig held(controller_facts(120, 1440), 2);
+    held.run(200, 0.995);   // the try up
+    held.run(130, 0.995);   // held for over two minutes: a success
+    held.run(40, 0.5);
+    check(held.state.wait_multiple[2] == 1, "controller: a try up that held is forgiven");
+  }
+  // Grace, holds, the dead encoder, the lagging game, the floor.
+  {
+    ControllerRig rig(controller_facts(120, 1440));
+    buffrx::controller_grace(rig.state, rig.now, 30000);
+    check(rig.run(28, 0.30).move == Move::none, "controller: nothing moves during a grace window");
+    check(rig.run(40, 0.30).move == Move::down, "controller: and counting starts after it");
+    ControllerRig held(controller_facts(120, 1440));
+    held.holds.save_busy = true;
+    check(held.run(60, 0.30).move == Move::none, "controller: a save in progress holds it");
+    held.holds = {};
+    held.holds.manual_recording = true;
+    check(held.run(60, 0.30).move == Move::none, "controller: a manual recording holds it");
+    held.holds = {};
+    held.holds.device_hold = true;
+    check(held.run(60, 0.30).move == Move::none, "controller: the graphics driver settling holds it");
+    held.holds = {};
+    held.holds.frozen = true;
+    check(held.run(60, 0.03).move == Move::none, "controller: a dead encoder is the fallback ladder's, never a level");
+    ControllerRig lag(controller_facts(120, 1440));
+    check(lag.run(28, 0.80, 0.30).move == Move::none, "controller: lag relief waits thirty seconds");
+    check(lag.run(4, 0.80, 0.30).move == Move::down && lag.levels[lag.state.level].effort == 0 && lag.levels[lag.state.level].divisor == 2,
+          "controller: lag relief preserves base effort");
+    check(lag.run(280, 0.80, 0.30).move == Move::none, "controller: lag relief respects fps spacing");
+    check(lag.run(310, 0.995).move == Move::up && lag.state.level == 0, "controller: recovery restores base effort and fps");
+    ControllerRig no_fps(controller_facts(60, 1440));
+    check(no_fps.run(60, 0.80, 0.30).move == Move::none, "controller: lag cannot move when no fps relief is eligible");
+    buffrx::ControllerState remembered;
+    ControllerRig memory_source(controller_facts(120, 1440), 1);
+    memory_source.run(32, 0.80, 0.30);
+    buffrx::controller_start(remembered, memory_source.levels.size(), memory_source.state.level, 0, 0);
+    check(memory_source.levels[remembered.level].effort == 1 && memory_source.levels[remembered.level].divisor == 2,
+          "controller: remembered branch restores both effort and frame rate");
+    ControllerRig branch(controller_facts(120, 1440));
+    branch.run(32, 0.80, 0.30);
+    const int rate_only = branch.state.level;
+    check(branch.run(32, 0.80).move == Move::down && branch.levels[branch.state.level].effort == 1 && branch.levels[branch.state.level].divisor == 2,
+          "controller: encoder struggle after lag relief lowers effort at the same rate");
+    check(branch.run(184, 0.995).move == Move::up && branch.state.level == rate_only,
+          "controller: recovery first reverses effort without fps spacing");
+    check(branch.run(310, 0.995).move == Move::up && branch.state.level == 0,
+          "controller: recovery then reverses fps");
+    ControllerRig third(controller_facts(120, 1440));
+    third.run(32, 0.80, 0.30);
+    third.run(310, 0.80, 0.30);
+    check(third.levels[third.state.level].divisor == 3, "controller: lag reaches divisor three");
+    check(third.run(32, 0.80).move == Move::down && third.levels[third.state.level].effort == 1 && third.levels[third.state.level].divisor == 3,
+          "controller: divisor three is not the floor while effort relief remains");
+    check(third.run(32, 0.80).move == Move::down && third.levels[third.state.level].effort == 2,
+          "controller: another encoder-bound move lowers only one effort");
+    check(third.run(32, 0.80).move == Move::down && third.levels[third.state.level].effort == 3,
+          "controller: final effort remains reachable at divisor three");
+    check(third.run(40, 0.80).move == Move::floor_reached,
+          "controller: floor is reported only after rate and effort relief are exhausted");
+    ControllerRig lag_floor(controller_facts(60, 1440), 3);
+    check(lag_floor.run(40, 0.80, 0.30).move == Move::floor_reached,
+          "controller: effort-only floor is reported even when lag dominates");
+    ControllerRig lag_mid(controller_facts(120, 1440), 1);
+    check(lag_mid.run(32, 0.80, 0.30).move == Move::down && lag_mid.levels[lag_mid.state.level].effort == 1,
+          "controller: lag relief preserves intermediate effort");
+    check(lag_mid.run(310, 0.995).move == Move::up && lag_mid.state.level == 1, "controller: recovery returns to intermediate effort");
+    ControllerRig lag_fps(controller_facts(120, 1440), 3);
+    check(lag_fps.run(40, 0.80, 0.30).move == Move::down && lag_fps.levels[static_cast<size_t>(lag_fps.state.level)].kind == LevelKind::fps,
+          "controller: only the frame rate may move when the game is lagging");
+    ControllerRig light_lag(controller_facts(120, 1440), 2);
+    check(light_lag.run(184, 0.995, 0.01).move == Move::up, "controller: a game dropping the odd picture does not pin a level");
+    ControllerRig heavy_lag(controller_facts(120, 1440), 2);
+    check(heavy_lag.run(240, 0.995, 0.10).move == Move::none, "controller: a saturated GPU does not climb back");
+    ControllerRig floor(controller_facts(60, 720, true));
+    buffrx::controller_start(floor.state, floor.levels.size(), static_cast<int>(floor.levels.size()) - 1, floor.now, 0);
+    check(floor.run(40, 0.5).move == Move::floor_reached, "controller: at the floor and still short: one card");
+    check(floor.run(120, 0.5).move == Move::none, "controller: once per session");
+  }
+}
+
+// Encoder swaps (plan 008): the ring keeps its footage through a swap, the new encoder's packets get their own epoch, the index's clock keeps
+// going forward though the new encoder's own clock starts over, and a save that crosses the swap is planned as one part per epoch.
+bx::RingEntry epoch_entry(uint16_t epoch, bool video, bool key, int64_t dts_usec) {
+  bx::RingEntry entry;
+  entry.epoch = epoch;
+  entry.video = video;
+  entry.video_keyframe = video && key;
+  entry.dts_usec = dts_usec;
+  return entry;
+}
+
+void test_ring_epochs() {
+  {
+    bx::RingIndex index;
+    check(index.oldest_epoch(42) == 42, "an empty ring has no old epoch header to retain");
+    index.push(epoch_entry(UINT16_MAX, true, true, 0));
+    index.push(epoch_entry(UINT16_MAX, true, true, 1000000));
+    index.push(epoch_entry(0, true, true, 2000000));
+    index.push(epoch_entry(0, true, true, 3000000));
+    check(index.oldest_epoch(1) == UINT16_MAX, "epoch retention follows packet order before identifier wrap");
+    const auto next = epoch_entry(0, true, true, 4000000);
+    index.room_for(next, 2000000, 0);
+    check(index.oldest_epoch(1) == 0, "expired epoch headers can retire across identifier wrap");
+  }
+  // The plan: one epoch is today's single pipe (nothing to plan).
+  {
+    std::vector<bx::RingEntry> one = {epoch_entry(0, true, true, 0), epoch_entry(0, false, false, 10), epoch_entry(0, true, false, 33)};
+    check(bx::epoch_parts(one).empty(), "epoch parts: one epoch plans nothing, the save stays the single pipe");
+    std::vector<bx::RingEntry> later = {epoch_entry(3, true, true, 0), epoch_entry(3, false, false, 10)};
+    check(bx::epoch_parts(later).empty(), "epoch parts: a ring that is all of a later epoch is still the single pipe");
+  }
+  // Two epochs: pictures go to their own epoch, sound too, and the newer part loses the sound from before its first picture.
+  {
+    std::vector<bx::RingEntry> two = {
+        epoch_entry(0, true, true, 0),     epoch_entry(0, false, false, 5),   epoch_entry(0, true, false, 33),  epoch_entry(0, false, false, 40),
+        epoch_entry(1, false, false, 95),  // sound that arrived before the new encoder's first keyframe
+        epoch_entry(1, true, true, 100),   epoch_entry(1, false, false, 105), epoch_entry(1, true, false, 133)};
+    const std::vector<bx::EpochPart> parts = bx::epoch_parts(two);
+    check(parts.size() == 2, "epoch parts: two epochs make two parts");
+    if (parts.size() == 2) {
+      check(parts[0].epoch == 0 && parts[1].epoch == 1, "epoch parts: oldest epoch first");
+      check(parts[0].entries == std::vector<uint32_t>({0, 1, 2, 3}), "epoch parts: the first part is its epoch's packets in arrival order");
+      check(parts[1].entries == std::vector<uint32_t>({5, 6, 7}), "epoch parts: the newer part starts on its keyframe, without earlier sound");
+    }
+  }
+  // An epoch whose pictures are all gone leaves no part, and its sound with it; a part that starts mid-group starts on its first keyframe.
+  {
+    std::vector<bx::RingEntry> gone = {epoch_entry(0, false, false, 5), epoch_entry(1, true, false, 40), epoch_entry(1, true, true, 66),
+                                       epoch_entry(1, false, false, 70), epoch_entry(2, true, true, 200), epoch_entry(2, true, false, 233)};
+    const std::vector<bx::EpochPart> parts = bx::epoch_parts(gone);
+    check(parts.size() == 2 && parts[0].epoch == 1, "epoch parts: an epoch with no picture left makes no part");
+    if (parts.size() == 2) check(parts[0].entries == std::vector<uint32_t>({2, 3}), "epoch parts: pictures before a part's first keyframe are left out");
+  }
+  // The store: footage stays through begin_epoch, the clock of the new epoch continues, a part comes out zeroed on its own.
+  {
+    SpillStore store;
+    store.configure(60 * 1000000LL, 0);
+    int64_t sys = 5000000;
+    for (int frame = 0; frame < 40; ++frame) {  // epoch 0: 40 pictures at 25 fps, the encoder's own clock starts at 1,000,000
+      SpillTestPacket packet = spill_packet(true, frame % 20 == 0, 1000000 + frame * 40000LL, 1000);
+      packet.fields.sys_dts_usec = sys + frame * 40000LL;
+      store.push(packet);
+      SpillTestPacket audio = spill_packet(false, false, 1000000 + frame * 40000LL, 100);
+      audio.fields.sys_dts_usec = sys + frame * 40000LL;
+      store.push(audio);
+    }
+    store.begin_epoch(1);
+    // The new encoder's clock starts over at 0, its first keyframe arrives 200 ms (system clock) after the old epoch's last packet.
+    const int64_t new_sys = sys + 39 * 40000LL + 200000;
+    for (int frame = 0; frame < 40; ++frame) {
+      SpillTestPacket packet = spill_packet(true, frame % 20 == 0, frame * 40000LL, 1000);
+      packet.fields.sys_dts_usec = new_sys + frame * 40000LL;
+      packet.fields.pts = frame;
+      packet.fields.dts = frame;
+      store.push(packet);
+      SpillTestPacket audio = spill_packet(false, false, frame * 40000LL, 100);
+      audio.fields.sys_dts_usec = new_sys + frame * 40000LL;
+      store.push(audio);
+    }
+    const SpillStore::EpochJoin join = store.last_epoch_join();
+    check(join.known && join.gap_us == 200000, "epoch join: the swap's gap is read from the system clock");
+    check(join.shift_us == (1000000 + 39 * 40000LL + 200000) - 0, "epoch join: the new epoch is moved to where the old one ended plus the gap");
+    std::unique_ptr<SpillStore::SaveJob> job = store.begin_save();
+    check(job->entries.size() == 160, "epoch swap: every packet of both epochs is still in the ring");
+    bool forward = true, tagged = true;
+    for (size_t i = 1; i < job->entries.size(); ++i) forward = forward && job->entries[i].dts_usec >= job->entries[i - 1].dts_usec;
+    for (size_t i = 0; i < job->entries.size(); ++i) tagged = tagged && job->entries[i].epoch == (i < 80 ? 0 : 1);
+    check(forward, "epoch swap: the index's clock only goes forward across the swap");
+    check(tagged, "epoch swap: packets are tagged with the epoch they were made in");
+    const std::vector<bx::EpochPart> parts = bx::epoch_parts(job->entries);
+    check(parts.size() == 2, "epoch swap: a save across it is two parts");
+    if (parts.size() == 2) {
+      int64_t first_pts = -1, count = 0;
+      const bx::SaveReport report = store.run_part(*job, parts[1].entries, [&](const bx::PacketFields& packet) {
+        if (packet.video && first_pts < 0) first_pts = packet.pts;
+        ++count;
+        return true;
+      });
+      check(report.ok && count == 80, "epoch swap: the newer part writes all of its own packets");
+      check(first_pts == 0, "epoch swap: the newer part starts at zero on its own time base");
+    }
+    job.reset();
+    // A cut by length across the swap keeps the footage of both epochs when the length reaches back past it.
+    std::unique_ptr<SpillStore::SaveJob> cut = store.begin_save(2);
+    check(!cut->entries.empty() && cut->entries.front().video_keyframe, "epoch swap: a cut by length starts on a keyframe");
+    cut.reset();
+    store.reset();
+    check(store.info().packets == 0, "epoch swap: a reset forgets the epochs too");
+  }
+}
+
 // The same store driven by three threads: packets arriving, the spill writing, saves running. The accounting and the pin
 // must hold whatever order they land in.
 void test_ring_store_threads() {
@@ -10842,8 +12940,216 @@ int test_link_short_secret_local_expired();
 int test_ring_save_names();
 int test_ring_save_claims();
 int test_ring_save_result();
+// Plan 009: per-vendor tier tables, the settings-block parser and the compatibility report's privacy rule.
+void test_gpu_plan() {
+  std::printf("gpu plan (plan 009)\n");
+  using bx::EncoderFamily;
+  using bx::EncoderTraits;
+  const auto value = [](const std::vector<bx::EncoderSetting>& list, const char* name) { return bx::encoder_setting_value(list, name); };
+  const auto text = [&](const std::vector<bx::EncoderSetting>& list, const char* name) { return value(list, name).as_string(); };
+  const auto at = [](int fps, const char* codec) {
+    bx::Config config;
+    config.capture_fps = fps;
+    config.codec = codec;
+    return config;
+  };
+
+  // AMD, extras off (the shipped state): B-frames 0 everywhere, plain VBR, no pre-analysis, Quality drops to balanced above 90 fps.
+  check(!bx::kAmfQualityExtrasProven, "the AMD quality extras ship switched off until hardware proves them");
+  const EncoderTraits off;
+  for (const char* tier : {"performance", "standard", "balanced", "quality"}) {
+    for (int fps : {30, 60, 61, 90, 91, 144}) {
+      const auto amf = bx::encoder_tier_defaults(EncoderFamily::Amf, tier, at(fps, "av1"), off);
+      check(value(amf, "bf").as_int(-1) == 0, "amd writes bf 0 in every tier and band");
+      check(text(amf, "rate_control") == "VBR" && !value(amf, "pre_analysis").as_bool(true), "amd extras off: VBR and no pre-analysis");
+    }
+  }
+  check(text(bx::encoder_tier_defaults(EncoderFamily::Amf, "performance", at(60, "h264"), off), "preset") == "speed", "amd fast is speed");
+  check(text(bx::encoder_tier_defaults(EncoderFamily::Amf, "standard", at(60, "h264"), off), "preset") == "balanced", "amd standard is balanced");
+  check(text(bx::encoder_tier_defaults(EncoderFamily::Amf, "balanced", at(144, "h264"), off), "preset") == "balanced", "amd balanced is balanced");
+  check(text(bx::encoder_tier_defaults(EncoderFamily::Amf, "quality", at(60, "h264"), off), "preset") == "quality", "amd quality at 60 fps is quality");
+  check(text(bx::encoder_tier_defaults(EncoderFamily::Amf, "quality", at(90, "h264"), off), "preset") == "quality", "amd quality at 90 fps is quality");
+  check(text(bx::encoder_tier_defaults(EncoderFamily::Amf, "quality", at(120, "h264"), off), "preset") == "balanced", "amd quality above 90 fps is balanced");
+  check(text(bx::encoder_tier_defaults(EncoderFamily::Amf, "quality", at(60, "av1"), off), "preset") == "quality", "amd av1 highQuality waits for the extras");
+
+  // AMD, extras on: HQVBR up to 90 fps, pre-analysis up to 60, AV1 highQuality up to 60.
+  EncoderTraits on;
+  on.amf_quality_extras = true;
+  const auto q60 = bx::encoder_tier_defaults(EncoderFamily::Amf, "quality", at(60, "h264"), on);
+  const auto q90 = bx::encoder_tier_defaults(EncoderFamily::Amf, "quality", at(90, "h264"), on);
+  const auto q144 = bx::encoder_tier_defaults(EncoderFamily::Amf, "quality", at(144, "h264"), on);
+  check(text(q60, "rate_control") == "HQVBR" && value(q60, "pre_analysis").as_bool(false) && text(q60, "preset") == "quality", "extras: quality at 60 fps");
+  check(text(q90, "rate_control") == "HQVBR" && !value(q90, "pre_analysis").as_bool(true) && text(q90, "preset") == "quality", "extras: quality at 90 fps");
+  check(text(q144, "rate_control") == "VBR" && !value(q144, "pre_analysis").as_bool(true) && text(q144, "preset") == "balanced", "extras: quality at 144 fps");
+  check(text(bx::encoder_tier_defaults(EncoderFamily::Amf, "quality", at(60, "av1"), on), "preset") == "highQuality", "extras: av1 at 60 fps is highQuality");
+  check(text(bx::encoder_tier_defaults(EncoderFamily::Amf, "quality", at(75, "av1"), on), "preset") == "quality", "extras: av1 at 75 fps is quality");
+  check(text(bx::encoder_tier_defaults(EncoderFamily::Amf, "balanced", at(60, "av1"), on), "rate_control") == "VBR", "extras touch only the quality tier");
+
+  // NVIDIA older than Ada.
+  EncoderTraits old_card;
+  old_card.nvenc_pre_ada = true;
+  const auto ng_fast = bx::encoder_tier_defaults(EncoderFamily::Nvenc, "performance", at(60, "h264"), old_card);
+  const auto ng_std = bx::encoder_tier_defaults(EncoderFamily::Nvenc, "standard", at(60, "h264"), old_card);
+  const auto ng_bal = bx::encoder_tier_defaults(EncoderFamily::Nvenc, "balanced", at(60, "h264"), old_card);
+  check(text(ng_fast, "preset") == "p2" && text(ng_std, "preset") == "p3" && text(ng_bal, "preset") == "p4", "older nvenc: p2, p3, p4");
+  check(text(ng_fast, "multipass") == "disabled" && text(ng_std, "multipass") == "disabled" && text(ng_bal, "multipass") == "disabled", "older nvenc: no multipass below quality");
+  check(!value(ng_fast, "adaptive_quantization").as_bool(true) && !value(ng_std, "adaptive_quantization").as_bool(true) &&
+            value(ng_bal, "adaptive_quantization").as_bool(false),
+        "older nvenc: adaptive quantization from balanced");
+  check(text(bx::encoder_tier_defaults(EncoderFamily::Nvenc, "quality", at(60, "h264"), old_card), "preset") == "p6", "older nvenc quality at 60 fps is p6");
+  check(text(bx::encoder_tier_defaults(EncoderFamily::Nvenc, "quality", at(61, "h264"), old_card), "preset") == "p5", "older nvenc quality at 61 fps is p5");
+  check(text(bx::encoder_tier_defaults(EncoderFamily::Nvenc, "quality", at(90, "h264"), old_card), "preset") == "p5", "older nvenc quality at 90 fps is p5");
+  check(text(bx::encoder_tier_defaults(EncoderFamily::Nvenc, "quality", at(91, "h264"), old_card), "preset") == "p4", "older nvenc quality above 90 fps is p4");
+  check(text(bx::encoder_tier_defaults(EncoderFamily::Nvenc, "quality", at(90, "h264"), old_card), "multipass") == "qres", "older nvenc quality multipass is quarter-res to 90 fps");
+  check(text(bx::encoder_tier_defaults(EncoderFamily::Nvenc, "quality", at(144, "h264"), old_card), "multipass") == "disabled", "older nvenc quality has no multipass above 90 fps");
+  for (const char* tier : {"performance", "standard", "balanced", "quality"}) {
+    const auto list = bx::encoder_tier_defaults(EncoderFamily::Nvenc, tier, at(60, "h264"), old_card);
+    check(!value(list, "lookahead").as_bool(true) && value(list, "bf").as_int(-1) == 0 && text(list, "tune") == "hq", "older nvenc: no look-ahead, bf 0, hq tune");
+  }
+  // Ada and Blackwell keep today's table, at every band.
+  for (int fps : {30, 60, 120, 165}) {
+    const auto ada_quality = bx::encoder_tier_defaults(EncoderFamily::Nvenc, "quality", at(fps, "av1"));
+    check(text(ada_quality, "preset") == "p7" && text(ada_quality, "multipass") == "fullres" && value(ada_quality, "lookahead").as_bool(false),
+          "ada quality is untouched by the older-card table");
+  }
+  check(text(bx::encoder_tier_defaults(EncoderFamily::Nvenc, "balanced", at(60, "h264")), "preset") == "p5", "ada balanced is untouched");
+
+  // Intel: TU by band, plain VBR, no B-frames (the property is "bframes").
+  EncoderTraits none;
+  check(text(bx::encoder_tier_defaults(EncoderFamily::Qsv, "performance", at(60, "h264"), none), "target_usage") == "TU7", "qsv fast is TU7");
+  check(text(bx::encoder_tier_defaults(EncoderFamily::Qsv, "standard", at(60, "h264"), none), "target_usage") == "TU5", "qsv standard is TU5");
+  check(text(bx::encoder_tier_defaults(EncoderFamily::Qsv, "balanced", at(144, "h264"), none), "target_usage") == "TU4", "qsv balanced is TU4");
+  check(text(bx::encoder_tier_defaults(EncoderFamily::Qsv, "quality", at(60, "h264"), none), "target_usage") == "TU2", "qsv quality at 60 fps is TU2");
+  check(text(bx::encoder_tier_defaults(EncoderFamily::Qsv, "quality", at(90, "h264"), none), "target_usage") == "TU3", "qsv quality at 90 fps is TU3");
+  check(text(bx::encoder_tier_defaults(EncoderFamily::Qsv, "quality", at(120, "h264"), none), "target_usage") == "TU4", "qsv quality above 90 fps is TU4");
+  for (const char* tier : {"performance", "standard", "balanced", "quality"}) {
+    const auto list = bx::encoder_tier_defaults(EncoderFamily::Qsv, tier, at(60, "h264"), none);
+    check(text(list, "rate_control") == "VBR" && value(list, "bframes").as_int(-1) == 0 && value(list, "bf").is_null(), "qsv: VBR and bframes 0");
+  }
+
+  // Effort levels step down from the tier: no override makes any setting heavier than the tier gave.
+  struct Case {
+    EncoderFamily family;
+    EncoderTraits traits;
+    const char* codec;
+  };
+  EncoderTraits amd_on;
+  amd_on.amf_quality_extras = true;
+  const Case cases[] = {{EncoderFamily::Nvenc, none, "av1"}, {EncoderFamily::Nvenc, old_card, "h264"}, {EncoderFamily::Amf, off, "h264"},
+                        {EncoderFamily::Amf, amd_on, "av1"}, {EncoderFamily::Qsv, none, "h264"},       {EncoderFamily::X264, none, "h264"}};
+  bool no_heavier = true;
+  for (const Case& c : cases) {
+    for (const char* tier : {"performance", "standard", "balanced", "quality"}) {
+      for (int fps : {60, 90, 144}) {
+        const auto base = bx::encoder_tier_defaults(c.family, tier, at(fps, c.codec), c.traits);
+        for (int step = 1; step <= 3; ++step) {
+          auto relieved = base;
+          bx::apply_governor_relief(relieved, c.family, step);
+          for (const bx::EncoderSetting& before : base) {
+            const bx::Json after = value(relieved, before.name.c_str());
+            if (before.value.is_bool()) {
+              if (after.as_bool(false) && !before.value.as_bool(false)) no_heavier = false;
+            } else if (before.value.is_string()) {
+              const int was = bx::encoder_speed_rank(c.family, before.name, before.value.as_string());
+              const int now = bx::encoder_speed_rank(c.family, before.name, after.as_string());
+              if (was >= 0 && now > was) no_heavier = false;
+              if (before.name == "rate_control" && before.value.as_string() == "VBR" && after.as_string() != "VBR") no_heavier = false;
+            }
+          }
+          if (c.family == EncoderFamily::Amf && text(relieved, "rate_control") != "VBR") no_heavier = false;
+        }
+      }
+    }
+  }
+  check(no_heavier, "every effort level is no heavier than the tier, for every vendor, tier and frame-rate band");
+
+  // Only VBR (and HQVBR on AMD) ever reaches an AMD or Intel encoder, whatever an older config's options say.
+  bx::Config custom;
+  custom.encoder_mode = "custom";
+  custom.encoder_options = bx::Json::object();
+  custom.encoder_options.set("rate_control", bx::Json("CBR"));
+  check(text(bx::configured_encoder_settings(EncoderFamily::Amf, custom, 0), "rate_control") == "VBR", "amd never gets CBR");
+  check(text(bx::configured_encoder_settings(EncoderFamily::Qsv, custom, 0), "rate_control") == "VBR", "intel never gets CBR");
+  custom.encoder_options.set("rate_control", bx::Json("HQVBR"));
+  check(text(bx::configured_encoder_settings(EncoderFamily::Amf, custom, 0), "rate_control") == "HQVBR", "amd keeps a chosen HQVBR");
+  check(text(bx::configured_encoder_settings(EncoderFamily::Qsv, custom, 0), "rate_control") == "VBR", "intel has no HQVBR");
+
+  // The settings block an AMF encoder logs at init (texture-amf.cpp).
+  const std::string block =
+      "[texture-amf-h264: 'BuffrX video'] settings:\n\trate_control: VBR\n\tbitrate:      13333\n\tcqp:          20\n\tkeyint:       120\n"
+      "\tpreset:       balanced\n\tprofile:      high\n\tlevel:        4.2\n\tb-frames:     0\n\twidth:        1920\n\theight:       1080\n"
+      "\tpre-analysis: false\n\tparams:       (none)";
+  check(bx::encoder_settings_block_is(block), "a settings block is recognised");
+  check(!bx::encoder_settings_block_is("[texture-amf-h264: 'x'] Failed to create"), "another message is not a settings block");
+  const auto parsed = bx::encoder_settings_block_parse(block);
+  check(parsed.size() == 12, "the block has twelve rows");
+  check(parsed.at("preset") == "balanced" && parsed.at("rate_control") == "VBR" && parsed.at("b-frames") == "0" &&
+            parsed.at("pre-analysis") == "false" && parsed.at("bitrate") == "13333" && parsed.at("params") == "(none)",
+        "the rows keep their own spelling and values");
+  check(bx::encoder_settings_block_parse("nothing here").empty(), "text with no block parses to nothing");
+
+  // The report: no path, no user name, no window title; monitors by device name.
+  bx::CompatFacts facts;
+  facts.buffrx_version = "0.5.0";
+  facts.obs_version = "33.0.1";
+  facts.windows_build = 26100;
+  facts.hags = "on";
+  bx::CompatAdapter big;
+  big.index = 0;
+  big.vendor_id = 0x10DE;
+  big.device_id = 0x2684;
+  big.name = "NVIDIA GeForce RTX 4090";
+  big.driver = "32.0.15.6094";
+  big.dedicated_bytes = 24ull << 30;
+  big.used_by_libobs = true;
+  big.outputs = {"\\\\.\\DISPLAY1", "C:\\Users\\jdoe\\Desktop\\My Secret Game", "\\\\.\\DISPLAY2"};
+  bx::CompatAdapter small;
+  small.index = 1;
+  small.vendor_id = 0x8086;
+  small.device_id = 0xA780;
+  small.name = "Intel(R) UHD Graphics 770";
+  small.dedicated_bytes = 128ull << 20;
+  facts.adapters = {big, small};
+  facts.libobs_adapter_reason = "it drives the captured display";
+  bx::CompatEncoder encoder;
+  encoder.id = "h264_texture_amf";
+  encoder.codec = "h264";
+  encoder.hardware = true;
+  encoder.rate_control = {"CBR", "VBR", "HQVBR"};
+  encoder.preset = {"speed", "balanced", "quality"};
+  encoder.has_pre_analysis = true;
+  facts.encoders = {encoder};
+  facts.running_encoder = "h264_texture_amf";
+  facts.running_settings = {{"preset", bx::Json("balanced")},
+                            {"output_path", bx::Json("C:\\Users\\jdoe\\Videos\\clip.mp4")},
+                            {"share", bx::Json("\\\\nas\\jdoe\\clips")},
+                            {"bitrate", bx::Json(13333)},
+                            {"C:\\Users\\jdoe", bx::Json(1)}};
+  facts.reported_settings["preset"] = "balanced";
+  facts.reported_settings["params"] = "D:\\Users\\jdoe\\opts.txt";
+  facts.controller_level = 1;
+  facts.controller_label = "effort -1 in C:\\Users\\jdoe";
+  const std::string dumped = bx::compat_report_json(facts).dump(2);
+  const std::string summary = bx::compat_report_text(facts);
+  check(dumped.find(":\\") == std::string::npos && dumped.find("jdoe") == std::string::npos && dumped.find("Secret") == std::string::npos,
+        "the report holds no path, no user name and no window title");
+  check(summary.find(":\\") == std::string::npos && summary.find("jdoe") == std::string::npos, "the summary holds none either");
+  check(dumped.find("DISPLAY1") != std::string::npos && dumped.find("DISPLAY2") != std::string::npos, "monitors are named by their device");
+  check(dumped.find("balanced") != std::string::npos && dumped.find("13333") != std::string::npos, "ordinary settings stay");
+  check(dumped.find("hybrid_gpu_laptop_likely\": true") != std::string::npos, "two unlike adapters read as a hybrid laptop");
+  check(dumped.find("not measured: start the buffer first") != std::string::npos, "no buffer: the speed says so");
+  facts.speed_measured = true;
+  facts.speed_rendered = 600;
+  facts.speed_encoded = 594;
+  check(bx::compat_report_json(facts).dump(2).find("encoded_ratio") != std::string::npos, "a measured speed carries its ratio");
+}
+
 int test_ring_save_parts();
 int test_save_publish();
+int test_audio_settings();
+int test_audio_source_controls();
+int test_audio_watch_model();
+int test_audio_auto();
 
 int main() {
   char helper_mode[32] = {};
@@ -10854,6 +13160,15 @@ int main() {
   test_json();
   test_config();
   test_config_change_bits();
+  test_audio_prefs_persistence();
+  test_audio_routing();
+  test_audio_health();
+  g_failures += test_audio_settings();
+  g_failures += test_audio_source_controls();
+  g_failures += test_audio_watch_model();
+  g_failures += test_audio_auto();
+  test_audio_join_layout();
+  test_audio_layout();
   test_config_timeline();
   test_chords();
   test_gamepad_chords();
@@ -10908,6 +13223,7 @@ test_card_title();
   test_panel_size();
   test_interface_scale();
   test_card_grid();
+  test_display_card_layout();
   test_lock_watch();
   test_frame_stats();
   test_protocol_sync();
@@ -10919,12 +13235,17 @@ test_card_title();
   test_encoder_geometry();
   test_command_policy();
   test_idle_policy();
+  test_game_only();
   test_webview_present();
   test_process_path_is();
   test_capture_follows_focus();
   test_game_detection();
   test_buffer_watch();
   test_encoder_watch();
+  test_encoder_frozen();
+  test_driver_fault();
+  test_encoder_ladder();
+  test_hook_memory();
   test_encoder_governor();  test_gpu_adapter_choice();
   test_encoder_modes();
   test_recording_watch();
@@ -10973,6 +13294,7 @@ test_card_title();
   test_windowed_game();
   test_timeline_thumbs();
   test_timeline_loudness();
+  test_timeline_epoch();
   test_stream_compatibility();
   test_gpu_vendor();
   test_smooth_level();
@@ -11006,6 +13328,8 @@ test_card_title();
   test_ring_disk();
   test_ring_store_model();
   test_ring_store_threads();
+  test_ring_epochs();
+  test_encoder_controller();
   test_packet_hash();
   test_replay_store_ram_only();
   test_timeline_link();
@@ -11028,6 +13352,7 @@ test_card_title();
   test_config_defaults();
   test_native_path();
   test_wide_text();
+  test_gpu_plan();
   std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
   return g_failures == 0 ? 0 : 1;
 }

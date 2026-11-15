@@ -8,16 +8,18 @@ import { useCallback, useEffect, useMemo, useRef, useState, type Dispatch, type 
 import { Icon } from '../components/icons'
 import { Button, ContextMenu, DialogBox, IconButton, Slider, Tabs } from '../components/ui'
 import { engine, type MediaItem } from '../lib/api'
+import { audioLayout, audibleRows, joinSoundProblem, mixIsDerived, mixLockReason, monitorGains, monitorMode } from '../lib/audio'
 import { mediaUrl, onShell, shell } from '../lib/bridge'
 import { trimTimelineAt } from '../lib/editor_timeline'
-import { canShareSaved } from '../lib/editor-share'
+import { canShareSaved, shareThenLeave } from '../lib/editor-share'
 import { duration, fileName, stem, timecode } from '../lib/format'
+import { exportFileName } from '../lib/filename'
 import { setFullscreen as setWindowFullscreen } from '../lib/window'
 import { mediaWork } from '../lib/media'
 import type { MediaProbe } from '../lib/media_queue'
-import { playbackStep, playerSlot, preloadTime, slotClipIndex } from '../lib/playback'
+import { displaySource, holdInSpan, inSpan, lastShownSource, needsSeek, partSpan, playbackStep, playerSlot, preloadTime, previewClock, restartAt, slotClipIndex, spanAt, spanSource } from '../lib/playback'
 import { loadExportDefaults, saveExportDefaults } from '../lib/preferences'
-import { moveAll, moveEdge, movePart, playbackJump, remove, split, SHORTEST, type Part } from '../lib/segments'
+import { moveAll, moveEdge, movePart, partAt, playbackJump, remove, split, SHORTEST, type Part } from '../lib/segments'
 import {
   clipExportInput,
   clipOutputLength,
@@ -56,10 +58,14 @@ const EMPTY_CLIP: SequenceClip = newClip({ path: '', name: '', duration: 0, widt
 
 /** Said when the clips cannot be joined as they are: the engine refuses a join of unlike sound. */
 const TRACK_MISMATCH = 'These clips do not have the same sound tracks. A join needs every clip to match, so remove one.'
+/** Said when equal track counts still disagree on what the first stream means (a mix, or an import). */
+const SOUND_KIND_MISMATCH = 'These clips hold their sound differently: one starts with a full mix and the other has only separate tracks. Export the clips separately, or join clips that hold their sound the same way.'
 
 /** The details a player that holds no clip is given: the mix hook wants one, and this one is silent. */
-const NO_DETAILS: MediaDetails = { ok: false, duration: 0, width: 0, height: 0, fps: 0, videoCodec: '', videoKbps: 0, bytes: 0, audio: [] }
+const NO_DETAILS: MediaDetails = { ok: false, duration: 0, width: 0, height: 0, fps: 0, videoCodec: '', videoKbps: 0, bytes: 0, modified: 0, audio: [] }
 const NO_VOLUMES: number[] = []
+/** What the timeline's wave reads before any file has been read. */
+const NO_PROBE: MediaProbe = {}
 
 /** The engine's even slices of a clip's sound, as the waveform and the trim lane read them. */
 const PEAKS = 800
@@ -85,7 +91,7 @@ interface ExportResult {
   encoder: string
 }
 
-export function SequenceEditor({ clips, setClips, hover, dragging, suspended, clipsDir, focusClip, sourceProblem, onBrowse, onForget, onExportingChange }: {
+export function SequenceEditor({ clips, setClips, hover, dragging, suspended, clipsDir, focusClip, sourceProblem, onBrowse, onForget, onExportingChange, onShared }: {
   clips: SequenceClip[]
   setClips: Dispatch<SetStateAction<SequenceClip[]>>
   /** A file is over the window. */
@@ -103,10 +109,23 @@ export function SequenceEditor({ clips, setClips, hover, dragging, suspended, cl
   onForget: (id: string) => void
   /** True while an export is writing: closing the window now stops it and deletes its partial file. */
   onExportingChange?: (busy: boolean) => void
+  /** The panel's Share sheet is open on this file: leave the editor for it. */
+  onShared?: () => void
 }) {
   const [playhead, setPlayhead] = useState(0)
   const [playing, setPlaying] = useState(false)
   const wantPlay = useRef(false)
+  // A move the person makes (a seek, a cut, a clip change) places the players exactly. Only the playing sequence's own ticks
+  // leave a drift to the tolerance, so the flag is set by every other writer of the playhead.
+  const placeExact = useRef(false)
+  // A placement the playhead already holds renders nothing by itself, so each one also bumps this count: the sync effect runs
+  // for it, and the players are placed (a new cut at the same second is not skipped).
+  const [placeTick, setPlaceTick] = useState(0)
+  const place = useCallback((seconds: number) => {
+    placeExact.current = true
+    setPlayhead(seconds)
+    setPlaceTick((tick) => tick + 1)
+  }, [])
   // Two players take turns: the clip on screen in one, the clip after it loaded in the other.
   const players = [useRef<HTMLVideoElement>(null), useRef<HTMLVideoElement>(null)] as const
   const stage = useRef<HTMLDivElement>(null)
@@ -117,24 +136,40 @@ export function SequenceEditor({ clips, setClips, hover, dragging, suspended, cl
   const [replacing, setReplacing] = useState(false)
   const [confirmReplace, setConfirmReplace] = useState(false)
   const [rangeUndo, setRangeUndo] = useState<{ before: SequenceClip[]; after: SequenceClip[]; at: number } | null>(null)
+  // The Selection: the id of the clip whose active part the preview is held to. Null is the whole sequence. Only the id lives here;
+  // the part is the clip's own `active`, so a split, a delete or an undo keeps it valid without a second index.
+  const [selectedClip, setSelectedClip] = useState<string | null>(null)
   const focusedSerial = useRef(0)
   useEffect(() => {
     if (!focusClip || focusedSerial.current === focusClip.serial) return
     const found = clips.findIndex((entry) => entry.id === focusClip.id)
     if (found < 0) return
     focusedSerial.current = focusClip.serial
+    setSelectedClip(null)
     setPlaying(false)
     wantPlay.current = false
-    setPlayhead(clipStart(clips, found))
+    place(clipStart(clips, found))
   }, [clips, focusClip])
 
   const total = sequenceLength(clips)
-  const at = Math.min(Math.max(0, playhead), total)
+  // A clip that has left the sequence takes its Selection with it: the id finds nothing, and the preview is the sequence again.
+  const selectedIndex = selectedClip === null ? -1 : clips.findIndex((entry) => entry.id === selectedClip)
+  const selectedPart = selectedIndex >= 0 ? Math.min(clips[selectedIndex].active, clips[selectedIndex].parts.length - 1) : -1
+  const span = useMemo(() => (selectedIndex >= 0 ? partSpan(clips, selectedIndex, selectedPart) : null), [clips, selectedIndex, selectedPart])
+  // The playhead stays in sequence seconds everywhere. A Selection holds it inside its part (the end included), so it never reads
+  // the sequence lookup for its own end: a boundary there belongs to the next clip.
+  const at = span ? holdInSpan(span, playhead) : Math.min(Math.max(0, playhead), total)
   const located = locate(clips, at)
-  const index = Math.max(0, Math.min(clips.length - 1, located.index))
+  const index = span ? span.index : Math.max(0, Math.min(clips.length - 1, located.index))
   const empty = clips.length === 0
   const clip = clips[index] ?? EMPTY_CLIP
-  const sourceTime = located.sourceTime
+  const clock = previewClock(span, at, total)
+  // One fold for the whole audio view: the inspector and the timeline show the same state, and a clip
+  // that was not on screen yet starts folded into its one combined lane.
+  const [audioFold, setAudioFold] = useState({ id: clip.id, expanded: false })
+  const audioExpanded = audioFold.id === clip.id && audioFold.expanded
+  const setAudioExpanded = useCallback((open: boolean) => setAudioFold({ id: clip.id, expanded: open }), [clip.id])
+  const sourceTime = span ? spanSource(span, at) : located.sourceTime
   const sourceRef = useRef(sourceTime)
   sourceRef.current = sourceTime
   const activeSlot = playerSlot(index)
@@ -155,43 +190,75 @@ export function SequenceEditor({ clips, setClips, hover, dragging, suspended, cl
           videoCodec: '',
           videoKbps: 0,
           bytes: entry.bytes,
+          modified: entry.modified ?? 0,
           audio: entry.audio,
         }
       : NO_DETAILS
   const detailsA = useMemo(() => detailsOf(slotA), [slotA])
   const detailsB = useMemo(() => detailsOf(slotB), [slotB])
+  const gainsOf = (entry: SequenceClip | null) =>
+    entry ? monitorGains(entry.volumes, entry.muted, entry.solo, entry.audio.length, mixIsDerived(audioLayout(entry.audio)), entry.master) : NO_VOLUMES
+  const gainsA = useMemo(() => gainsOf(slotA), [slotA])
+  const gainsB = useMemo(() => gainsOf(slotB), [slotB])
   const failed = !empty && failedPath === clip.path
 
   // Keyframes and sound, once per file, for as long as the window is open. The reads are shared and
   // capped (media_queue.ts): a walk through the clips leaves one process at a time, and leaving a clip
   // ends the read it had out once another needs its place, so nothing is scanned for a clip nobody is
-  // looking at. A source replaced in place keeps its path, so `mediaEpoch` is what asks for the new
-  // bytes to be read.
-  const [media, setMedia] = useState<MediaProbe>({})
+  // looking at. A source replaced in place keeps its path, so its size and write time are what ask for
+  // the new bytes to be read.
+  const [media, setMedia] = useState<{ path: string; probe: MediaProbe; sound: 'loading' | 'ready' | 'failed' }>({ path: '', probe: NO_PROBE, sound: 'loading' })
   const [mediaEpoch, setMediaEpoch] = useState(0)
+  const stamps = useRef(new Map<string, string>())
   useEffect(() => {
     const path = clip.path
     if (!path) {
-      setMedia({})
+      setMedia({ path: '', probe: NO_PROBE, sound: 'loading' })
       return
     }
     let live = true
-    const show = () => {
-      if (live) setMedia(mediaWork.cached(path, PEAKS))
-    }
-    // A file already read draws at once, with no empty frame in between.
-    show()
-    void mediaWork.keyframes(path).then(show)
-    void mediaWork.peaks(path, PEAKS).then(show)
+    const stamp = `${clip.bytes}|${clip.modified}`
+    // A file rewritten under the same name would otherwise keep the wave of its old bytes: the queue
+    // caches by path, so the read in hand is dropped and asked for again.
+    if (stamps.current.has(path) && stamps.current.get(path) !== stamp) mediaWork.forget(path)
+    stamps.current.set(path, stamp)
+    // A file already read draws at once, with no empty frame in between. The state names the path it
+    // describes, so a switched clip never shows the previous clip's wave for a frame.
+    const show = (patch: Partial<{ probe: MediaProbe; sound: 'loading' | 'ready' | 'failed' }>) =>
+      setMedia((current) => (current.path === path ? { ...current, ...patch } : { path, probe: NO_PROBE, sound: 'loading', ...patch }))
+    const known = mediaWork.cached(path, PEAKS)
+    setMedia({ path, probe: known, sound: known.peaks ? 'ready' : 'loading' })
+    void mediaWork.keyframes(path).then((keyframes) => {
+      if (live && keyframes) show({ probe: { ...mediaWork.cached(path, PEAKS), keyframes } })
+    })
+    // A failed read is not cached, so it is said rather than left looking like a silent track.
+    void mediaWork.peaks(path, PEAKS).then((tracks) => {
+      if (!live) return
+      if (tracks) show({ probe: mediaWork.cached(path, PEAKS), sound: 'ready' })
+      else show({ sound: 'failed' })
+    })
     return () => {
       live = false
       mediaWork.release(path)
     }
-  }, [clip.path, clip.bytes, mediaEpoch])
+  }, [clip.path, clip.bytes, clip.modified, mediaEpoch])
+  // The probe and the sound state belong to the path that asked for them.
+  const probe = media.path === clip.path ? media.probe : NO_PROBE
+  const sound = media.path === clip.path ? media.sound : 'loading'
 
   const update = useCallback((patch: Partial<SequenceClip>) => {
     setClips((list) => list.map((entry, i) => (i === index ? { ...entry, ...patch } : entry)))
   }, [index, setClips])
+
+  // A lane and its fader are one control: picking a lane brings the Edit tab forward and puts the
+  // keyboard on that track's level. The mixer is read from the document, so no shared selection state
+  // has to be threaded through the pane.
+  const focusMixer = useCallback((trackIndex: number) => {
+    setTab('edit')
+    window.requestAnimationFrame(() => {
+      document.querySelector<HTMLInputElement>(`[data-audio-track="${trackIndex}"]`)?.focus()
+    })
+  }, [])
 
   // The colour grade and the crop are one look for the whole sequence: a change on the active clip is made on every
   // clip, a clip whose value already matches is left as it is (no new object, nothing to redraw), and a frame placed
@@ -214,6 +281,7 @@ export function SequenceEditor({ clips, setClips, hover, dragging, suspended, cl
   }, [index, setClips])
 
   const setParts = useCallback((next: Part[], record = true) => {
+    placeExact.current = true
     update({
       parts: next,
       history: record ? [...clip.history.slice(-49), clip.parts] : clip.history,
@@ -224,11 +292,13 @@ export function SequenceEditor({ clips, setClips, hover, dragging, suspended, cl
   const undo = useCallback(() => {
     const previous = clip.history[clip.history.length - 1]
     if (!previous) return
+    placeExact.current = true
     update({ parts: previous, history: clip.history.slice(0, -1), future: [...clip.future, clip.parts], active: Math.min(clip.active, previous.length - 1) })
   }, [clip, update])
   const redo = useCallback(() => {
     const next = clip.future[clip.future.length - 1]
     if (!next) return
+    placeExact.current = true
     update({ parts: next, history: [...clip.history, clip.parts], future: clip.future.slice(0, -1), active: Math.min(clip.active, next.length - 1) })
   }, [clip, update])
 
@@ -240,40 +310,68 @@ export function SequenceEditor({ clips, setClips, hover, dragging, suspended, cl
   // The part of the clip the cut lane shows. The wheel and the toolbar's zoom write it; a clip starts whole.
   const [view, setView] = useState<TimelineView>({ start: 0, span: Math.max(0.001, clip.duration) })
   useEffect(() => setView({ start: 0, span: Math.max(0.001, clip.duration) }), [clip.id, clip.duration])
-  // Each player carries its own clip's tracks: only the one on screen is connected to the mix.
-  const mixA = useTrackMix(players[0], slotA?.path ?? '', detailsA, slotA?.volumes ?? NO_VOLUMES, !slotA || activeSlot !== 0 || failedPath === slotA.path)
-  const mixB = useTrackMix(players[1], slotB?.path ?? '', detailsB, slotB?.volumes ?? NO_VOLUMES, !slotB || activeSlot !== 1 || failedPath === slotB.path)
+  // Each player carries its own clip's tracks: only the one on screen is connected to the mix, and a
+  // screenshot in front of the editor leaves no copy running behind it.
+  const mixA = useTrackMix(players[0], slotA?.path ?? '', detailsA, gainsA, !slotA || activeSlot !== 0 || suspended || failedPath === slotA.path)
+  const mixB = useTrackMix(players[1], slotB?.path ?? '', detailsB, gainsB, !slotB || activeSlot !== 1 || suspended || failedPath === slotB.path)
   const mix = activeSlot === 0 ? mixA : mixB
+  // What the picture's sound is: the file's own layout decides, never the capture settings of today.
+  const layout = useMemo(() => audioLayout(clip.audio), [clip.audio])
+  const monitor = monitorMode(layout, clip.audio.length)
+  // The lanes whose sound is actually heard, in the mixer's order: a derived mix is not drawn beside
+  // the sources it is made from, and a mix that cannot be rebuilt is drawn alone.
+  const audible = useMemo(() => audibleRows(clip.audio, layout), [clip.audio, layout])
 
   // ---------------------------------------------------------------- playback
 
   const playFrom = (seconds: number) => {
-    setPlayhead(Math.min(Math.max(0, seconds), total))
+    place(Math.min(Math.max(0, seconds), total))
+  }
+  // The sequence's own places leave any Selection: a lane, the library, a move or a removal means the whole sequence again.
+  const sequenceFrom = (seconds: number) => {
+    setSelectedClip(null)
+    playFrom(seconds)
+  }
+  const pausePreview = () => {
+    wantPlay.current = false
+    setPlaying(false)
+    for (const player of players) player.current?.pause()
   }
 
+  // The parts the player on screen is held to: the selected part alone in a Selection, the clip's kept parts otherwise.
+  const playParts = (entry: SequenceClip, slot: 0 | 1): Part[] => (span && slot === activeSlot ? [[span.from, span.to]] : entry.parts)
+
   const togglePlay = useCallback(() => {
-    const element = players[playerSlot(index)].current
-    if (!element) return
     if (wantPlay.current) {
       wantPlay.current = false
       for (const player of players) player.current?.pause()
       setPlaying(false)
       return
     }
-    if (at >= total - 0.05) setPlayhead(0)
+    // From the end, the preview starts again: the sequence on its first kept frame, a Selection on the start of its part.
+    // The ended player is not played here: it would restart at the removed head of its file. The sync effect places the
+    // players first, then starts the one on screen.
+    if (span ? restartAt(span, at) !== at : at >= total - 0.05) {
+      place(span ? span.start : 0)
+      wantPlay.current = true
+      setPlaying(true)
+      return
+    }
+    const element = players[playerSlot(index)].current
+    if (!element) return
     wantPlay.current = true
     void element.play().catch(() => undefined)
     setPlaying(true)
-  }, [at, total, index])
+  }, [at, total, index, place, span])
 
   // A loaded player takes its place: the active one the playhead, the waiting one its clip's first
   // kept frame, so the boundary swaps two ready pictures instead of loading one.
   const prepare = (slot: 0 | 1) => {
     const element = players[slot].current
     const entry = slotClip(slot)
-    if (!element || !entry) return
+    if (!entry || !element) return
     element.playbackRate = entry.speed
-    if (slot === activeSlot) element.currentTime = Math.max(0, Math.min(entry.duration, sourceRef.current))
+    if (slot === activeSlot) element.currentTime = displaySource(playParts(entry, slot), Math.max(0, Math.min(entry.duration, sourceRef.current)))
     else element.currentTime = preloadTime(entry)
     if (slot === activeSlot && wantPlay.current) void element.play().catch(() => undefined)
   }
@@ -286,23 +384,42 @@ export function SequenceEditor({ clips, setClips, hover, dragging, suspended, cl
     trimming.current = on
     if (!on) setReleaseTick((tick) => tick + 1)
   }, [])
+  // The Selection's own reconcile, in one place. A change to the held part (another part or clip, its source range, its place on the
+  // clock) stops the preview, and a playhead outside the part goes to its start. Declared before the sync effect, so the pause is in
+  // place before any player is asked to play. The playhead is read through its ref: a tick never restarts this check.
+  const selectionKey = span ? `${clip.id}|${span.part}|${span.from}|${span.to}` : ''
+  const headRef = useRef(playhead)
+  headRef.current = playhead
+  useEffect(() => {
+    pausePreview()
+    if (!span) return
+    if (!inSpan(span, headRef.current)) place(span.start)
+    // It re-runs when the held part, its source range or its place on the clock changes; the playhead is read through its ref.
+  }, [selectionKey, span?.start, span?.end]) // eslint-disable-line react-hooks/exhaustive-deps -- see the comment above
+
   // Both players follow the playhead: the active one plays from the sequence's second, the other
   // waits on its clip's first frame until the boundary makes it active.
   useEffect(() => {
     if (trimming.current) return
+    // Paused, or placed by a move or a committed edit, the players go to the exact kept frame: a speed change while paused moves
+    // the sequence's source second with no placement, and the picture has to follow it. A playing one is only corrected once it
+    // drifts (needsSeek). The flag is spent here, so the next tick is a drift again. A placement made before a player has its
+    // metadata is not lost: prepare places that player when the metadata arrives.
+    const exact = placeExact.current || !wantPlay.current
+    placeExact.current = false
     players.forEach((ref, slot) => {
       const element = ref.current
       const entry = slotClip(slot as 0 | 1)
       if (!element || !entry) return
       element.playbackRate = entry.speed
       if (element.readyState < 1) return
-      const target = slot === activeSlot ? Math.min(entry.duration, sourceTime) : preloadTime(entry)
-      if (Math.abs(element.currentTime - target) > 0.25) element.currentTime = target
+      const target = slot === activeSlot ? displaySource(playParts(entry, slot as 0 | 1), Math.min(entry.duration, sourceTime)) : preloadTime(entry)
+      if (needsSeek(element.currentTime, target, exact)) element.currentTime = target
       if (slot === activeSlot) {
         if (wantPlay.current && element.paused) void element.play().catch(() => undefined)
       } else if (!element.paused) element.pause()
     })
-  }, [activeSlot, sourceTime, slotA, slotB, releaseTick])
+  }, [activeSlot, sourceTime, slotA, slotB, releaseTick, placeTick, span?.from, span?.to]) // eslint-disable-line react-hooks/exhaustive-deps -- playParts reads the span, which its bounds name
 
   // The clip plays only what it keeps, and the end of its last part hands over to the next clip,
   // whose player is already loaded and waiting. A player the browser paused mid-clip is started
@@ -314,42 +431,61 @@ export function SequenceEditor({ clips, setClips, hover, dragging, suspended, cl
     const tick = () => {
       const element = players[activeSlot].current
       if (element) {
-        const end = clip.parts[clip.parts.length - 1][1]
+        // A Selection is one bounded part: its end finishes the preview on its own last kept image, and never hands over.
+        const parts: Part[] = span ? [[span.from, span.to]] : clip.parts
         const step = playbackStep({
           wantPlay: wantPlay.current,
           paused: element.paused,
           ended: element.ended,
           currentTime: element.currentTime,
-          end,
-          last: index + 1 >= clips.length,
+          end: parts[parts.length - 1][1],
+          last: span ? true : index + 1 >= clips.length,
         })
         if (step === 'restart') void element.play().catch(() => undefined)
         else if (step === 'advance') {
-          const jump = playbackJump(clip.parts, element.currentTime)
+          const jump = playbackJump(parts, element.currentTime)
           if (jump !== null) element.currentTime = jump
-          setPlayhead(clipStart(clips, index) + outputOffsetOfSource(clip, element.currentTime))
-        } else if (step === 'handover') setPlayhead(clipStart(clips, index + 1))
+          setPlayhead(span ? spanAt(span, element.currentTime) : clipStart(clips, index) + outputOffsetOfSource(clip, element.currentTime))
+        } else if (step === 'handover') place(clipStart(clips, index + 1))
         else if (step === 'finish') {
           wantPlay.current = false
           setPlaying(false)
           element.pause()
-          setPlayhead(total)
+          place(span ? span.end : total)
         }
       }
       if (wantPlay.current) frame = requestAnimationFrame(tick)
     }
     frame = requestAnimationFrame(tick)
     return () => cancelAnimationFrame(frame)
-  }, [playing, clip, index, clips, total, activeSlot])
+  }, [playing, clip, index, clips, total, activeSlot, place, span])
 
   // A cut part is skipped when playback starts, as on the stage of the single-clip editor.
+  // The playhead and the player go to a second of the clip under the given parts. A committed cut passes its own parts:
+  // the render's clip still holds the parts that were just replaced, and mapping through them placed the playhead wrongly.
+  const placeIn = useCallback((parts: Part[], t: number) => {
+    const jump = playbackJump(parts, t)
+    const next = jump === null ? t : jump
+    place(clipStart(clips, index) + outputOffsetOfSource({ ...clip, parts }, next))
+    const element = players[playerSlot(index)].current
+    if (element) element.currentTime = displaySource(parts, next)
+  }, [clip, clips, index, place])
+  // A seek from the cut lane's pointer. In a Selection it selects the part the second lands in, so the lane and the preview agree.
+  // It writes `active` only when that part changes: a seek drag reports every move, and the same part is not written again.
   const seekSource = useCallback((t: number) => {
     const jump = playbackJump(clip.parts, t)
-    const next = jump === null ? t : jump
-    setPlayhead(clipStart(clips, index) + outputOffsetOfSource(clip, next))
+    const part = partAt(clip.parts, jump === null ? t : jump)
+    if (span && part >= 0 && part !== span.part) update({ active: part })
+    placeIn(clip.parts, t)
+  }, [clip.parts, span, placeIn, update])
+  // The keys (the arrows, the frame steps, Home and End) never leave a Selection: they are held to its part. In the sequence they seek as before.
+  const seekInSpan = (t: number) => {
+    if (!span) return seekSource(t)
+    const source = Math.min(Math.max(t, span.from), span.to)
+    place(spanAt(span, source))
     const element = players[playerSlot(index)].current
-    if (element) element.currentTime = next
-  }, [clip, clips, index])
+    if (element) element.currentTime = displaySource([[span.from, span.to]], source)
+  }
 
   const [splitFlash, setSplitFlash] = useState<{ at: number; id: number } | null>(null)
   const splitHere = useCallback(() => {
@@ -364,31 +500,36 @@ export function SequenceEditor({ clips, setClips, hover, dragging, suspended, cl
     if (!result) return
     setParts(result.parts)
     update({ active: result.active })
-    seekSource(result.parts[result.active][0])
-  }, [clip.parts, setParts, update, seekSource])
+    placeIn(result.parts, result.parts[result.active][0])
+  }, [clip.parts, setParts, update, placeIn])
   const deletePart = useCallback(() => deletePartAt(current), [deletePartAt, current])
   const canSplit = split(clip.parts, sourceTime) !== null
   const canDelete = clip.parts.length > 1
 
+  // A committed trim selects its clip's part: the Selection follows the edit. The reconcile effect then holds the playhead.
   const applyEdge = useCallback((part: number, edge: 'in' | 'out', t: number, first: boolean, live: boolean) => {
     if (!clip.parts[part]) return
     setParts(moveEdge(clip.parts, part, edge, t, clip.duration, live ? 0 : SHORTEST), first)
-  }, [clip.parts, clip.duration, setParts])
+    setSelectedClip(clip.id)
+  }, [clip.id, clip.parts, clip.duration, setParts])
   const applyPart = useCallback((part: number, from: number, first: boolean) => {
     const entry = clip.parts[part]
     if (!entry) return
     setParts(movePart(clip.parts, part, from - entry[0], clip.duration), first)
-  }, [clip.parts, clip.duration, setParts])
+    setSelectedClip(clip.id)
+  }, [clip.id, clip.parts, clip.duration, setParts])
   const applyBar = useCallback((from: number, first: boolean) => {
     if (!clip.parts.length) return
     setParts(moveAll(clip.parts, from - clip.parts[0][0], clip.duration), first)
-  }, [clip.parts, clip.duration, setParts])
+    setSelectedClip(clip.id)
+  }, [clip.id, clip.parts, clip.duration, setParts])
 
   const moveClip = useCallback((from: number, to: number) => {
     const next = reorder(clips, from, to)
     if (next === clips) return
+    setSelectedClip(null)
     setClips(next)
-    setPlayhead(clipStart(next, to))
+    place(clipStart(next, to))
   }, [clips, setClips])
 
   // ---------------------------------------------------------------- export
@@ -396,6 +537,12 @@ export function SequenceEditor({ clips, setClips, hover, dragging, suspended, cl
   const [defaults] = useState(loadExportDefaults)
   const [quality, setQuality] = useState(defaults.quality)
   const [resolution, setResolution] = useState(defaults.resolution)
+  // The saved copy's name. It follows the generated default (the clip's name and "edit"/"sequence") until a
+  // person types one; from then on their name stays, across cuts, a second save and to the Share sheet.
+  const generatedName = `${stem(clips[0]?.path ?? '') || 'buffrx'}-${clips.length > 1 ? 'sequence' : 'edit'}.mp4`
+  const [typedName, setTypedName] = useState<string | null>(null)
+  const exportName = typedName ?? generatedName
+  const nameCheck = exportFileName(exportName)
   const [exportBusy, setExportBusy] = useState(false)
   const [exporting, setExporting] = useState<{ id: number; value: number }[]>([])
   const [done, setDone] = useState<string | null>(null)
@@ -435,6 +582,13 @@ export function SequenceEditor({ clips, setClips, hover, dragging, suspended, cl
     }
   }, [])
 
+  // The panel draws the sheet; the editor leaves only after the engine accepted the file, so a refused share
+  // does not take the person away from the edit. Save & share and the saved card's Share both end here.
+  const shareFile = useCallback((file: string) => {
+    void attempt('The share sheet did not open',
+                 () => shareThenLeave(() => engine.share(file), () => onShared?.()))
+  }, [onShared])
+
   const settle = useCallback((result: ExportResult) => {
     onExportingChange?.(false)
     const wasReplacing = replacingRef.current
@@ -445,8 +599,8 @@ export function SequenceEditor({ clips, setClips, hover, dragging, suspended, cl
       setDoneSignature(saveSignature.current)
       setDoneShareable(shareIsCopy.current)
       toast('success', 'Saved', `${fileName(result.output)}${result.encoder === 'copy' ? ' · lossless copy' : ''}`)
-      // The save ends in Explorer, on the file: the card can say it, the folder shows it.
-      void attempt('Not shown', () => engine.reveal({ file: result.output, kind: 'clip' } as MediaItem))
+      // A save that goes straight to the Share sheet does not also open Explorer: the sheet is the destination.
+      if (!shareAfter.current) void attempt('Not shown', () => engine.reveal({ file: result.output, kind: 'clip' } as MediaItem))
       void engine.notifyLibrary().catch(() => undefined)
       if (wasReplacing) {
         // The source has changed on disk. Reset its edit only if nothing arrived or changed while saving.
@@ -458,10 +612,12 @@ export function SequenceEditor({ clips, setClips, hover, dragging, suspended, cl
           }
           mediaWork.forget(result.output)
           // Same path, new bytes: the reads of the old file are gone, so the wave and cuts are read again.
+          setSelectedClip(null)
           setMediaEpoch((epoch) => epoch + 1)
           setClips([newClip({ path: result.output, name: fileName(result.output), duration: details.duration,
-            width: details.width, height: details.height, fps: details.fps, bytes: details.bytes, audio: details.audio })])
-          setPlayhead(0)
+            width: details.width, height: details.height, fps: details.fps, bytes: details.bytes,
+            modified: details.modified, audio: details.audio })])
+          place(0)
           setFailedPath(null)
           // The source was rewritten: its signature is no longer the one the save was measured
           // against, so the old card would immediately claim the edit changed. Start clean.
@@ -470,13 +626,13 @@ export function SequenceEditor({ clips, setClips, hover, dragging, suspended, cl
         }).catch(() => toast('info', 'Original replaced', 'Reopen the video before making further edits.'))
       }
       if (shareAfter.current && canShareSaved(shareSignature.current, signatureRef.current, shareIsCopy.current))
-        void attempt('The share sheet did not open', () => engine.share(result.output))
+        shareFile(result.output)
       else if (shareAfter.current) toast('info', 'Clip saved', 'Your edit changed while saving. Save it again to share the latest version.')
     } else if (result.error !== 'cancelled') {
       toast('error', 'The export failed', result.error)
     }
     shareAfter.current = false
-  }, [setClips, onExportingChange])
+  }, [setClips, onExportingChange, shareFile])
 
   const outHeight = resolution === 'original' ? 0 : Number(resolution)
   const base = clips[0] ?? EMPTY_CLIP
@@ -486,14 +642,20 @@ export function SequenceEditor({ clips, setClips, hover, dragging, suspended, cl
   const outSize = outHeight && outHeight < frame.height
     ? { width: Math.round((frame.width * outHeight) / frame.height / 2) * 2, height: outHeight }
     : null
-  const mismatch = new Set(clips.map((entry) => entry.audio.length)).size > 1
+  const soundProblem = joinSoundProblem(clips)
+  const soundWarning = soundProblem === 'tracks' ? TRACK_MISMATCH : soundProblem === 'kinds' ? SOUND_KIND_MISMATCH : null
   const canReplace = clips.length === 1 && !clips[0].timelineSession
   // A source problem belongs to the Timeline clip it names, so it only blocks an export the sequence would
   // actually read it for: an ordinary sequence of library clips exports while a session is still preparing.
-  const exportable = total >= 0.5 && !!clipsDir && clips.length > 0 && !mismatch && (!sourceProblem || !clips.some((entry) => entry.timelineSession))
+  const exportable = total >= 0.5 && !!clipsDir && clips.length > 0 && !soundProblem && (!sourceProblem || !clips.some((entry) => entry.timelineSession))
 
   const runExport = async (share: boolean, replace = false) => {
     if (exportBusy || !exportable || (replace && !canReplace)) return
+    const chosen = exportFileName(exportName)
+    if (!replace && chosen.error) {
+      toast('error', 'The copy needs a name', chosen.error)
+      return
+    }
     setTab('export')
     setExportBusy(true)
     onExportingChange?.(true)
@@ -509,13 +671,12 @@ export function SequenceEditor({ clips, setClips, hover, dragging, suspended, cl
       players.forEach((ref) => ref.current?.pause())
     }
     setDone(null)
-    const suffix = clips.length === 1 ? 'edit' : 'sequence'
-    const target = replace ? clips[0].path : await attempt('The export did not start', () => uniquePath(`${clipsDir}\\Edits\\${stem(clips[0].path)}-${suffix}.mp4`))
+    const target = replace ? clips[0].path : await attempt('The export did not start', () => uniquePath(`${clipsDir}\\Edits\\${chosen.name}`))
     if (target === undefined) { setExportBusy(false); onExportingChange?.(false); replacingRef.current = false; setReplacing(false); return }
     const inputs = clips.map(clipExportInput)
     const job = clips.length === 1
-      ? { ...inputs[0], output: target, replace_original: replace, quality, out_width: outSize?.width ?? 0, out_height: outSize?.height ?? 0 }
-      : { output: target, inputs, quality, out_width: outSize?.width ?? 0, out_height: outSize?.height ?? 0, fit_pad: true }
+      ? { ...inputs[0], output: target, replace_original: replace, fail_if_exists: !replace, quality, out_width: outSize?.width ?? 0, out_height: outSize?.height ?? 0 }
+      : { output: target, inputs, fail_if_exists: true, quality, out_width: outSize?.width ?? 0, out_height: outSize?.height ?? 0, fit_pad: true }
     const id = await attempt('The export did not start', () => shell<number>('media_export', { job }))
     if (id === undefined) { setExportBusy(false); onExportingChange?.(false); replacingRef.current = false; setReplacing(false); return }
     const ended = endedEarly.current.get(id)
@@ -531,23 +692,25 @@ export function SequenceEditor({ clips, setClips, hover, dragging, suspended, cl
   const takeOut = (id: string) => {
     const removed = clips.findIndex((entry) => entry.id === id)
     const next = clips.filter((entry) => entry.id !== id)
+    setSelectedClip(null)
     setClips(next)
     onForget(id)
-    if (next.length) setPlayhead(clipStart(next, Math.min(removed, next.length - 1)))
-    else setPlayhead(0)
+    if (next.length) place(clipStart(next, Math.min(removed, next.length - 1)))
+    else place(0)
   }
 
   const trimTimeline = (side: 'from' | 'to') => {
     const next = trimTimelineAt(clips, index, sourceTime, side)
     if (!next || !clip.timelineSession) return
     setRangeUndo({ before: clips, after: next, at })
+    setSelectedClip(null)
     setClips(next)
     wantPlay.current = false
     setPlaying(false)
     const matching = next.map((entry, i) => entry.timelineSession === clip.timelineSession ? i : -1).filter((i) => i >= 0)
     const target = side === 'from' ? matching[0] : matching[matching.length - 1]
     const boundary = clipStart(next, target) + (side === 'to' ? Math.max(0, clipOutputLength(next[target]) - 0.001) : 0)
-    setPlayhead(boundary)
+    place(boundary)
   }
 
   // The toolbar's zoom reads and writes the cut lane's view, around the playhead when it is on screen.
@@ -557,9 +720,14 @@ export function SequenceEditor({ clips, setClips, hover, dragging, suspended, cl
     setView((current) => viewAtSpan(current, clip.duration, anchor, spanOfZoom(level, clip.duration)))
   }
   const stepZoom = (direction: 1 | -1) => setZoom(Math.min(1, Math.max(0, zoom + direction * 0.15)))
-  const offsetInClip = at - clipStart(clips, index)
-  const goPrevious = () => playFrom(offsetInClip > 0.5 || index === 0 ? clipStart(clips, index) : clipStart(clips, index - 1))
-  const goNext = () => playFrom(clipStart(clips, index + 1))
+  // Clip navigation returns to the sequence; selecting a cut is the explicit way to preview one part again.
+  const goPrevious = () => {
+    const offsetInClip = at - clipStart(clips, index)
+    sequenceFrom(offsetInClip > 0.5 || index === 0 ? clipStart(clips, index) : clipStart(clips, index - 1))
+  }
+  const goNext = () => {
+    if (index + 1 < clips.length) sequenceFrom(clipStart(clips, index + 1))
+  }
 
   // ---------------------------------------------------------------- keyboard and wheel
 
@@ -623,26 +791,33 @@ export function SequenceEditor({ clips, setClips, hover, dragging, suspended, cl
       case 'redo': return redo()
       case 'earlier': return moveClip(index, index - 1)
       case 'later': return moveClip(index, index + 1)
-      case 'back1': return seekSource(sourceTime - 1)
-      case 'forward1': return seekSource(sourceTime + 1)
-      case 'back5': return seekSource(sourceTime - 5)
-      case 'forward5': return seekSource(sourceTime + 5)
-      case 'frameBack': return seekSource(sourceTime - frameStep)
-      case 'frameForward': return seekSource(sourceTime + frameStep)
-      case 'clipStart': return seekSource(clip.parts[0][0])
+      case 'back1': return seekInSpan(sourceTime - 1)
+      case 'forward1': return seekInSpan(sourceTime + 1)
+      case 'back5': return seekInSpan(sourceTime - 5)
+      case 'forward5': return seekInSpan(sourceTime + 5)
+      case 'frameBack': return seekInSpan(sourceTime - frameStep)
+      case 'frameForward': return seekInSpan(sourceTime + frameStep)
+      // Home and End are the selected part's own start and end in a Selection, the clip's in the sequence.
+      case 'clipStart': return seekInSpan(span ? span.from : clip.parts[0][0])
       // The last frame, not the end itself: the end is where the next clip starts.
-      case 'clipEnd': return seekSource(Math.max(clip.parts[0][0], clip.parts[clip.parts.length - 1][1] - frameStep))
+      case 'clipEnd': return seekInSpan(span ? span.to : lastShownSource(clip.parts[clip.parts.length - 1]))
       case 'previousClip': return goPrevious()
       case 'nextClip': return goNext()
-      case 'sequenceStart': return playFrom(0)
-      case 'sequenceEnd': return playFrom(total)
-      case 'markIn': return setParts(moveEdge(clip.parts, current, 'in', sourceTime, clip.duration))
-      case 'markOut': return setParts(moveEdge(clip.parts, current, 'out', sourceTime, clip.duration))
+      // Ctrl+Home and Ctrl+End are the whole sequence, whatever the preview holds.
+      case 'sequenceStart': return sequenceFrom(0)
+      case 'sequenceEnd': return sequenceFrom(total)
+      case 'markIn':
+        setSelectedClip(clip.id)
+        return setParts(moveEdge(clip.parts, current, 'in', sourceTime, clip.duration))
+      case 'markOut':
+        setSelectedClip(clip.id)
+        return setParts(moveEdge(clip.parts, current, 'out', sourceTime, clip.duration))
       case 'zoomIn': return stepZoom(1)
       case 'zoomOut': return stepZoom(-1)
       case 'zoomFit': return setView({ start: 0, span: Math.max(0.001, clip.duration) })
       case 'resetTrim':
         if (untouched) return
+        setSelectedClip(clip.id)
         setParts([[0, clip.duration]])
         return update({ active: 0 })
       case 'saveCopy': return void runExport(false)
@@ -733,12 +908,16 @@ export function SequenceEditor({ clips, setClips, hover, dragging, suspended, cl
     }
     // Playing, the picture is what drives the playhead every frame, so the wheel moves the picture too: the playhead
     // alone would be overwritten by the next frame. The ref keeps a burst of notches adding up before a render.
-    const next = Math.min(Math.max(0, playheadRef.current + moved), total)
+    const next = Math.min(Math.max(span ? span.start : 0, playheadRef.current + moved), span ? span.end : total)
     playheadRef.current = next
-    setPlayhead(next)
-    const where = locate(clips, next)
+    place(next)
     const element = players[playerSlot(index)].current
-    if (element && where.index === index) element.currentTime = where.sourceTime
+    if (span) {
+      if (element) element.currentTime = displaySource([[span.from, span.to]], spanSource(span, next))
+      return
+    }
+    const where = locate(clips, next)
+    if (element && where.index === index) element.currentTime = displaySource(clip.parts, where.sourceTime)
   }
   const playheadRef = useRef(at)
   playheadRef.current = at
@@ -813,8 +992,17 @@ export function SequenceEditor({ clips, setClips, hover, dragging, suspended, cl
           <Transport
             playing={playing}
             fullscreen={fullscreen}
-            time={at}
-            total={total}
+            time={clock.time}
+            total={clock.total}
+            scope={span ? 'selection' : 'sequence'}
+            showScope={clips.length > 1 || clip.parts.length > 1}
+            onScope={(next) => {
+              // Choosing the Selection holds the active part; choosing the sequence leaves it. A choice already in force changes
+              // nothing. Otherwise the preview pauses, and the playhead stays where it is, read on the sequence's clock.
+              if ((next === 'selection') === (span !== null)) return
+              setSelectedClip(next === 'selection' && clip.parts.length ? clip.id : null)
+              pausePreview()
+            }}
             hasNext={index + 1 < clips.length}
             clip={clip}
             onToggle={togglePlay}
@@ -834,7 +1022,7 @@ export function SequenceEditor({ clips, setClips, hover, dragging, suspended, cl
           onChange={setTab}
           className="mt-1"
           tabs={[
-            { id: 'edit', label: 'Edit', icon: 'sliders', content: editPanel(<EditTab clip={clip} update={update} look={look} />) },
+            { id: 'edit', label: 'Edit', icon: 'sliders', content: editPanel(<EditTab clip={clip} update={update} look={look} audioExpanded={audioExpanded} onAudioExpanded={setAudioExpanded} />) },
             { id: 'color', label: 'Color', icon: 'palette', content: editPanel(<ColorTab clip={clip} look={look} />) },
             { id: 'speed', label: 'Speed', icon: 'gauge', content: editPanel(<SpeedTab clip={clip} update={update} />) },
             {
@@ -845,6 +1033,9 @@ export function SequenceEditor({ clips, setClips, hover, dragging, suspended, cl
                 <ExportTab
                   clips={clips.length}
                   canReplace={canReplace}
+                  name={exportName}
+                  onName={setTypedName}
+                  nameError={nameCheck.error}
                   quality={quality}
                   onQuality={(next) => {
                     setQuality(next)
@@ -860,7 +1051,7 @@ export function SequenceEditor({ clips, setClips, hover, dragging, suspended, cl
                   exportable={exportable}
                   busy={exportBusy}
                   clipsDir={clipsDir}
-                  warning={sourceProblem || (mismatch ? TRACK_MISMATCH : null)}
+                  warning={sourceProblem || soundWarning}
                   replacing={replacing}
                   progress={exporting}
                   onCancel={(id) => void shell('media_cancel', { id })}
@@ -870,7 +1061,7 @@ export function SequenceEditor({ clips, setClips, hover, dragging, suspended, cl
                   doneStale={doneSignature !== exportSignature}
                   doneShareable={doneShareable}
                   shareable={canShareSaved(doneSignature, exportSignature, doneShareable)}
-                  onShare={() => done && void attempt('The share sheet did not open', () => engine.share(done))}
+                  onShare={() => done && shareFile(done)}
                   onShow={() => done && void attempt('Not shown', () => engine.reveal({ file: done, kind: 'clip' } as MediaItem))}
                   onCopy={() => done && void attempt('Not copied', () => engine.copy([done])).then((result) => result !== undefined && toast('success', 'Copied'))}
                 />
@@ -885,38 +1076,39 @@ export function SequenceEditor({ clips, setClips, hover, dragging, suspended, cl
         <h3 className="pane-title">sequence</h3>
         <span className="pane-title num !left-auto right-[10px]">{duration(total)} total</span>
         {!empty && (
-          <div className="mt-1 grid h-[40px] shrink-0 grid-cols-[1fr_auto_1fr] items-center gap-2 border-b border-line px-2">
+          <div className="mt-1 grid h-[52px] shrink-0 grid-cols-[1fr_auto_1fr] items-center gap-2 border-b border-line px-3">
             <div className="flex items-center">
-              <IconButton icon="undo" label="Undo (Ctrl+Z)" isDisabled={clip.history.length === 0} onPress={undo} />
-              <IconButton icon="undo" label="Redo (Ctrl+Y)" className="-scale-x-100" isDisabled={clip.future.length === 0} onPress={redo} />
-              <span className="mx-2 h-5 w-px bg-line" aria-hidden="true" />
-              <IconButton icon="scissors" label="Cut at the playhead (S or C)" isDisabled={!canSplit} onPress={splitHere} />
-              <IconButton icon="trash" label="Remove this clip (Shift+Delete)" onPress={() => takeOut(clip.id)} />
+              <IconButton size={19} className="!h-9 !w-9" icon="undo" label="Undo (Ctrl+Z)" isDisabled={clip.history.length === 0} onPress={undo} />
+              <IconButton size={19} icon="undo" label="Redo (Ctrl+Y)" className="!h-9 !w-9 -scale-x-100" isDisabled={clip.future.length === 0} onPress={redo} />
+              <span className="mx-2 h-6 w-px bg-line" aria-hidden="true" />
+              <IconButton size={19} className="!h-9 !w-9" icon="scissors" label="Cut at the playhead (S or C)" isDisabled={!canSplit} onPress={splitHere} />
+              <IconButton size={19} className="!h-9 !w-9" icon="trash" label="Remove this clip (Shift+Delete)" onPress={() => takeOut(clip.id)} />
             </div>
-            <span className="num min-w-[96px] border border-line bg-canvas px-3 py-1 text-center text-[14px] font-bold text-ink">{timecode(at)}</span>
+            <span className="num min-w-[124px] border border-line bg-canvas px-3 py-1.5 text-center text-[17px] font-bold text-ink">{timecode(at)}</span>
             <div className="flex items-center justify-end gap-1">
-              <IconButton icon="zoomOut" label="Zoom out (-)" isDisabled={zoom <= 0} onPress={() => stepZoom(-1)} />
-              <Slider label="Timeline zoom" value={Math.round(zoom * 100)} min={0} max={100} step={1} onChange={(value) => setZoom(value / 100)} onCommit={(value) => setZoom(value / 100)} className="w-[140px]" />
-              <IconButton icon="zoomIn" label="Zoom in (+)" isDisabled={zoom >= 1} onPress={() => stepZoom(1)} />
-              <span className="mx-2 h-5 w-px bg-line" aria-hidden="true" />
-              <IconButton icon="keyboard" label="Keyboard shortcuts (?)" onPress={() => setHelp(true)} />
+              <IconButton size={19} className="!h-9 !w-9" icon="zoomOut" label="Zoom out (-)" isDisabled={zoom <= 0} onPress={() => stepZoom(-1)} />
+              <Slider label="Timeline zoom" value={Math.round(zoom * 100)} min={0} max={100} step={1} onChange={(value) => setZoom(value / 100)} onCommit={(value) => setZoom(value / 100)} className="w-[180px]" />
+              <IconButton size={19} className="!h-9 !w-9" icon="zoomIn" label="Zoom in (+)" isDisabled={zoom >= 1} onPress={() => stepZoom(1)} />
+              <span className="mx-2 h-6 w-px bg-line" aria-hidden="true" />
+              <IconButton size={19} className="!h-9 !w-9" icon="keyboard" label="Keyboard shortcuts (?)" onPress={() => setHelp(true)} />
             </div>
           </div>
         )}
-        <div className="flex min-h-0 flex-col gap-2 overflow-y-auto p-2" style={{ maxHeight: '46vh' }}>
+        <div className="flex min-h-0 flex-col gap-3 overflow-y-auto p-3" style={{ maxHeight: '46vh' }}>
           {empty ? (
             <div className="grid h-[88px] place-items-center border border-line bg-canvas px-4 text-center text-[14px] text-faint">Added clips appear here.</div>
           ) : (
             <>
-              <SequenceLanes clips={clips} active={index} time={at} onSelect={(i) => playFrom(clipStart(clips, i))} onMenu={(i, x, y) => setMenu({ kind: 'clip', index: i, x, y })} onSeek={playFrom} onReorder={moveClip} />
+              <SequenceLanes clips={clips} active={index} time={at} onSelect={(i) => sequenceFrom(clipStart(clips, i))} onMenu={(i, x, y) => setMenu({ kind: 'clip', index: i, x, y })} onSeek={sequenceFrom} onReorder={moveClip} />
               {clip.timelineSession && (
                 <div className="flex flex-wrap items-center gap-2">
                   <span className="text-[13px] text-muted">Trim Timeline at playhead</span>
                   <Button variant="ghost" isDisabled={!!sourceProblem} onPress={() => trimTimeline('from')}>Keep from here</Button>
                   <Button variant="ghost" isDisabled={!!sourceProblem} onPress={() => trimTimeline('to')}>Keep to here</Button>
                   {rangeUndo?.after === clips && <Button variant="ghost" onPress={() => {
+                    setSelectedClip(null)
                     setClips(rangeUndo.before)
-                    setPlayhead(rangeUndo.at)
+                    place(rangeUndo.at)
                     setRangeUndo(null)
                   }}>Undo Timeline trim</Button>}
                 </div>
@@ -926,11 +1118,18 @@ export function SequenceEditor({ clips, setClips, hover, dragging, suspended, cl
                 time={sourceTime}
                 parts={clip.parts}
                 active={current}
-                tracks={clip.audio}
-                volumes={clip.volumes}
+                tracks={audible.map((row) => row.track)}
+                trackIndexes={audible.map((row) => row.index)}
+                gains={gainsOf(clip)}
+                muted={clip.muted}
+                solo={clip.solo}
+                sound={sound}
                 view={view}
                 onView={setView}
-                onSelect={(part) => update({ active: part })}
+                onSelect={(part) => {
+                  if (part !== clip.active) update({ active: part })
+                  setSelectedClip(clip.id)
+                }}
                 onPartMenu={(part, x, y) => setMenu({ kind: 'part', index: part, x, y })}
                 onEdge={applyEdge}
                 onPart={applyPart}
@@ -938,13 +1137,33 @@ export function SequenceEditor({ clips, setClips, hover, dragging, suspended, cl
                 onSeek={seekSource}
                 onDrag={onTrimDrag}
                 flash={splitFlash}
-                peaks={media.peaks}
-                keyframes={media.keyframes}
+                peaks={probe.peaks}
+                undecoded={probe.undecoded}
+                keyframes={probe.keyframes}
+                onFocusTrack={focusMixer}
+                lockReason={mixLockReason(layout)}
+                expanded={audioExpanded}
+                onExpanded={setAudioExpanded}
               />
-              {mismatch && <p className="text-[13px] leading-snug text-warn">{TRACK_MISMATCH}</p>}
-              {mix !== 'ready' && clip.audio.length > 1 && (
-                <p className="text-[13px] text-muted">{mix === 'loading' ? 'Preparing the tracks for the preview…' : 'The preview plays the first track only. The save uses every track.'}</p>
-              )}
+              {soundWarning && <p className="text-[13px] leading-snug text-warn">{soundWarning}</p>}
+              {clip.audio.length > 1 && (() => {
+                const reason = monitor === 'mix' ? mixLockReason(layout)
+                  : mix.state === 'loading'
+                    ? (monitor === 'isolated'
+                      ? "Preparing this clip's own tracks. The original mix plays until they are ready, so your edits are not audible yet."
+                      : "Preparing this clip's tracks. The further tracks join when they are ready.")
+                    : mix.state === 'failed'
+                      ? (monitor === 'isolated'
+                        ? "Your audio edits are not audible in the preview: the original mix is playing. The saved file still uses every track and your edits."
+                        : "Some of this file's tracks could not be opened, so the preview is not playing every track. The saved file still uses every track and your edits.")
+                      : ''
+                return reason ? (
+                  <div className="flex flex-wrap items-center gap-2">
+                    <p className={clsx('text-[13px] leading-snug', mix.state === 'failed' ? 'text-warn' : 'text-muted')}>{reason}</p>
+                    {mix.state === 'failed' && <Button variant="ghost" onPress={mix.retry}>Try again</Button>}
+                  </div>
+                ) : null
+              })()}
             </>
           )}
         </div>

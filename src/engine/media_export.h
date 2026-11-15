@@ -10,6 +10,7 @@
 #include <string>
 #include <vector>
 
+#include "audio_layout.h"
 #include "media_math.h"
 
 namespace bx {
@@ -19,6 +20,8 @@ struct MediaTrack {
   int channels = 0;
   int sample_rate = 0;
   std::string title;      // the stream's own title metadata, "" when it has none
+  std::string role;       // from the sidecar: mix | desktop | microphone | application | combined | empty | track
+  std::vector<std::string> sources;  // desktop | microphone | app:<exe>; empty for an import
 };
 
 struct MediaDetails {
@@ -32,14 +35,20 @@ struct MediaDetails {
   std::string video_codec;
   int video_kbps = 0;     // the video stream's own rate, else the container's less audio; 0 unknown
   int64_t bytes = 0;
+  int64_t modified = 0;   // last write time, seconds since 1970: what a cached track copy is keyed by
   std::vector<MediaTrack> audio;
+  AudioLayout layout;     // the file's own labels and whether track 1 is a mix this editor may rebuild
 };
 
 MediaDetails media_details(const std::string& path);
 
-// Per audio track, `buckets` peak levels (0..1, each track normalised to its own loudest point) across
-// the whole file: the editor's waveform lanes. Video is not decoded.
-bool media_peaks(const std::string& path, int buckets, std::vector<std::vector<float>>& tracks, std::string& error);
+// Per audio track, `buckets` peak levels (0..1) across the whole file: the editor's waveform lanes. Video
+// is not decoded. `normalize` scales each track to its own loudest point (the older CLI answer); false
+// keeps every lane on one absolute scale, so the editor can compare a quiet microphone with a loud
+// desktop. `decoded`, when given, says per lane whether its decoder opened: a lane that is all zeros
+// because it could not be read is not a silent lane, and the ordinals still match the file's streams.
+bool media_peaks(const std::string& path, int buckets, std::vector<std::vector<float>>& tracks,
+                 std::string& error, std::vector<bool>* decoded = nullptr, bool normalize = true);
 
 // One audio track of a clip (`track` counts audio streams from 0) copied into an .m4a of its own, so
 // the editor's preview can play every track at its own volume: a browser plays only a file's first

@@ -39,6 +39,12 @@ Give your agent this prompt, followed by your task:
 AI-assisted contributions follow the same checks. Review the diff yourself and
 include actual results; explain any checks you could not run.
 
+## Ideas and questions
+
+Have an idea that could improve BuffrX? [Share it in Ideas](https://github.com/bulhaa1/BuffrX/discussions/categories/ideas).
+For questions and answers others can find later, use [Q&A](https://github.com/bulhaa1/BuffrX/discussions/categories/q-a).
+[Discord](https://discord.gg/73Js632Ba) is there for quick help and conversation too.
+
 ## Reporting a bug
 
 Open a [bug report](https://github.com/bulhaa1/BuffrX/issues/new?template=bug_report.yml)

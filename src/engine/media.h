@@ -92,9 +92,13 @@ bool media_trim(const std::string& path, const std::string& output_path, double 
 // checked before the output is created: a chunk from before a settings change is refused, not joined, unless
 // `dropped_head` is given: the join then copies the run of files that share the last file's layout, from the beginning of
 // the first of them, and reports in `*dropped_head` how many files before that run it left out (0: all of them match).
+//
+// `rate_may_differ` is for the parts of one replay save that crossed an encoder swap (plan 008): the frame rate and time base of a part are its
+// encoder's own (a frame-rate divisor halves them) and every packet is rescaled into the first part's time base as it is copied, so only those two
+// are not compared. Everything else a join must share (codec, size, pixel format, sound) still is.
 bool media_concat(const std::vector<std::string>& files, const std::string& output_path, double start_in_first,
                   double end_in_last, std::string& error, double* first_keyframe_seconds = nullptr,
-                  size_t* dropped_head = nullptr);
+                  size_t* dropped_head = nullptr, bool rate_may_differ = false);
 
 // What a Timeline save asks a child process to join, so the engine's own media lock stays free while the
 // copy runs. `start_in_first_seconds` and `end_in_last_seconds` are local to the first and last file.
@@ -103,6 +107,9 @@ struct MediaJoinRequest {
   std::string output;
   double start_in_first_seconds = 0.0;
   double end_in_last_seconds = 0.0;
+  // A caller that owns the join's output as a finished file asks for the inputs' track labels to be
+  // bound to it. A child whose output is a staging file for another publisher leaves this off.
+  bool carry_audio_labels = false;
 };
 
 // The file a `--media-join` child writes its outcome to, beside the video it made: `<output>.join.json`.
@@ -141,6 +148,7 @@ inline bool parse_media_join_request(const Json& spec, MediaJoinRequest& request
   }
   request.start_in_first_seconds = spec["start_in_first"].as_double(0.0);
   request.end_in_last_seconds = spec["end_in_last"].as_double(request.start_in_first_seconds);
+  request.carry_audio_labels = spec["carry_audio_labels"].as_bool(false);
   // Both cuts are offsets inside their own file, so they are only comparable when one file holds the whole
   // range. Comparing them across a range of files refused every Timeline save whose first chunk gave up more
   // than the last one did - a 20 s range ending a few hundred ms into its last chunk, for one, with the
@@ -214,6 +222,10 @@ inline bool media_join_process(const MediaJoinRequest& request, MediaJoinResult&
   spec.set("output", Json(request.output));
   spec.set("start_in_first", Json(request.start_in_first_seconds));
   spec.set("end_in_last", Json(request.end_in_last_seconds));
+  // The child decides whether that sound can be described at all, so a caller that owns the output as a
+  // finished file has its wish reach it: without this the flag never left the parent and a join of clips
+  // with unlike sound was written with no labels at all.
+  if (request.carry_audio_labels) spec.set("carry_audio_labels", Json(true));
   const std::string dumped = spec.dump();
   FILE* spec_file = _wfopen(media_join_wide(spec_path).c_str(), L"wb");
   if (!spec_file) {

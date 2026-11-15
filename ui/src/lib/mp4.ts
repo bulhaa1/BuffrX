@@ -27,17 +27,60 @@ interface Box {
   end: number
 }
 
-/** The init segment a player appends first: ftyp and moov, which hold the sample tables of nothing. */
-export function initBytes(file: Uint8Array): Uint8Array {
+/** The file's own ftyp and moov, untouched: what a reader that parses later fragments must keep, because `segments` learns
+ *  from the moov which audio tracks to hide. `initBytes` is this with those tracks hidden, for MediaSource. */
+export function headerBytes(file: Uint8Array): Uint8Array {
   const top = boxes(file, 0, file.length)
   const moov = top.find((box) => box.type === 'moov')
   if (!moov) throw new Error('mp4: no moov box: this is not a fragmented MP4')
   const ftyp = top.find((box) => box.type === 'ftyp')
-  if (!ftyp) return file.slice(moov.start, moov.end)
-  const init = new Uint8Array(ftyp.end - ftyp.start + moov.end - moov.start)
-  init.set(file.subarray(ftyp.start, ftyp.end), 0)
-  init.set(file.subarray(moov.start, moov.end), ftyp.end - ftyp.start)
+  const head = ftyp ? ftyp.end - ftyp.start : 0
+  const init = new Uint8Array(head + moov.end - moov.start)
+  if (ftyp) init.set(file.subarray(ftyp.start, ftyp.end), 0)
+  init.set(file.subarray(moov.start, moov.end), head)
   return init
+}
+
+/** The init segment a player appends first: ftyp and moov, which hold the sample tables of nothing. */
+export function initBytes(file: Uint8Array): Uint8Array {
+  const init = headerBytes(file)
+  const top = boxes(init, 0, init.length)
+  const moov = top.find((box) => box.type === 'moov')!
+  // MediaSource takes one audio track: the first (the mix) stays and the others become `free` boxes,
+  // which keeps every offset where it is. `segments` does the same to their `traf`s.
+  const extra = extraAudioIds(init, moov)
+  if (extra.size) {
+    for (const trak of children(init, moov)) {
+      if (trak.type === 'trak' && extra.has(trackIdOf(init, trak) ?? -1)) hide(init, trak)
+    }
+  }
+  return init
+}
+
+/** Overwrites a box's type so a reader skips it; its size, and so every offset after it, is unchanged. */
+function hide(bytes: Uint8Array, box: Box): void {
+  bytes.set([0x66, 0x72, 0x65, 0x65], box.start + 4)
+}
+
+/** The track_ID of a `trak`, or undefined when it has no readable `tkhd`. */
+function trackIdOf(bytes: Uint8Array, trak: Box): number | undefined {
+  const tkhd = children(bytes, trak).find((box) => box.type === 'tkhd')
+  if (!tkhd) return undefined
+  const at = tkhd.body + 4 + (bytes[tkhd.body] === 1 ? 16 : 8)
+  if (at + 4 > tkhd.end) return undefined
+  return new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(at, false)
+}
+
+/** Track IDs of every sound track after the first: a browser's MediaSource refuses a file that has more. */
+function extraAudioIds(bytes: Uint8Array, moov: Box): Set<number> {
+  const out = new Set<number>()
+  let seen = 0
+  for (const trak of children(bytes, moov)) {
+    if (trak.type !== 'trak' || handlerOf(bytes, trak) !== 'soun') continue
+    const id = trackIdOf(bytes, trak)
+    if (seen++ > 0 && id !== undefined) out.add(id)
+  }
+  return out
 }
 
 /**
@@ -73,6 +116,7 @@ export function segments(file: Uint8Array, shiftMs: number, sequenceStart: numbe
   const moov = top.find((box) => box.type === 'moov')
   if (!moov) throw new Error('mp4: no moov box: this is not a fragmented MP4')
   const tracks = trackTimescales(file, moov)
+  const extra = extraAudioIds(file, moov)
   const out: MoofSegment[] = []
   let sequence = sequenceStart
   let seen = 0
@@ -107,6 +151,10 @@ export function segments(file: Uint8Array, shiftMs: number, sequenceStart: numbe
       }
       const full = new DataView(file.buffer, file.byteOffset, file.byteLength)
       const trackId = full.getUint32(tfhd.body + 4, false)
+      if (extra.has(trackId)) {
+        hide(copy, { ...traf, start: traf.start - moof.start })
+        continue
+      }
       const track = tracks.get(trackId)
       if (!track) throw new Error(`mp4: no track ${trackId} in the moov box`)
       const tfdt = inner.find((box) => box.type === 'tfdt')

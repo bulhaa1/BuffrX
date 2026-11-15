@@ -10,6 +10,7 @@
 #include <string>
 #include <vector>
 
+#include "audio_layout.h"
 #include "log_policy.h"
 #include "packet_hash.h"
 #include "screenshot.h"
@@ -79,7 +80,7 @@ private:
 // they call it. A trim is a one-file join, so it needs the same worker.
 bool concat_files(const std::vector<std::string>& files, const std::string& output_path, double start_in_first,
                   double end_in_last, std::string& error, double* first_keyframe_seconds = nullptr,
-                  size_t* dropped_head = nullptr);
+                  size_t* dropped_head = nullptr, bool rate_may_differ = false);
 
 std::string av_error(int code) {
   char buffer[AV_ERROR_MAX_STRING_SIZE] = {0};
@@ -183,6 +184,10 @@ bool read_signature(AVFormatContext* format, StreamSignature& out) {
                               : stream->r_frame_rate;
   out.frame_rate = Rational{rate.num, rate.den};
   out.time_base = Rational{stream->time_base.num, stream->time_base.den};
+  out.audio_streams = 0;
+  for (unsigned index = 0; index < format->nb_streams; ++index) {
+    if (format->streams[index]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) ++out.audio_streams;
+  }
   const int audio = av_find_best_stream(format, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
   if (audio >= 0) {
     const AVCodecParameters* parameters = format->streams[audio]->codecpar;
@@ -584,13 +589,13 @@ bool media_trim(const std::string& path, const std::string& output_path, double 
 }
 
 bool media_concat(const std::vector<std::string>& files, const std::string& output_path, double start_in_first,
-                  double end_in_last, std::string& error, double* first_keyframe_seconds, size_t* dropped_head) {
+                  double end_in_last, std::string& error, double* first_keyframe_seconds, size_t* dropped_head, bool rate_may_differ) {
   const MediaLock lock(kSaveWait);
   if (!lock.owned()) {
     error = kMediaBusy;
     return false;
   }
-  return concat_files(files, output_path, start_in_first, end_in_last, error, first_keyframe_seconds, dropped_head);
+  return concat_files(files, output_path, start_in_first, end_in_last, error, first_keyframe_seconds, dropped_head, rate_may_differ);
 }
 
 namespace {
@@ -598,7 +603,7 @@ namespace {
 // The copy itself, with no lock of its own: the two public entry points above hold the media lock
 // while they call it.
 bool concat_files(const std::vector<std::string>& requested_files, const std::string& output_path, double start_in_first,
-                  double end_in_last, std::string& error, double* first_keyframe_seconds, size_t* dropped_head) {
+                  double end_in_last, std::string& error, double* first_keyframe_seconds, size_t* dropped_head, bool rate_may_differ) {
   if (first_keyframe_seconds) *first_keyframe_seconds = -1.0;
   if (dropped_head) *dropped_head = 0;
   if (requested_files.empty()) {
@@ -622,21 +627,21 @@ bool concat_files(const std::vector<std::string>& requested_files, const std::st
   }
   // The run that shares the last chunk's stream: all of them when nothing changed. A join across a change is refused unless
   // the caller (a Timeline save) asked for the part that holds the end of its range.
-  const size_t from = trailing_compatible_run(signatures);
+  const size_t from = trailing_compatible_run(signatures, rate_may_differ);
   if (from > 0 && !dropped_head) {
     // The person sees one sentence; whatever asks "why did my clip not save" needs the number that
     // differed, and probing it again by hand is the whole afternoon.
     const StreamSignature& signature = signatures[from - 1];
     const StreamSignature& expected = signatures.back();
     BX_LOG_WARN("chunk layout mismatch in %s: codec %d/%d %dx%d/%dx%d pix %d/%d fps %d/%d/%d/%d "
-                "tb %d/%d/%d/%d audio %d/%d layout %llu/%llu",
+                "tb %d/%d/%d/%d audio %d/%d layout %llu/%llu tracks %d/%d",
                 requested_files[from - 1].c_str(), signature.codec_id, expected.codec_id, signature.width, signature.height,
                 expected.width, expected.height, signature.pix_fmt, expected.pix_fmt,
                 signature.frame_rate.num, signature.frame_rate.den, expected.frame_rate.num,
                 expected.frame_rate.den, signature.time_base.num, signature.time_base.den,
                 expected.time_base.num, expected.time_base.den, signature.sample_rate, expected.sample_rate,
                 static_cast<unsigned long long>(signature.channel_layout),
-                static_cast<unsigned long long>(expected.channel_layout));
+                static_cast<unsigned long long>(expected.channel_layout), signature.audio_streams, expected.audio_streams);
     error = "the chunks do not share one stream layout";
     return false;
   }
@@ -996,14 +1001,75 @@ int run_media_join(const std::string& spec_path) {
     return 3;
   }
 
+  // What the join can honestly say about the output's sound is decided before the copy runs (audio_layout.h).
+  // A mix-first clip joined with one that has only independent tracks cannot be described by any one
+  // sidecar, and writing the copy anyway left the mix and its stems playing as independent streams (every
+  // sound heard twice). The stitch export refuses such a join from the same helper, from the same layouts:
+  // each input's own sidecar, believed only when the container really reports that many audio streams, so
+  // an import is counted as the streams it has and a sidecar that is still pending reads as an import.
+  // Headers are probed only; nothing is decoded, re-encoded or copied, and a refused join writes no video.
+  const auto refuse = [&](const std::string& why) {
+    result.set("error", Json(why));
+    write_result(request.output, result);
+    std::printf("%s\n", result.dump().c_str());
+    return 3;
+  };
+  JoinAudioLayout joined;
+  if (request.carry_audio_labels) {
+    // The files the copy will really join: media_concat keeps the run that shares the last file's stream
+    // and drops what came before a settings change (trailing_compatible_run). The labels describe that
+    // same run, so a range that crossed a rebuild is neither described by a chunk the copy no longer
+    // holds nor refused here though its copy could still be saved.
+    std::vector<StreamSignature> signatures;
+    std::vector<int> audio_streams;
+    signatures.reserve(request.files.size());
+    audio_streams.reserve(request.files.size());
+    for (const std::string& file : request.files) {
+      Input probe;
+      std::string probe_error;
+      if (!open_input(file, probe, probe_error)) {
+        return refuse("a clip in the join could not be read: " + file + " (" + probe_error + ")");
+      }
+      StreamSignature signature;
+      if (!read_signature(probe.format, signature)) return refuse("a clip in the join has no video: " + file);
+      int streams = 0;
+      for (unsigned i = 0; i < probe.format->nb_streams; ++i) {
+        if (probe.format->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) ++streams;
+      }
+      signatures.push_back(signature);
+      audio_streams.push_back(streams);
+    }
+    const size_t from = trailing_compatible_run(signatures, true);
+    std::vector<AudioLayout> layouts;
+    layouts.reserve(request.files.size() - from);
+    for (size_t i = from; i < request.files.size(); ++i) {
+      layouts.push_back(read_audio_layout(request.files[i], audio_streams[i]));
+    }
+    joined = join_audio_layout(layouts);
+    // Refused before anything is written: a file already at the output belongs to someone else and stays.
+    if (!joined.error.empty()) return refuse(joined.error);
+  }
+
   double first_keyframe = -1.0;
   size_t dropped_head = 0;
+  // A frame-rate change (the encoder controller's divisor, a person's own setting) is joined, rescaled, as a replay save across
+  // a swap is; only a change the copy cannot carry (codec, size, sound) keeps the part that holds the range's end.
   const bool ok = media_concat(request.files, request.output, request.start_in_first_seconds,
-                               request.end_in_last_seconds, error, &first_keyframe, &dropped_head);
+                               request.end_in_last_seconds, error, &first_keyframe, &dropped_head, true);
   result.set("ok", Json(ok));
   result.set("error", Json(ok ? std::string() : error));
   result.set("first_keyframe", Json(first_keyframe));
   result.set("dropped_head", Json(static_cast<int64_t>(dropped_head)));
+  // A finished join the caller publishes carries the layout decided above, and only now that the writer
+  // has let go: identical layouts are carried, aggregates with different lanes get one honest positional
+  // layout, and an import join carries none.
+  if (ok && request.carry_audio_labels) {
+    if (!joined.carries) {
+      remove_audio_layout(request.output);
+    } else if (!write_audio_layout(request.output, joined.layout)) {
+      BX_LOG_WARN("the audio track labels for the joined file %s were not written", request.output.c_str());
+    }
+  }
 
   // The engine reads this file, so it is written whatever the outcome, beside the video it describes. A
   // failed join leaves no video behind (concat_files removes its own output).

@@ -3,8 +3,8 @@
 // Commands arrive on the pipe server's reader threads while the main thread ticks the same libobs
 // objects (capture source, outputs, encoders) and builds the status broadcast. A command that touches
 // them, or the protocol's config, runs under one engine-wide lock that the main thread also takes.
-// The exceptions are the slow commands that only read and write files: holding the lock through a
-// library scan or a range export would delay a hotkey save and a chunk rotation by seconds. The list is
+// The exceptions are slow commands that read external state or work on files: holding the lock through an
+// audio-session query, library scan or range export could delay a hotkey save and a chunk rotation. The list is
 // protocol_commands.h's table, beside the command names themselves.
 //
 // The lock is also what keeps two rebuilds from running at once. `ObsHost::apply` tears the pipeline

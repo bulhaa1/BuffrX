@@ -24,6 +24,22 @@ void toggle_recording(ViewEnv& env);
 void open_editor(ViewEnv& env, const std::vector<std::string>& files, bool preview = false);
 void set(ViewEnv& env, const char* key, Json value);  // one setting
 
+// The audio program list, shared by Settings > Audio and the panel's mixer: one row per program (two windows
+// of one exe are one process-loopback source), its measured activity, and the state the engine reports for a
+// selected slot. Pure reads of the lists already on hand; nothing here samples or lists on its own.
+std::string lower_text(std::string text);
+bool same_program(const std::string& left, const std::string& right);
+bool own_audio_program(const std::string& exe);
+std::string program_name(const std::string& exe);
+std::vector<Json> audio_program_choices(const Json& windows);
+float program_peak(const Json& sessions, const std::string& exe);
+bool program_sounding(const Json& sessions, const std::string& exe);
+void audio_speaker_prune(const std::vector<std::string>& keep);
+// A program's speaker, its waves moving only while its meter says it sounds and only where it is seen.
+void audio_speaker_icon(const Json& sessions, const std::string& exe, ImVec2 at, float size, uint32_t now_ms,
+                        PanelState& panel);
+std::string audio_slot_hint(const Json& status, size_t index, bool game, const std::string& name);
+
 // The Timeline: the panel's and the tray's TIMELINE entry opens (or closes) the preview, and the notices a writer
 // state change earns once - started, paused outside the game, stopped for disk space. Called once per frame.
 void timeline_action(ViewEnv& env);

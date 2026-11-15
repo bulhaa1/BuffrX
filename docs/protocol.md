@@ -64,6 +64,7 @@ their handlers and use isolated test state rather than invoking the list blindly
 | `devices.list` | Yes |
 | `audio.get` | Yes |
 | `audio.set` | Yes |
+| `audio.sessions` | No |
 | `profiles.list` | Yes |
 | `profiles.add` | Yes |
 | `profiles.remove` | Yes |
@@ -99,6 +100,7 @@ their handlers and use isolated test state rather than invoking the list blindly
 | `timeline.edit` | No |
 | `timeline.edit_source` | No |
 | `encoder.properties` | Yes |
+| `diagnostics.report` | No |
 | `encoder.set` | Yes |
 | `ui.show` | Yes |
 | `ui.share` | Yes |

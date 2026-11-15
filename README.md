@@ -160,7 +160,7 @@ for connections except the sharing helper, and only while a BuffrX link you made
 ## Install
 
 1. Open the [latest release](https://github.com/bulhaa1/BuffrX/releases/latest) and download
-   **`BuffrX-Setup.exe`**. A portable `BuffrX-0.5.0.zip` is there too.
+   **`BuffrX-Setup.exe`**. A portable `BuffrX-0.6.0.zip` is there too.
 2. Run it.
 3. Press `Alt+1` in a game.
 
@@ -271,8 +271,12 @@ fix something that bugs you, or build a feature you'd like to use.
 First-time contributors are welcome. Small fixes, docs, testing, and feedback all
 help. Feel free to open a draft PR and work things out as you go.
 
+Have an idea that could make BuffrX better? [Share it in Ideas](https://github.com/bulhaa1/BuffrX/discussions/categories/ideas).
+I'd love to hear what you'd like to see.
+
 - Read [CONTRIBUTING.md](CONTRIBUTING.md) to get started.
-- Report bugs or discuss ideas in [Issues](https://github.com/bulhaa1/BuffrX/issues).
+- Ask a question or find an answer in [Q&A](https://github.com/bulhaa1/BuffrX/discussions/categories/q-a).
+- Report reproducible bugs in [Issues](https://github.com/bulhaa1/BuffrX/issues).
 - Build and check your change with the [development guide](DEVELOPMENT.md).
 - Help with the native Linux port using the [Linux guide](DEVELOPMENT_LINUX.md).
 - Using an agent? Point it to [CONTRIBUTOR_AGENT.md](CONTRIBUTOR_AGENT.md).

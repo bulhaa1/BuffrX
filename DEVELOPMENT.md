@@ -52,8 +52,8 @@ powershell -File tools/verify.ps1 -Area Native
 ```
 
 The first command downloads pinned LLVM-MinGW, CMake and Ninja into `work/`.
-The second builds into `build-contrib/` and runs the engine's existing
-logic and regression checks. No Visual Studio, OBS runtime, Rust, GPU or
+The second builds into `build-contrib/` and runs the engine logic, display planning,
+present scheduling and canvas checks. No Visual Studio, OBS runtime, Rust, GPU or
 capture session is needed. Tests use an isolated temporary data directory.
 Downloads are reused on later runs; no setup-time or download-size guarantee is made.
 

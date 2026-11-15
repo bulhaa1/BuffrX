@@ -3,14 +3,16 @@
 
 import clsx from 'clsx'
 import { Fragment, useEffect, useMemo, useRef, useState, type Dispatch, type SetStateAction } from 'react'
+import { Icon } from '../components/icons'
 import { mediaUrl } from '../lib/bridge'
 import { simpleTitle } from '../lib/clip_label'
 import { duration } from '../lib/format'
-import { columnsIn, columnsOf, peakRange } from '../lib/peaks'
+import { columnsIn, columnsOf, peakRange, sharedScale } from '../lib/peaks'
+import { heardPeaks, trackName, type AudioTrack } from '../lib/audio'
 import { clipOutputLength, clipStart, reorder, sequenceLength, type SequenceClip } from '../lib/sequence'
 import { ratioAtTime, rulerSteps, snapToKeyframe, timeAtRatio, type TimelineView } from '../lib/timeline_view'
 import { moveAll, moveEdge, movePart, type Part } from '../lib/segments'
-import { CUT_STYLE, type AudioTrack } from './editor-parts'
+import { CUT_STYLE } from './editor-parts'
 
 /** The stretches between kept parts: what the cut throws away, drawn dimmed on every lane. */
 function cutAway(parts: Part[], total: number): Part[] {
@@ -53,7 +55,7 @@ function RulerMarks({ start, span, width }: { start: number; span: number; width
         // A label the ruler would cut in half at its right end is left out.
         .filter((t) => (t - start) * perSecond < width - 40)
         .map((t) => (
-          <span key={t} className="num absolute top-[5px] text-[11px] leading-none text-muted" style={{ left: (t - start) * perSecond + 4 }}>
+          <span key={t} className="num absolute top-[8px] text-[12px] leading-none text-muted" style={{ left: (t - start) * perSecond + 4 }}>
             {name(t)}
           </span>
         ))}
@@ -69,15 +71,22 @@ type CutDrag =
   | { mode: 'bar'; moved: boolean; base: number; pointer: number; snapshot?: Part[]; last?: number }
 
 /** The active clip's cut: one row a track, then the kept parts with a grip on each edge. */
-export function ClipTimeline({ duration: total, time, parts: partsProp, active, tracks, volumes, view, onView, onSelect, onPartMenu, onEdge, onPart, onBar, onSeek, onDrag, flash, peaks, keyframes }: {
+export function ClipTimeline({ duration: total, time, parts: partsProp, active, tracks, trackIndexes, gains, muted = [], solo = [], sound = 'ready', view, onView, onSelect, onPartMenu, onEdge, onPart, onBar, onSeek, onDrag, flash, peaks, undecoded, keyframes, onFocusTrack, lockReason = '', expanded, onExpanded }: {
   duration: number
   time: number
   parts: Part[]
   active: number
-  /** One row a track: its name in the gutter, its own sound to the right. */
+  /** One row a track whose sound is heard: its name in the gutter, its own sound to the right. */
   tracks: AudioTrack[]
-  /** Each track's level, which scales the sound drawn (the faders are in the inspector). */
-  volumes: number[]
+  /** Each row's ordinal in the file, so a hidden row still keeps its level and its waveform. */
+  trackIndexes: number[]
+  /** Each track's level as it is heard, indexed by the file's own ordinal. */
+  gains: number[]
+  /** Per track, by ordinal: the row is drawn muted, and a solo row carries the accent. */
+  muted?: boolean[]
+  solo?: boolean[]
+  /** Whether the waveform read is still out, done, or failed: the three look different. */
+  sound?: 'loading' | 'ready' | 'failed'
   /** The part of the clip on screen; the toolbar's zoom and the wheel both write it. */
   view: TimelineView
   onView: Dispatch<SetStateAction<TimelineView>>
@@ -96,8 +105,18 @@ export function ClipTimeline({ duration: total, time, parts: partsProp, active, 
   /** G7: a split just happened here (source seconds): a line flashes at the cut for 180 ms. `id` makes each split its own flash. */
   flash?: { at: number; id: number } | null
   peaks?: number[][]
+  /** File ordinals whose waveform the engine could not decode: their zeros are unreadable, not silent. */
+  undecoded?: number[]
   /** Video keyframes, in source seconds: ticks on the ruler, and where Alt snaps an edge. */
   keyframes?: number[]
+  /** Show one track in the mixer, so a lane and its fader are one thing. */
+  onFocusTrack?: (index: number) => void
+  /** Why this file's levels cannot be edited, or '' when they can. A locked mix has no fader to focus,
+   *  so its lane is plain text instead of a button that would do nothing. */
+  lockReason?: string
+  /** The one audio fold, shared with the inspector: closed draws one combined lane, open one lane per source. */
+  expanded: boolean
+  onExpanded: (open: boolean) => void
 }) {
   // The time axis is the ruler's own cell: its left edge is 0 s, so the gutter beside it is not time.
   const axis = useRef<HTMLDivElement>(null)
@@ -115,6 +134,8 @@ export function ClipTimeline({ duration: total, time, parts: partsProp, active, 
   // move re-rendered the whole editor per frame, which is what made the trim bar feel heavy.
   const [dragParts, setDragParts] = useState<Part[] | null>(null)
   const parts = dragParts ?? partsProp
+  // Sound starts as one combined lane; expanding is a look at the same mix, never a change to it. The
+  // fold belongs to the editor, so the inspector and this lane always show the same state.
   const drag = useRef<CutDrag | null>(null)
   const [dragging, setDragging] = useState<string | null>(null)
   // Alt held while an edge is dragged: the edge lands on the nearest keyframe.
@@ -188,6 +209,26 @@ export function ClipTimeline({ duration: total, time, parts: partsProp, active, 
   const activeFrom = parts[active]?.[0] ?? 0
   const activeTo = parts[active]?.[1] ?? total
   const count = columnsIn(width)
+  // Every lane drawn together is read against one loudness, so a quiet microphone is not drawn as
+  // tall as a loud desktop. The scale covers the whole file, so a zoom does not renormalise it.
+  const lanes = trackIndexes.join(',')
+  const gainsKey = gains.join(',')
+  const scale = useMemo(
+    () => sharedScale(trackIndexes
+      .filter((index) => !undecoded?.includes(index))
+      .map((index) => peaks?.[index])
+      .filter((lane): lane is number[] => !!lane)),
+    [lanes, peaks, undecoded], // eslint-disable-line react-hooks/exhaustive-deps -- the lanes key names the ordinals read
+  )
+  // The one lane drawn while folded: every heard row's cached peaks, weighted by the gain it is heard
+  // at. The rows already exclude a derived mix, so the mix and its stems are never counted twice.
+  const combined = useMemo(
+    () => heardPeaks(peaks ?? [], gains, trackIndexes),
+    [peaks, gainsKey, lanes], // eslint-disable-line react-hooks/exhaustive-deps -- the keys name the ordinals and levels read
+  )
+  const combinedScale = useMemo(() => sharedScale(combined ? [combined] : []), [combined])
+  const combinedUndecoded = trackIndexes.some((index) => undecoded?.includes(index))
+  const separate = expanded && tracks.length > 1
   return (
     <div className="relative select-none" onPointerMove={onMove} onPointerUp={onUp} onPointerCancel={onUp}>
       <div
@@ -200,10 +241,10 @@ export function ClipTimeline({ duration: total, time, parts: partsProp, active, 
         onDoubleClick={() => onView({ start: 0, span: total })}
       >
         {/* The ruler: the scale, and the kept stretch as a handle that slides the whole cut. */}
-        <div className="flex h-[22px] cursor-default items-center border-r border-line px-2" onPointerDown={(event) => event.stopPropagation()} onWheel={(event) => event.stopPropagation()}>
+        <div className="flex h-[28px] cursor-default items-center border-r border-line px-2" onPointerDown={(event) => event.stopPropagation()} onWheel={(event) => event.stopPropagation()}>
           <span className="label leading-none" title="The clip's own time, before its cuts and speed">clip time</span>
         </div>
-        <div ref={axis} className="relative h-[22px] overflow-hidden">
+        <div ref={axis} className="relative h-[28px] overflow-hidden">
           {parts.length > 0 && (
             <div
               role="slider"
@@ -227,39 +268,172 @@ export function ClipTimeline({ duration: total, time, parts: partsProp, active, 
           {(keyframes ?? [])
             .filter((t) => t >= view.start && t <= view.start + view.span)
             .map((t) => (
-              <div key={`key-${t}`} className="pointer-events-none absolute top-0 h-[5px] w-px bg-accent/70" style={{ left: pct(t) }} />
+              <div key={`key-${t}`} className="pointer-events-none absolute top-0 h-[6px] w-px bg-accent/70" style={{ left: pct(t) }} />
             ))}
         </div>
 
-        {/* A row to a track: its name in the gutter, its own sound beside it. */}
-        {tracks.map((track, index) => (
-          <Fragment key={track.index}>
-            <div className={clsx('flex h-[32px] cursor-default items-center border-r border-line px-2', index === 0 && 'border-t')} onPointerDown={(event) => event.stopPropagation()} onWheel={(event) => event.stopPropagation()}>
-              <span className="label min-w-0 truncate leading-none" title={track.title || `Audio track ${index + 1}`}>
-                {tracks.length === 1 ? 'sound' : `sound ${index + 1}`}
-              </span>
+        {/* Sound starts folded: one waveform of everything heard, with Expand beside its name. Expanding
+          *  draws one lane a heard track, each kept at its file ordinal so the mixer and the lane agree.
+          *  Alternate rows sit on the pane surface, so two adjacent sources do not read as one tall lane. */}
+        {tracks.length > 0 && (separate ? (
+          <>
+            <div
+              className="col-span-2 flex h-[26px] cursor-default items-center gap-2 border-t border-line bg-surface px-2"
+              onPointerDown={(event) => event.stopPropagation()}
+              onWheel={(event) => event.stopPropagation()}
+            >
+              <span className="label leading-none" title="One lane for each track you hear">audio · {tracks.length} sources</span>
+              <button
+                type="button"
+                aria-expanded={true}
+                aria-label="Collapse audio into one combined waveform"
+                title={`Hide audio sources (${tracks.length})`}
+                className="btn btn-ghost !h-6 !w-6 shrink-0 !px-0"
+                onClick={() => onExpanded(false)}
+              >
+                <Icon name="compact" size={13} />
+              </button>
             </div>
-            <div className={clsx('relative h-[32px] overflow-hidden', index === 0 && 'border-t border-line')}>
-              <Sound
-                values={peaks?.[index]}
-                count={count}
-                gain={volumes[index] ?? 1}
-                from={Math.max(0, activeFrom - view.start)}
-                to={Math.min(view.span, activeTo - view.start)}
-                total={view.span}
-                start={view.start}
-                span={view.span}
-                fileSeconds={total}
-              />
-            </div>
-          </Fragment>
-        ))}
+            {tracks.map((track, row) => {
+              const index = trackIndexes[row] ?? row
+              const name = trackName(track, index)
+              const isMuted = !!muted[index]
+              const isSolo = !!solo[index]
+              // The banding follows the row on screen, never the file's ordinal: hiding the mix must not
+              // re-colour the lanes the person is looking at.
+              const band = row % 2 === 1 && !isSolo ? 'bg-surface' : ''
+              return (
+                <Fragment key={track.index}>
+                  <div
+                    data-lane={index + 1}
+                    className={clsx(
+                      'flex h-[40px] cursor-default items-center gap-1 border-r border-t border-line px-2',
+                      band,
+                      isSolo && 'bg-accent-soft',
+                    )}
+                    onPointerDown={(event) => event.stopPropagation()}
+                    onWheel={(event) => event.stopPropagation()}
+                  >
+                    <button
+                      type="button"
+                      onClick={() => onFocusTrack?.(index)}
+                      className="flex min-w-0 flex-1 items-center text-left"
+                      aria-label={`${name}. Show it in the mixer`}
+                      title={`${name} · show in the mixer`}
+                    >
+                      <span className={clsx('label truncate leading-none', isMuted && 'text-warn', isSolo && 'text-accent')} title={name}>
+                        {name}
+                      </span>
+                    </button>
+                    {isMuted && <span className="shrink-0 text-warn" title="Muted in the preview and the saved file"><Icon name="speakerOff" size={13} /></span>}
+                    {isSolo && (
+                      <span className="shrink-0 text-accent" title="Heard alone in the preview only">
+                        <Icon name="eye" size={13} />
+                      </span>
+                    )}
+                  </div>
+                  <div className={clsx('relative h-[40px] overflow-hidden border-t border-line', band, isSolo && 'bg-accent-soft')}>
+                    <Sound
+                      values={peaks?.[index]}
+                      decoded={!undecoded?.includes(index)}
+                      count={count}
+                      gain={gains[index] ?? 1}
+                      scale={scale}
+                      sound={sound}
+                      from={Math.max(0, activeFrom - view.start)}
+                      to={Math.min(view.span, activeTo - view.start)}
+                      total={view.span}
+                      start={view.start}
+                      span={view.span}
+                      fileSeconds={total}
+                    />
+                  </div>
+                </Fragment>
+              )
+            })}
+          </>
+        ) : (() => {
+          const single = tracks.length === 1
+          const index = trackIndexes[0] ?? 0
+          // Every heard track under one waveform is the output a person hears, never a guessed mix.
+          const name = single ? trackName(tracks[0], index) : 'Combined'
+          const isMuted = single && !!muted[index]
+          const isSolo = single && !!solo[index]
+          return (
+            <>
+              <div
+                data-lane={single ? index + 1 : undefined}
+                className={clsx(
+                  'flex h-[40px] cursor-default items-center gap-1 border-r border-t border-line px-2',
+                  isSolo && 'bg-accent-soft',
+                )}
+                onPointerDown={(event) => event.stopPropagation()}
+                onWheel={(event) => event.stopPropagation()}
+              >
+                {single && !lockReason ? (
+                  <button
+                    type="button"
+                    onClick={() => onFocusTrack?.(index)}
+                    className="flex min-w-0 flex-1 items-center text-left"
+                    aria-label={`${name}. Show it in the mixer`}
+                    title={`${name} · show in the mixer`}
+                  >
+                    <span className={clsx('label truncate leading-none', isMuted && 'text-warn', isSolo && 'text-accent')} title={name}>
+                      {name}
+                    </span>
+                  </button>
+                ) : (
+                  <span
+                    className="label min-w-0 flex-1 truncate leading-none"
+                    title={single ? `${name} · ${lockReason}` : 'Every track you hear, drawn as one waveform. Expand for each track.'}
+                  >
+                    {name}
+                  </span>
+                )}
+                {isMuted && <span className="shrink-0 text-warn" title="Muted in the preview and the saved file"><Icon name="speakerOff" size={13} /></span>}
+                {isSolo && (
+                  <span className="shrink-0 text-accent" title="Heard alone in the preview only">
+                    <Icon name="eye" size={13} />
+                  </span>
+                )}
+                {!single && (
+                  <button
+                    type="button"
+                    aria-expanded={false}
+                    aria-label="Expand audio into one lane per track"
+                    title={`Show audio sources (${tracks.length})`}
+                    className="btn btn-ghost !h-6 !w-6 shrink-0 !px-0"
+                    onClick={() => onExpanded(true)}
+                  >
+                    <Icon name="expand" size={13} />
+                  </button>
+                )}
+              </div>
+              <div className={clsx('relative h-[40px] overflow-hidden border-t border-line', isSolo && 'bg-accent-soft')}>
+                <Sound
+                  values={single ? peaks?.[index] : combined}
+                  decoded={single ? !undecoded?.includes(index) : !combinedUndecoded}
+                  count={count}
+                  gain={single ? gains[index] ?? 1 : 1}
+                  scale={single ? scale : combinedScale}
+                  sound={sound}
+                  from={Math.max(0, activeFrom - view.start)}
+                  to={Math.min(view.span, activeTo - view.start)}
+                  total={view.span}
+                  start={view.start}
+                  span={view.span}
+                  fileSeconds={total}
+                />
+              </div>
+            </>
+          )
+        })())}
 
         {/* The cut: what is kept as blocks, what is dropped left as a flat tint in its place. */}
-        <div className="flex h-[44px] cursor-default items-center border-r border-t border-line px-2" onPointerDown={(event) => event.stopPropagation()}>
+        <div className="flex h-[40px] cursor-default items-center border-r border-t border-line px-2" onPointerDown={(event) => event.stopPropagation()}>
           <span className="label leading-none" title="Drag the ends to trim, split to cut a part out">trim</span>
         </div>
-        <div className="relative h-[44px] overflow-hidden border-t border-line">
+        <div className="relative h-[40px] overflow-hidden border-t border-line">
           {cutAway(parts, total).map(([from, to], index) => (
             <div key={`cut-${index}`} className="pointer-events-none absolute inset-0" style={{ left: pct(from), width: `calc(${pct(to)} - ${pct(from)})`, ...CUT_STYLE }} />
           ))}
@@ -463,11 +637,11 @@ export function SequenceLanes({ clips, active, time, onSelect, onMenu, onSeek, o
   return (
     <div className="relative select-none border border-line bg-canvas">
       <div className="grid" style={{ gridTemplateColumns: `${GUTTER}px 1fr` }}>
-        <div className="flex h-[22px] items-center border-r border-line px-2">
+        <div className="flex h-[28px] items-center border-r border-line px-2">
           <span className="label leading-none">time</span>
         </div>
         <div
-          className="relative h-[22px] cursor-pointer overflow-hidden"
+          className="relative h-[28px] cursor-pointer overflow-hidden"
           onPointerDown={(event) => {
             event.currentTarget.setPointerCapture(event.pointerId)
             seekAt(event.clientX)
@@ -476,10 +650,10 @@ export function SequenceLanes({ clips, active, time, onSelect, onMenu, onSeek, o
         >
           <RulerMarks start={0} span={total} width={width} />
         </div>
-        <div className="flex h-[48px] items-center border-r border-t border-line px-2">
+        <div className="flex h-[64px] items-center border-r border-t border-line px-2">
           <span className="label leading-none" title="The clips of the sequence, in play order">clips</span>
         </div>
-        <div ref={row} className={clsx('relative h-[48px] overflow-hidden border-t border-line', carrying !== null && 'cursor-grabbing')}>
+        <div ref={row} className={clsx('relative h-[64px] overflow-hidden border-t border-line', carrying !== null && 'cursor-grabbing')}>
           {ghosts.map((ghost) => (
             <div key={`ghost-${ghost.id}`} aria-hidden="true" className="bx-ghost-out pointer-events-none absolute inset-y-0 z-10 bg-raised" style={{ left: `${ghost.left}%`, width: `${ghost.width}%` }} />
           ))}
@@ -528,7 +702,7 @@ export function SequenceLanes({ clips, active, time, onSelect, onMenu, onSeek, o
                   carrying === index ? 'z-20 cursor-grabbing border border-accent bg-line shadow-[0_6px_16px_rgb(0_0_0/0.5)]' : 'cursor-grab',
                   carrying !== index && (index === active ? 'bg-line shadow-[inset_0_0_0_2px_var(--bx-accent)]' : 'bg-raised hover:bg-line'),
                   settled === clip.id && 'bx-settle',
-                  pixels >= 72 ? 'px-1.5' : 'px-0',
+                  pixels >= 72 ? 'px-2' : 'px-0',
                 )}
                 style={{
                   left: `${lefts.get(clip.id) ?? 0}%`,
@@ -539,19 +713,19 @@ export function SequenceLanes({ clips, active, time, onSelect, onMenu, onSeek, o
                   transition: carrying === index ? 'none' : 'left var(--bx-dur-fast) var(--bx-ease-out), transform var(--bx-dur-fast) var(--bx-ease-out), background-color var(--bx-dur-fast), box-shadow var(--bx-dur-fast)',
                 }}
               >
-                {pixels >= 110 && (
+                {pixels >= 140 && (
                   <video
                     src={`${mediaUrl(clip.path)}#t=0.1`}
                     preload="metadata"
                     muted
                     tabIndex={-1}
-                    className="pointer-events-none h-[34px] w-[54px] shrink-0 border border-line bg-canvas object-cover"
+                    className="pointer-events-none h-[46px] w-[82px] shrink-0 border border-line bg-canvas object-cover"
                   />
                 )}
                 {pixels >= 72 && (
                   <span className="min-w-0">
-                    <span className="block truncate text-[13px] font-bold leading-tight">{simpleTitle(clip.name)}</span>
-                    <span className="num block truncate text-[11px] leading-tight text-muted">
+                    <span className="block truncate text-[14px] font-bold leading-tight">{simpleTitle(clip.name)}</span>
+                    <span className="num mt-0.5 block truncate text-[12px] leading-tight text-muted">
                       {duration(length)}
                       {clip.speed !== 1 && ` · ${clip.speed}x`}
                       {clip.parts.length > 1 && ' · cut'}
@@ -569,18 +743,25 @@ export function SequenceLanes({ clips, active, time, onSelect, onMenu, onSeek, o
   )
 }
 
-/** The gutter is the same on every row, so every 0 s lines up: the level, then time. */
-export const GUTTER = 104
+/** The gutter is the same on every row, so every 0 s lines up: the level, then time. It is wide
+ *  enough for a source name and its mute mark, with the expand control beside a folded lane. */
+export const GUTTER = 148
 /** A lit column and the gap beside it. */
 const PITCH = 3
 
 /** One track's sound, drawn the way the product draws sound: a column every 3 px, bottom-anchored and square.
  *  The level scales it from the bottom, so a muted track is a flat line and 200 % is clipped by the row: the
  *  picture and the mix move together, at the same value. */
-function Sound({ values, count, gain, from, to, total, start = 0, span, fileSeconds }: {
+function Sound({ values, decoded = true, count, gain, scale, sound = 'ready', from, to, total, start = 0, span, fileSeconds }: {
   values?: number[]
+  /** False when the engine could not decode this lane: its zeros are not silence. */
+  decoded?: boolean
   count: number
   gain: number
+  /** The loudness every lane on screen is read against. */
+  scale?: number
+  /** The waveform read itself: still out, done, or failed. */
+  sound?: 'loading' | 'ready' | 'failed'
   from: number
   to: number
   total: number
@@ -595,7 +776,17 @@ function Sound({ values, count, gain, from, to, total, start = 0, span, fileSeco
     const [first, last] = peakRange(start, span ?? total, fileSeconds ?? total, values.length)
     return values.slice(first, last)
   }, [values, start, span, total, fileSeconds])
-  const columns = useMemo(() => columnsOf(visible, count), [visible, count])
+  const columns = useMemo(() => columnsOf(visible, count, scale), [visible, count, scale])
+  const silent = values !== undefined && visible.every((value) => value === 0)
+  const quiet = !silent && columns.every((value) => value < 0.002)
+  // Reading, failure and a silent track are three different things, and a flat row alone would read
+  // as all three. The label is the one thing the picture cannot say. A lane the engine could not decode
+  // says so on its own row: its zeros must never be drawn as a silent track.
+  const status = !decoded ? 'SOUND COULD NOT BE READ'
+    : sound === 'failed' ? 'SOUND COULD NOT BE READ'
+      : sound === 'loading' && values === undefined ? 'READING SOUND'
+        : values === undefined ? 'NO SOUND'
+          : silent ? 'SILENT' : quiet ? 'QUIET' : ''
   // The columns are built once per width, part and level-independent: a drag of the level only rewrites the
   // svg's transform below, so it stays smooth however many columns the lane holds.
   const layer = useMemo(
@@ -616,16 +807,26 @@ function Sound({ values, count, gain, from, to, total, start = 0, span, fileSeco
   const left = Math.max(0, Math.min(1, from / total)) * wide
   const right = Math.max(0, Math.min(1, to / total)) * wide
   return (
-    <svg
-      viewBox={`0 0 ${count * PITCH - 1} 100`}
-      preserveAspectRatio="none"
-      className="absolute inset-0 h-full w-full text-muted"
-      style={{ transform: `scaleY(${gain})`, transformOrigin: 'bottom' }}
-      aria-hidden="true"
-    >
-      {layer}
-      <rect x={0} y={0} width={left} height={100} fill="var(--bx-canvas)" opacity={0.55} />
-      <rect x={right} y={0} width={Math.max(0, wide - right)} height={100} fill="var(--bx-canvas)" opacity={0.55} />
-    </svg>
+    <>
+      <svg
+        viewBox={`0 0 ${count * PITCH - 1} 100`}
+        preserveAspectRatio="none"
+        className="absolute inset-0 h-full w-full text-muted"
+        style={{ transform: `scaleY(${gain})`, transformOrigin: 'bottom' }}
+        aria-hidden="true"
+      >
+        {layer}
+        <rect x={0} y={0} width={left} height={100} fill="var(--bx-canvas)" opacity={0.55} />
+        <rect x={right} y={0} width={Math.max(0, wide - right)} height={100} fill="var(--bx-canvas)" opacity={0.55} />
+      </svg>
+      {status && (
+        <span className={clsx(
+          'pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 text-[12px] font-bold leading-none',
+          !decoded || sound === 'failed' ? 'text-warn' : 'text-faint',
+        )}>
+          {status}
+        </span>
+      )}
+    </>
   )
 }

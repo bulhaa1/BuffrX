@@ -127,6 +127,13 @@ if (-not (Invoke-Step 'unit checks' {
   exit 1
 }
 
+foreach ($test in @('buffrx-display-tests.exe', 'buffrx-canvas-tests.exe')) {
+  if (-not (Invoke-Step $test { & (Join-Path $repo "build\$test") })) {
+    Write-Host "FAILED: $test."
+    exit 1
+  }
+}
+
 if (-not (Invoke-Step 'ui typecheck' { & npm --prefix ui run typecheck })) {
   Write-Host 'FAILED: ui typecheck.'
   exit 1

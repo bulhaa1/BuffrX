@@ -17,6 +17,7 @@
 
 #include "../shared/files.h"
 #include "../shared/log.h"
+#include "audio_layout.h"
 #include "session_store.h"
 
 namespace bx {
@@ -475,8 +476,10 @@ void delete_cached_images(const std::string& file) {
 bool library_delete(const std::string& file) {
   if (!library_can_remove(file)) return false;
   if (!retry_while_shared([&] { return DeleteFileA(file.c_str()) != FALSE; })) return false;
-  // Its thumbnail and preview frames, if any, go with it.
+  // Its thumbnail and preview frames, if any, go with it; the labels are this product's own, and a
+  // stranger's file at that name is left alone (remove_audio_layout decides).
   delete_cached_images(file);
+  remove_audio_layout(file);
   return true;
 }
 
@@ -540,6 +543,10 @@ bool library_trash(const std::string& file) {
     return false;
   }
   delete_cached_images(file);
+  // The track labels are a file of their own beside the clip. A clip in the Recycle Bin without its
+  // labels still sounds right (the mix is the first track), so a refused sidecar never fails the delete;
+  // a file somebody else put at that name is not this product's and is not moved.
+  if (audio_sidecar_is_ours(file)) library_trash(file + kAudioLayoutSuffix);
   return true;
 }
 
@@ -585,10 +592,24 @@ bool library_rename(const std::string& file, const std::string& new_name, std::s
     return true;
   }
   if (!same_name && GetFileAttributesA(target.c_str()) != INVALID_FILE_ATTRIBUTES) return false;
+  // A sidecar already at the target belongs to another file (or is a stranger's): the rename is refused
+  // whole, so the clip keeps its own labels and that file is never replaced. A medialess orphan at the
+  // target is still not ours to overwrite.
+  if (!same_name && GetFileAttributesA((target + kAudioLayoutSuffix).c_str()) != INVALID_FILE_ATTRIBUTES) {
+    BX_LOG_WARN("refusing a rename whose track labels would replace a file already there: %s", target.c_str());
+    return false;
+  }
   if (!retry_while_shared([&] { return MoveFileA(file.c_str(), target.c_str()) != FALSE; })) return false;
   // The caches are keyed by the old path, so the new name starts without them and nothing else
   // would ever free the old ones.
   delete_cached_images(file);
+  // The track labels follow the clip. A sidecar that cannot move leaves valid sound (the mix is track
+  // 1) and generic labels, so the rename itself still succeeds.
+  const std::string old_sidecar = file + kAudioLayoutSuffix;
+  if (audio_sidecar_is_ours(file) &&
+      !MoveFileExA(old_sidecar.c_str(), (target + kAudioLayoutSuffix).c_str(), 0)) {
+    BX_LOG_WARN("the audio track labels did not follow the rename: %s", old_sidecar.c_str());
+  }
   result_path = target;
   return true;
 }

@@ -207,7 +207,8 @@ foreach ($helper in @('obs-nvenc-test.exe', 'obs-qsv-test.exe', 'obs-amf-test.ex
 
 # Stage the executables into the packaged layout (bin/64bit beside obs.dll) so local runs and the
 # smoke tests exercise the same directory structure users get. Measurement and test tools stay in build/.
-$devTools = @('buffrx-present-loop.exe', 'buffrx-tests.exe', 'buffrx-fuzz.exe',
+$devTools = @('buffrx-present-loop.exe', 'buffrx-tests.exe', 'buffrx-display-tests.exe', 'buffrx-canvas-tests.exe', 'buffrx-fuzz.exe',
+  'buffrx-ui-present-tests.exe', 'buffrx-audio-fixture.exe', 'buffrx-audio-watch-tests.exe', 'buffrx-process-audio-tests.exe',
   'buffrx-admin-probe.exe', 'ring_save_tests.exe')
 if (-not $NoStage) {
   $stage = Join-Path $root 'runtime\bin\64bit'

@@ -1,6 +1,6 @@
 # Builds the portable BuffrX package from the staged runtime and ui/dist.
 #
-#   powershell -File tools/package.ps1 [-Version 0.5.0] [-OutDir dist]
+#   powershell -File tools/package.ps1 [-Version 0.6.0] [-OutDir dist]
 #
 # The package is not shippable until the smoke test passes *from the staged folder*: a package whose
 # engine cannot start is a broken package, and testing it where it was built proves nothing.
@@ -10,7 +10,7 @@
 # and SHA256SUMS.txt.
 
 param(
-  [string]$Version = '0.5.0',
+  [string]$Version = '0.6.0',
   [string]$OutDir = 'dist'
 )
 
@@ -78,7 +78,8 @@ if (Test-Path -LiteralPath $stageFull) { Remove-Item -LiteralPath $stageFull -Re
 New-Item -ItemType Directory -Force $stageFull | Out-Null
 
 Write-Host "staging into $stage"
-foreach ($folder in @('bin\64bit', 'obs-plugins\64bit', 'data', 'licenses')) {
+# core\win-capture\data: the hook files OBS 33's win-capture copies to ProgramData from there (prepare-runtime.ps1).
+foreach ($folder in @('bin\64bit', 'obs-plugins\64bit', 'data', 'core', 'licenses')) {
   $from = Join-Path $runtime $folder
   if (-not (Test-Path -LiteralPath $from)) { continue }
   $to = Join-Path $stageFull $folder
@@ -97,6 +98,11 @@ $devBinaries = @(
   '^buffrx-engine\.exe\.(old|prev.*|previous-.+)$',
   '^buffrx-share\.exe\.old$',
   '^buffrx-fuzz\.exe$',
+  '^buffrx-display-tests\.exe$',
+  '^buffrx-canvas-tests\.exe$',
+  '^buffrx-audio-fixture\.exe$',
+  '^buffrx-audio-watch-tests\.exe$',
+  '^buffrx-process-audio-tests\.exe$',
   '^buffrx-present-loop\.exe$',
   '^ring_save_tests\.exe$',
   '^buffrx-ui-.+\.exe$'                  # baseline, p4g and every other ui build beside the product one
@@ -152,6 +158,11 @@ foreach ($binary in @('bin\64bit\buffrx-engine.exe', 'bin\64bit\buffrx-ui.exe', 
 # BuffrX.exe runs from the root, away from the MinGW runtime in bin\64bit: it may import Windows only.
 $imports = & (Join-Path $paths.llvm_bin 'llvm-objdump.exe') -p (Join-Path $stageFull 'BuffrX.exe') | Select-String 'DLL Name'
 if ($imports -match 'libc\+\+|libunwind|libwinpthread') { throw "BuffrX.exe imports the MinGW runtime and would not start from the package root" }
+# A console-subsystem entry opened from Explorer or the Run key gets a console of its own: the command prompt
+# that flashes at launch. The entry is a GUI binary; the engine stays a console binary and the entry starts it
+# with CREATE_NO_WINDOW.
+$subsystem = & $objdump -p (Join-Path $stageFull 'BuffrX.exe') | Select-String '^Subsystem'
+if ($subsystem -notmatch 'Windows GUI') { throw "BuffrX.exe is a console binary and would flash a console window at launch" }
 
 # Per-file hashes, and the same list in the format every checksum tool reads.
 $files = Get-ChildItem -LiteralPath $stageFull -Recurse -File | Sort-Object FullName

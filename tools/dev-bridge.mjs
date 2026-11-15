@@ -243,7 +243,7 @@ async function shellInvoke(command, args) {
     await ensureRoots()
     if (!isAllowed(args?.path) || !/\.(png|jpe?g)$/i.test(args.path)) throw new Error('images can only be written inside the BuffrX folders')
     await mkdir(dirname(resolve(args.path)), { recursive: true })
-    await writeFile(resolve(args.path), Buffer.from(Array.isArray(args?.bytes) ? args.bytes : []))
+    await writeFile(resolve(args.path), Buffer.from(String(args?.bytesBase64 ?? ''), 'base64'))
     return null
   }
   throw new Error(`the dev bridge does not implement "${command}"`)

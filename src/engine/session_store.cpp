@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "../shared/files.h"
+#include "audio_layout.h"
 #include "dir_listing.h"
 #include "../shared/json.h"
 #include "../shared/log.h"
@@ -756,6 +757,11 @@ bool session_store_load_one(const std::string& id, SessionEntry& out, std::strin
 }
 
 namespace {
+// The labels a chunk carries are a second file beside it (audio_layout.h): a chunk that goes takes them
+// with it, or a later recording that reuses the name would inherit the wrong tracks. Only this product's
+// own sidecar is removed: a file somebody else put at that name is left alone.
+void remove_chunk_sidecar(const std::string& file) { remove_audio_layout(file); }
+
 // Footage an interrupted retention sweep renamed to "<chunk>.expired" and never deleted: the index no
 // longer names it, so sweeping the media folder is the only thing that finds it.
 void remove_expired_leftovers(const std::string& media) {
@@ -781,7 +787,10 @@ bool session_store_delete(const SessionEntry& entry, std::string& error) {
   // Only files inside this session's own directory are ever removed, so a tampered index cannot turn
   // a delete into a file shredder.
   for (const SessionChunk& chunk : entry.chunks) {
-    if (path_inside(chunk.file, directory)) DeleteFileA(chunk.file.c_str());
+    if (path_inside(chunk.file, directory)) {
+      DeleteFileA(chunk.file.c_str());
+      remove_chunk_sidecar(chunk.file);
+    }
   }
   // Footage the open session dropped and a crash kept from deleting is still on disk as "<chunk>.expired": it goes with the session.
   remove_expired_leftovers(media);
@@ -821,6 +830,9 @@ bool session_store_drop_chunks(SessionEntry& entry, const std::vector<size_t>& e
         next.chunks.push_back(entry.chunks[index]);
         continue;
       }
+      // The chunk is going (renamed or already gone): its labels go with it, and a crash between the
+      // rename and the delete leaves nothing a later recording could inherit.
+      if (inside) remove_chunk_sidecar(file);
       dropped.push_back(DroppedChunk{entry.id, entry.chunks[index]});
     } else {
       next.chunks.push_back(entry.chunks[index]);
@@ -859,6 +871,7 @@ void session_store_delete_chunk_files(const std::vector<DroppedChunk>& dropped, 
     const bool had_renamed = GetFileAttributesA(renamed.c_str()) != INVALID_FILE_ATTRIBUTES;
     const std::string& target = had_renamed ? renamed : item.chunk.file;
     if (DeleteFileA(target.c_str()) != 0 || GetFileAttributesA(target.c_str()) == INVALID_FILE_ATTRIBUTES) {
+      remove_chunk_sidecar(item.chunk.file);
       session_thumbs_remove(item.session_id, timeline_thumb_key(item.chunk.file));
     } else {
       still_held.push_back(item);

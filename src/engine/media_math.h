@@ -82,11 +82,14 @@ struct StreamSignature {
   int sample_rate = 0;
   uint64_t channel_layout = 0;
   Rational time_base;
+  int audio_streams = 0;  // a copy maps streams one to one, so a chunk with another track count cannot join
 };
 bool streams_compatible(const StreamSignature& a, const StreamSignature& b);
 // Where the run of chunks that share the last chunk's stream begins, as an index (0 when they all do, or there are fewer than
 // two). A save across a settings change copies from here.
-size_t trailing_compatible_run(const std::vector<StreamSignature>& signatures);
+// `rate_may_differ`: a join that rescales every packet into the first part's time base (an encoder controller frame-rate step, a
+// Timeline save across one) does not compare the frame rate or the time base.
+size_t trailing_compatible_run(std::vector<StreamSignature> signatures, bool rate_may_differ = false);
 
 // What the engine does once a recording chunk has closed. Decided on the engine's own thread, never
 // inside libobs's "stop" signal: that signal runs on the output's own thread, and releasing the output
@@ -123,7 +126,7 @@ struct ExportInput {
   int crop_x = 0, crop_y = 0, crop_width = 0, crop_height = 0;  // source pixels; width 0 means no crop
   double grade_brightness = 100.0, grade_contrast = 100.0, grade_saturation = 100.0;
   double speed = 1.0;
-  std::vector<double> volumes;  // per audio track, 1.0 unchanged
+  std::vector<double> volumes;  // per audio track, 1.0 unchanged; 0 is silence, never a missing stream
 };
 
 // One editor export: a cut of one file, optionally cropped, scaled, compressed and re-mixed.
@@ -133,6 +136,8 @@ struct ExportJob {
   // Replace is ask-first in the editor: the new file is verified, the original is renamed aside, and
   // only then does the new file take its path. The aside file goes to the Recycle Bin.
   bool replace_original = false;
+  // A saved copy must not overwrite a file created after the editor picked its name.
+  bool fail_if_exists = false;
   double start = 0.0;       // seconds into the input
   double end = 0.0;         // seconds; 0 or past the end means "to the end"
   int crop_x = 0, crop_y = 0, crop_width = 0, crop_height = 0;  // source pixels; width 0 means no crop
@@ -155,7 +160,7 @@ struct ExportJob {
   // Playback speed: 2 plays twice as fast, so the clip is half as long. The bitrate is kept, so the
   // file is smaller by about the same factor. 1 leaves the timing alone.
   double speed = 1.0;
-  std::vector<double> volumes;  // per audio track, 1.0 unchanged, 0 drops the track; missing = 1.0
+  std::vector<double> volumes;  // per audio track, 1.0 unchanged, 0 silences it; missing = 1.0
   // The parts of the input to keep, in seconds, joined in order. Empty means the one range
   // start..end. A cut in the editor is a split and a deleted part: what is left is this list.
   std::vector<std::pair<double, double>> segments;

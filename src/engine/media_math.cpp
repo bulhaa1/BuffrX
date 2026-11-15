@@ -104,9 +104,11 @@ ExportPlan export_plan(const ExportJob& job) {
   const bool cropped = job.crop_width > 0 && job.crop_height > 0;
   const bool scaled = job.out_width > 0 && job.out_height > 0;
   if (cropped || scaled || job.quality > 0.0 || job.video_kbps > 0) return ExportPlan::reencode;
+  if (job.fps > 0.0 || job.square_pixels || !job.video_codec.empty() || !job.video_encoder.empty()) return ExportPlan::reencode;
   if (export_graded(job)) return ExportPlan::reencode;
   if (export_retimed(job)) return ExportPlan::reencode;
   if (job.segments.size() > 1) return ExportPlan::reencode;
+  if (job.audio_rate > 0 || job.audio_channels > 0 || job.audio_kbps > 0) return ExportPlan::audio_only;
   for (double volume : job.volumes) {
     if (std::abs(volume - 1.0) > 0.005) return ExportPlan::audio_only;
   }
@@ -293,8 +295,14 @@ bool rationals_close(const Rational& a, const Rational& b) {
 
 }  // namespace
 
-size_t trailing_compatible_run(const std::vector<StreamSignature>& signatures) {
+size_t trailing_compatible_run(std::vector<StreamSignature> signatures, bool rate_may_differ) {
   if (signatures.size() < 2) return 0;
+  if (rate_may_differ) {
+    for (StreamSignature& signature : signatures) {
+      signature.frame_rate = signatures.back().frame_rate;
+      signature.time_base = signatures.back().time_base;
+    }
+  }
   size_t from = signatures.size() - 1;
   while (from > 0 && streams_compatible(signatures[from - 1], signatures[signatures.size() - 1])) --from;
   return from;
@@ -303,7 +311,8 @@ size_t trailing_compatible_run(const std::vector<StreamSignature>& signatures) {
 bool streams_compatible(const StreamSignature& a, const StreamSignature& b) {
   return a.codec_id == b.codec_id && a.width == b.width && a.height == b.height && a.pix_fmt == b.pix_fmt &&
          rationals_close(a.frame_rate, b.frame_rate) && a.sample_rate == b.sample_rate &&
-         a.channel_layout == b.channel_layout && rationals_equal(a.time_base, b.time_base);
+         a.channel_layout == b.channel_layout && rationals_equal(a.time_base, b.time_base) &&
+         a.audio_streams == b.audio_streams;
 }
 
 ChunkClosedAction chunk_closed_action(bool has_session, bool rotating) {

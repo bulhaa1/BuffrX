@@ -33,6 +33,8 @@ const std::map<std::string, std::string>& icon_table() {
       {"mic", "M12 3a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3Zm-6 9a6 6 0 0 0 12 0M12 18v3"},
       {"micOff", "M9 9v3a3 3 0 0 0 5.1 2.1M15 9.3V6a3 3 0 0 0-5.9-.8M6 12a6 6 0 0 0 10 4.5M18 12a6 6 0 0 1-.4 2.1M12 18v3M4 4l16 16"},
       {"speaker", "M4 9v6h4l5 4V5L8 9H4Zm12.5-.5a5 5 0 0 1 0 7M19 6a8.5 8.5 0 0 1 0 12"},
+      {"speakerBody", "M4 9v6h4l5 4V5L8 9H4Z"},
+      {"speakerWave1", "M4 9v6h4l5 4V5L8 9H4Zm12.5-.5a5 5 0 0 1 0 7"},
       {"speakerOff", "M4 9v6h4l5 4V5L8 9H4Zm12 1 5 5m0-5-5 5"},
       {"check", "M5 12.5 10 17 19 7"},
       {"alert", "M12 8v5m0 3.5h.01M10.3 3.9 2.6 17.5A2 2 0 0 0 4.3 20.5h15.4a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"},
