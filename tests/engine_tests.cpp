@@ -1856,6 +1856,26 @@ void test_config_timeline() {
   bool portable = false;
   check(bx::resolve_data_root(root, portable), "the data root resolves with a portable marker");
   check(portable && root.size() >= 5 && root.compare(root.size() - 5, 5, "\\data") == 0, "the marker selects <exe>\\data");
+  const std::string held_probe = root + "\\.buffrx-write";
+  HANDLE held = CreateFileA(held_probe.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                            FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+  check(held != INVALID_HANDLE_VALUE, "an overlapping launch can hold the old write probe");
+  if (held != INVALID_HANDLE_VALUE) {
+    check(bx::resolve_data_root(root, portable), "an overlapping write probe does not reject a writable data root");
+    CloseHandle(held);
+  }
+  std::atomic<int> resolved{0};
+  std::vector<std::thread> launches;
+  for (int i = 0; i < 8; ++i) launches.emplace_back([&] {
+    for (int attempt = 0; attempt < 32; ++attempt) {
+      std::string concurrent_root;
+      bool concurrent_portable = false;
+      if (bx::resolve_data_root(concurrent_root, concurrent_portable) && concurrent_portable)
+        ++resolved;
+    }
+  });
+  for (auto& launch : launches) launch.join();
+  check(resolved == 256, "concurrent launches independently accept the same writable data root");
   std::remove(marker.c_str());
   if (!data_existed) RemoveDirectoryA(portable_root.c_str());
   root.clear();
