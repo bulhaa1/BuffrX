@@ -108,8 +108,10 @@ try {
   if ($Area -eq 'Rust' -or $Area -eq 'All') {
     if ($env:OS -ne 'Windows_NT') { throw 'Rust tests require Windows.' }
     $rustManifest = Join-Path $root 'work/rust-toolchain.json'
-    $pathsFile = Join-Path $root 'work/paths.json'
-    if (-not (Test-Path -LiteralPath $rustManifest) -or -not (Test-Path -LiteralPath $pathsFile)) {
+    # The LLVM-MinGW folder is the linker and resource compiler for the Rust target; either manifest names it.
+    $toolFile = @('work/toolchain.json', 'work/toolchain-minimal.json') | ForEach-Object { Join-Path $root $_ } |
+      Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+    if (-not (Test-Path -LiteralPath $rustManifest) -or -not $toolFile) {
       throw 'Run: powershell -File tools/bootstrap-toolchain.ps1, then tools/bootstrap-rust.ps1'
     }
     # The shell embeds the editor page when it compiles.
@@ -117,15 +119,15 @@ try {
       Invoke-Check 'editor page for embedding' { npm --prefix ui run build }
     }
     $rust = Get-Content -LiteralPath $rustManifest -Raw | ConvertFrom-Json
-    $paths =Get-Content -LiteralPath $pathsFile -Raw | ConvertFrom-Json
+    $llvmBin = (Get-Content -LiteralPath $toolFile -Raw | ConvertFrom-Json).llvm_root + '\bin'
     $cargoHome = Join-Path $root 'work/cargo'
     $saved = @{ CARGO_HOME = $env:CARGO_HOME; RUSTUP_HOME = $env:RUSTUP_HOME; RUSTUP_TOOLCHAIN = $env:RUSTUP_TOOLCHAIN; PATH = $env:PATH; RC = $env:RC }
     try {
       $env:CARGO_HOME = $cargoHome
       $env:RUSTUP_HOME = Join-Path $root 'work/rustup'
       $env:RUSTUP_TOOLCHAIN = $rust.toolchain
-      $env:RC = Join-Path $paths.llvm_bin 'llvm-rc.exe'
-      $env:PATH = (Join-Path $cargoHome 'bin') + ';' + $paths.llvm_bin + ';' + $env:PATH
+      $env:RC = Join-Path $llvmBin 'llvm-rc.exe'
+      $env:PATH = (Join-Path $cargoHome 'bin') + ';' + $llvmBin + ';' + $env:PATH
       # Release profile: the full build has already compiled these dependencies the same way.
       foreach ($crate in 'src-share', 'src-tauri') {
         Invoke-Check "rust tests ($crate)" {
