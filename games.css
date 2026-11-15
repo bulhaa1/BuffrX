@@ -1,0 +1,5 @@
+/* BuffrX landing page: a game's picture (a frame of its capture or a publisher image) and the clip behind a demo. */
+.gshot { position: relative; display: block; overflow: hidden; aspect-ratio: 16 / 9; background: #0b0c0d; }
+.gshot img { display: block; width: 100%; height: 100%; object-fit: cover; }
+/* a real clip behind a demo */
+.gvid { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
