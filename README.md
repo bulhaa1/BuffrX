@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/readme-banner.jpg" alt="BuffrX. Clip it. Cut it. Send it. A free, open-source game clipping app for Windows." width="100%">
+<img width="1200" height="630" alt="image" src="https://github.com/user-attachments/assets/b1595b67-0dfb-4ed2-9baa-c339d6d74705" />
 
 &nbsp;
 
@@ -30,7 +30,7 @@ No account. No ads. No watermark. No telemetry.
 
 &nbsp;
 
-> **Status:** in active development. Windows 10 and 11 today. The Timeline is in beta, and Linux is planned.
+ **Status:** in active development. Windows 10 and 11 today. The Timeline is in beta, and Linux is planned.
 
 </div>
 
