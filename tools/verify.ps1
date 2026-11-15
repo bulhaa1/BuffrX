@@ -84,6 +84,10 @@ try {
       $ctestArgs = @('--test-dir', $build, '--output-on-failure')
       if ($Performance) { $ctestArgs += '--verbose' }
       Invoke-Check 'native logic tests' { & (Join-Path (Split-Path $tools.cmake) 'ctest.exe') @ctestArgs }
+      Invoke-Check 'installer keeps clips' {
+        & (Join-Path $PSScriptRoot 'installer.ps1') -StageToolsOnly
+        & (Join-Path $PSScriptRoot 'test-installer-keeps-clips.ps1')
+      }
     } finally {
       $env:BUFFRX_DATA_ROOT = $previousData
       $env:BUFFRX_SOURCE_DIR = $previousSource
@@ -108,8 +112,12 @@ try {
     if (-not (Test-Path -LiteralPath $rustManifest) -or -not (Test-Path -LiteralPath $pathsFile)) {
       throw 'Run: powershell -File tools/bootstrap-toolchain.ps1, then tools/bootstrap-rust.ps1'
     }
+    # The shell embeds the editor page when it compiles.
+    if (-not (Test-Path -LiteralPath (Join-Path $root 'ui/dist/index.html'))) {
+      Invoke-Check 'editor page for embedding' { npm --prefix ui run build }
+    }
     $rust = Get-Content -LiteralPath $rustManifest -Raw | ConvertFrom-Json
-    $paths = Get-Content -LiteralPath $pathsFile -Raw | ConvertFrom-Json
+    $paths =Get-Content -LiteralPath $pathsFile -Raw | ConvertFrom-Json
     $cargoHome = Join-Path $root 'work/cargo'
     $saved = @{ CARGO_HOME = $env:CARGO_HOME; RUSTUP_HOME = $env:RUSTUP_HOME; RUSTUP_TOOLCHAIN = $env:RUSTUP_TOOLCHAIN; PATH = $env:PATH; RC = $env:RC }
     try {

@@ -11,13 +11,10 @@ foreach ($bad in '[InstallDelete]', '[UninstallDelete]', 'filesandordirs', 'DelT
 }
 Write-Output 'PASS buffrx.iss has no delete directive'
 
-$paths = Get-Content -LiteralPath (Join-Path $repo 'work/paths.json') -Raw | ConvertFrom-Json
 $root = Join-Path $repo ('work/installer-clips-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $root | Out-Null
-$source = Join-Path $root 'launcher.cpp'
-'int main() { return 0; }' | Set-Content -LiteralPath $source -Encoding ascii
-& $paths.clangxx -static $source -o (Join-Path $root 'BuffrX.exe')
-if ($LASTEXITCODE -ne 0) { throw 'Fixture build failed' }
+# Any small program stands in for BuffrX.exe: the test is about which files Setup touches.
+Copy-Item -LiteralPath (Join-Path $env:SystemRoot 'System32\whoami.exe') -Destination (Join-Path $root 'BuffrX.exe')
 $files = [regex]::Match($product, '(?m)^Source: "\{#Src\}\\\*".*$').Value
 if (-not $files) { throw 'The product [Files] line was not found' }
 $flags = [regex]::Match($files, 'Flags: .*$').Value

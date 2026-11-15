@@ -24,6 +24,7 @@ jobs:
       editor: ${{ steps.paths.outputs.editor }}
       native: ${{ steps.paths.outputs.native }}
       build: ${{ steps.paths.outputs.build }}
+      rust: ${{ steps.paths.outputs.rust }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -34,24 +35,26 @@ jobs:
         run: |
           $event = Get-Content $env:GITHUB_EVENT_PATH -Raw | ConvertFrom-Json
           $base = if ($event.pull_request) { $event.pull_request.base.sha } else { $event.before }
-          $editor = $false; $native = $false; $build = $false
+          $editor = $false; $native = $false; $build = $false; $rust = $false
           if (-not $base -or $base -match '^0+$') {
-            $editor = $true; $native = $true; $build = $true
+            $editor = $true; $native = $true; $build = $true; $rust = $true
           } else {
             $files = @(git diff --name-only $base HEAD)
             if ($LASTEXITCODE -ne 0) { throw 'Cannot determine changed files.' }
             foreach ($file in $files) {
-              if ($file -match '^ui/') { $editor = $true; $build = $true }
+              if ($file -match '^ui/') { $editor = $true; $build = $true; $rust = $true }
               elseif ($file -match '^docs/protocol\.md$') { $native = $true }
               elseif ($file -match '\.md$|^\.github/(ISSUE_TEMPLATE/|PULL_REQUEST_TEMPLATE\.md$|dependabot\.yml$)') { continue }
-              elseif ($file -match '^(src/|tests/|src-tauri/|src-share/|tools/|CMakeLists\.txt$|assets/|brand/)') {
+              elseif ($file -match '^(src-tauri/|src-share/|tools/(verify|bootstrap-rust|bootstrap-toolchain)\.ps1$)') { $native = $true; $build = $true; $rust = $true }
+              elseif ($file -match '^(src/|tests/|tools/|CMakeLists\.txt$|assets/|brand/)') {
                 $native = $true; $build = $true
-              } else { $editor = $true; $native = $true; $build = $true }
+              } else { $editor = $true; $native = $true; $build = $true; $rust = $true }
             }
           }
           "editor=$($editor.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
           "native=$($native.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
           "build=$($build.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+          "rust=$($rust.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
 
   docs:
     runs-on: ubuntu-latest
@@ -178,9 +181,6 @@ jobs:
       - run: npm ci --prefix ui
       - shell: powershell
         run: ./tools/verify.ps1 -Area Build
-      # The sharing helper and the editor shell have their own Rust tests; the build alone never ran them.
-      - shell: powershell
-        run: ./tools/verify.ps1 -Area Rust
       - uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         if: success() && github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.warm.outputs.cache-hit != 'true'
         with:
@@ -200,9 +200,59 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+  # The sharing helper and the editor shell have their own Rust tests. They run beside the build, not after it,
+  # and only when Rust code or the editor page (which the shell embeds) changed.
+  rust:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        if: github.event_name != 'schedule'
+        with:
+          path: |
+            work/toolchain
+            work/cargo/registry
+          key: rust-${{ runner.os }}-${{ hashFiles('tools/bootstrap-toolchain.ps1', 'tools/bootstrap-rust.ps1', '**/Cargo.lock') }}
+      # Test-mode builds of the crates, saved by main like the build job's cache.
+      - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        if: github.event_name != 'schedule'
+        id: warm
+        with:
+          path: |
+            src-share/target
+            src-tauri/target
+          key: rust-warm-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', 'tools/bootstrap-rust.ps1') }}-${{ github.sha }}
+          restore-keys: |
+            rust-warm-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', 'tools/bootstrap-rust.ps1') }}-
+            rust-warm-${{ runner.os }}-
+      - shell: powershell
+        run: |
+          ./tools/bootstrap-toolchain.ps1
+          ./tools/bootstrap-rust.ps1
+      - run: npm ci --prefix ui
+      - shell: powershell
+        run: ./tools/verify.ps1 -Area Rust
+      - uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        if: success() && github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.warm.outputs.cache-hit != 'true'
+        with:
+          path: |
+            src-share/target
+            src-tauri/target
+          key: rust-warm-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', 'tools/bootstrap-rust.ps1') }}-${{ github.sha }}
+
   pr-gate:
     if: always()
-    needs: [changes, docs, editor, native, build]
+    needs: [changes, docs, editor, native, build, rust]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     env:
@@ -211,19 +261,21 @@ jobs:
       EDITOR_REQUIRED: ${{ needs.changes.outputs.editor }}
       NATIVE_REQUIRED: ${{ needs.changes.outputs.native }}
       BUILD_REQUIRED: ${{ needs.changes.outputs.build }}
+      RUST_REQUIRED: ${{ needs.changes.outputs.rust }}
       EDITOR: ${{ needs.editor.result }}
       NATIVE: ${{ needs.native.result }}
       BUILD: ${{ needs.build.result }}
+      RUST: ${{ needs.rust.result }}
     steps:
       - shell: pwsh
         run: |
           $summary = @('| Check | Needed | Result |', '|---|---|---|', "| changes | yes | $env:CHANGES |", "| docs | yes | $env:DOCS |")
-          foreach ($area in @('EDITOR', 'NATIVE', 'BUILD')) {
+          foreach ($area in @('EDITOR', 'NATIVE', 'BUILD', 'RUST')) {
             $summary += "| $($area.ToLower()) | $([Environment]::GetEnvironmentVariable("${area}_REQUIRED")) | $([Environment]::GetEnvironmentVariable($area)) |"
           }
           $summary >> $env:GITHUB_STEP_SUMMARY
           if ($env:CHANGES -ne 'success' -or $env:DOCS -ne 'success') { throw 'Required setup/docs job failed.' }
-          foreach ($area in @('EDITOR', 'NATIVE', 'BUILD')) {
+          foreach ($area in @('EDITOR', 'NATIVE', 'BUILD', 'RUST')) {
             $required = [Environment]::GetEnvironmentVariable("${area}_REQUIRED")
             $result = [Environment]::GetEnvironmentVariable($area)
             if ($required -notin @('true', 'false')) { throw "Missing route for $area" }
