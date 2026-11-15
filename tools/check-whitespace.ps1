@@ -17,6 +17,8 @@ if (-not $BaseRef -and $env:GITHUB_ACTIONS -eq 'true') {
       $separator = '..'
       $initialPush = $BaseRef -match '^0{40}$'
     }
+    # A weekly or manual run has no change to compare; every commit was checked when it merged.
+    { $_ -in 'schedule', 'workflow_dispatch' } { Write-Host 'No change range for this event; whitespace was checked at merge.'; return }
     default { throw "Unsupported whitespace-check event: $env:GITHUB_EVENT_NAME" }
   }
   if (-not $BaseRef) { throw 'GitHub event contains no comparison base.' }
