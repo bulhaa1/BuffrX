@@ -10,6 +10,7 @@
 #include <shlobj.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cmath>
 #include <cstdlib>
@@ -28,12 +29,21 @@ bool directory_exists(const std::string& path) {
 // A directory that merely exists may still be unwritable: a copy unzipped into Program Files passes an
 // existence check and then every write fails. Ask for a real write before calling it usable.
 bool directory_writable(const std::string& path) {
-  const std::string probe = path + "\\.buffrx-write";
-  HANDLE file = CreateFileA(probe.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
-                            FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
-  if (file == INVALID_HANDLE_VALUE) return false;
-  CloseHandle(file);  // FILE_FLAG_DELETE_ON_CLOSE removes the probe
-  return true;
+  // Launches and media workers can check the same directory before single-instance arbitration.
+  // Each check owns its file; CREATE_NEW also preserves any file left by a reused process ID.
+  static std::atomic<unsigned long long> sequence{0};
+  for (int attempt = 0; attempt < 16; ++attempt) {
+    const std::string probe = path + "\\.buffrx-write-" + std::to_string(GetCurrentProcessId()) + "-" +
+                              std::to_string(sequence.fetch_add(1, std::memory_order_relaxed));
+    HANDLE file = CreateFileA(probe.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
+                              FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+    if (file != INVALID_HANDLE_VALUE) {
+      CloseHandle(file);  // FILE_FLAG_DELETE_ON_CLOSE removes the probe
+      return true;
+    }
+    if (GetLastError() != ERROR_FILE_EXISTS && GetLastError() != ERROR_ALREADY_EXISTS) return false;
+  }
+  return false;
 }
 
 bool ensure_directory(const std::string& path) {

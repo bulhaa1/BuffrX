@@ -74,9 +74,9 @@ Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExe}"; Tasks: startmenuicon
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\{#AppExe}"; Description: "Launch {#AppName}"; Flags: nowait postinstall
+Filename: "{app}\{#AppExe}"; Description: "Launch {#AppName}"; Flags: nowait postinstall skipifsilent
 ; A silent update passes /relaunch=1 so BuffrX comes back; a quiet install from anywhere else leaves it closed.
-Filename: "{app}\{#AppExe}"; Flags: nowait; Check: RelaunchAfterSilent
+Filename: "{app}\{#AppExe}"; Flags: nowait skipifnotsilent; Check: RelaunchAfterSilent
 
 [Code]
 function RelaunchAfterSilent: Boolean;
