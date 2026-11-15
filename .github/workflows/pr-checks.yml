@@ -4,6 +4,10 @@ on:
   pull_request:
   push:
     branches: [main]
+  workflow_dispatch:
+  schedule:
+    # Weekly clean build: no caches are restored, so a cache can never hide a broken build for long.
+    - cron: '17 4 * * 1'
 
 permissions:
   contents: read
@@ -39,7 +43,7 @@ jobs:
             foreach ($file in $files) {
               if ($file -match '^ui/') { $editor = $true; $build = $true }
               elseif ($file -match '^docs/protocol\.md$') { $native = $true }
-              elseif ($file -match '\.md$|^\.github/(ISSUE_TEMPLATE/|PULL_REQUEST_TEMPLATE\.md$)') { continue }
+              elseif ($file -match '\.md$|^\.github/(ISSUE_TEMPLATE/|PULL_REQUEST_TEMPLATE\.md$|dependabot\.yml$)') { continue }
               elseif ($file -match '^(src/|tests/|src-tauri/|src-share/|tools/|CMakeLists\.txt$|assets/|brand/)') {
                 $native = $true; $build = $true
               } else { $editor = $true; $native = $true; $build = $true }
@@ -51,16 +55,26 @@ jobs:
 
   docs:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
           persist-credentials: false
+      # Whitespace, public-document links, the privacy rules (no private files, machine paths, personal
+      # emails or credentials in anything tracked) and the installer's no-delete rule.
       - shell: pwsh
         run: |
           ./tools/test-whitespace.ps1
           ./tools/verify.ps1 -Area Docs
+      # Lints every workflow file, this one included. Pinned by release and hash.
+      - shell: bash
+        run: |
+          curl -fsSL -o actionlint.tgz https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
+          echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  actionlint.tgz" | sha256sum -c -
+          tar -xzf actionlint.tgz actionlint
+          ./actionlint -color
+          rm actionlint actionlint.tgz
 
   editor:
     needs: changes
@@ -77,6 +91,8 @@ jobs:
           cache: npm
           cache-dependency-path: ui/package-lock.json
       - run: npm ci --prefix ui
+      # Shipped code only: a known high-severity hole in a runtime dependency blocks the merge.
+      - run: npm audit --omit=dev --audit-level=high --prefix ui
       - shell: pwsh
         run: ./tools/verify.ps1 -Area Editor
 
@@ -97,6 +113,13 @@ jobs:
         run: ./tools/bootstrap-toolchain.ps1 -Minimal
       - shell: powershell
         run: ./tools/verify.ps1 -Area Native
+      - if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: native-test-logs
+          path: build-contrib/Testing/Temporary/
+          if-no-files-found: ignore
+          retention-days: 7
 
   build:
     needs: changes
@@ -113,11 +136,39 @@ jobs:
           cache: npm
           cache-dependency-path: ui/package-lock.json
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        if: github.event_name != 'schedule'
         with:
           path: |
             work/toolchain
             work/cargo/registry
           key: full-${{ runner.os }}-${{ hashFiles('tools/bootstrap-toolchain.ps1', 'tools/bootstrap-rust.ps1', '**/Cargo.lock') }}
+      # Compiled output from the last merge to main: C++ objects (ccache) and the Rust dependency builds.
+      # Only main saves it, so a pull request can read it but never overwrites it. The weekly run skips it.
+      - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        if: github.event_name != 'schedule'
+        id: warm
+        with:
+          path: |
+            .ccache
+            src-share/target
+            src-tauri/target
+          key: warm-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', 'tools/bootstrap-rust.ps1') }}-${{ github.sha }}
+          restore-keys: |
+            warm-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', 'tools/bootstrap-rust.ps1') }}-
+            warm-${{ runner.os }}-
+      # If ccache cannot be installed the build simply runs without it.
+      - name: ccache
+        if: github.event_name != 'schedule'
+        continue-on-error: true
+        shell: powershell
+        run: |
+          choco install ccache --no-progress -y
+          if ($LASTEXITCODE -eq 0 -and (Get-Command ccache -ErrorAction SilentlyContinue)) {
+            "CMAKE_C_COMPILER_LAUNCHER=ccache" >> $env:GITHUB_ENV
+            "CMAKE_CXX_COMPILER_LAUNCHER=ccache" >> $env:GITHUB_ENV
+            "CCACHE_DIR=$env:GITHUB_WORKSPACE\.ccache" >> $env:GITHUB_ENV
+            "CCACHE_MAXSIZE=1G" >> $env:GITHUB_ENV
+          }
       - shell: powershell
         run: |
           ./tools/bootstrap-toolchain.ps1
@@ -127,6 +178,27 @@ jobs:
       - run: npm ci --prefix ui
       - shell: powershell
         run: ./tools/verify.ps1 -Area Build
+      # The sharing helper and the editor shell have their own Rust tests; the build alone never ran them.
+      - shell: powershell
+        run: ./tools/verify.ps1 -Area Rust
+      - uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        if: success() && github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.warm.outputs.cache-hit != 'true'
+        with:
+          path: |
+            .ccache
+            src-share/target
+            src-tauri/target
+          key: warm-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', 'tools/bootstrap-rust.ps1') }}-${{ github.sha }}
+      - if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: build-logs
+          path: |
+            build/CMakeFiles/CMakeError.log
+            build/CMakeFiles/CMakeOutput.log
+            build/Testing/Temporary/
+          if-no-files-found: ignore
+          retention-days: 7
 
   pr-gate:
     if: always()
@@ -145,6 +217,11 @@ jobs:
     steps:
       - shell: pwsh
         run: |
+          $summary = @('| Check | Needed | Result |', '|---|---|---|', "| changes | yes | $env:CHANGES |", "| docs | yes | $env:DOCS |")
+          foreach ($area in @('EDITOR', 'NATIVE', 'BUILD')) {
+            $summary += "| $($area.ToLower()) | $([Environment]::GetEnvironmentVariable("${area}_REQUIRED")) | $([Environment]::GetEnvironmentVariable($area)) |"
+          }
+          $summary >> $env:GITHUB_STEP_SUMMARY
           if ($env:CHANGES -ne 'success' -or $env:DOCS -ne 'success') { throw 'Required setup/docs job failed.' }
           foreach ($area in @('EDITOR', 'NATIVE', 'BUILD')) {
             $required = [Environment]::GetEnvironmentVariable("${area}_REQUIRED")

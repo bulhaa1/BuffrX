@@ -1,0 +1,24 @@
+name: Dependency audit
+
+# Known security advisories in the Rust crates BuffrX ships. Weekly, because an advisory can appear
+# against a lock file nobody has touched.
+on:
+  schedule:
+    - cron: '41 5 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cargo-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - run: cargo install cargo-audit --locked --version 0.23.0
+      - run: |
+          cargo audit --file src-share/Cargo.lock
+          cargo audit --file src-tauri/Cargo.lock

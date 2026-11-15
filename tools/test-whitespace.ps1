@@ -62,6 +62,7 @@ try {
   Assert-Check -Name 'clean committed PR range' -Pass $true -Event 'pull_request' -Base $base
   Git-Fixture -GitArguments @('checkout', '--quiet', '--detach', $base) | Out-Null
   Assert-Check -Name 'initial push root commit' -Pass $true -Event 'push' -Base ('0' * 40)
+  Assert-Check -Name 'scheduled run has no range to check' -Pass $true -Event 'schedule'
   Write-Host "Whitespace regression checks passed: $checks"
 } finally {
   Pop-Location
