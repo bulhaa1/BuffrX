@@ -100,7 +100,6 @@ bool http_get(const std::string& url, int timeout_ms, ULONGLONG deadline, size_t
     }
   }
   return true;
-}
 #else
   (void)deadline;
   body.clear();
