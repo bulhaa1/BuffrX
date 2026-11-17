@@ -24,7 +24,20 @@ Config apply_performance_plan(const Config& user, const PerformancePlan& plan) {
   out.scale_filter = plan.scale_filter;
   out.audio_tracks = plan.audio_tracks;
   out.separate_tracks = false;
-  out.audio_bitrate_kbps = plan.audio_bitrate_kbps;
+  // One track is the point of this mode for the legacy desktop mix. Automatic mode keeps its separation:
+  // the person asked for separate tracks in the editor, and the video preset must not silently merge them
+  // back into one desktop track. Its six encoders cost more; that is measured, not hidden (docs/measurement.md).
+  if (user.audio_capture_mode == "auto") {
+    out.audio_capture_mode = "auto";
+    out.audio_tracks = 6;
+    out.audio_bitrate_kbps = plan.audio_bitrate_kbps;
+  } else {
+    // Application capture would need the loopback off and several encoders, so the effective config records
+    // the desktop; the stored mode and routes are untouched and come back when the mode ends.
+    out.audio_capture_mode = "desktop";
+    out.audio_apps.clear();
+    out.audio_bitrate_kbps = plan.audio_bitrate_kbps;
+  }
   out.quality = "standard";
   out.peak_mode = "fixed";
   out.custom_kbps = plan.peak_kbps;

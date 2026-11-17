@@ -75,13 +75,16 @@ std::vector<std::string> keycaps(const std::string& chord);  // "Ctrl+Alt+1" →
 
 // A key pressed in the hotkey recorder. `waiting` while only modifiers are down; otherwise the chord
 // in the engine's format and, when it would fire while typing or takes more than three parts, the
-// problem to show.
+// problem to show. `lone_key` is true for a chord with no modifier (a warned-about single key).
 struct ChordCapture {
   bool waiting = true;
+  bool lone_key = false;
   std::string chord;
   std::string problem;
 };
 ChordCapture capture_chord(bool ctrl, bool alt, bool shift, bool win, unsigned virtual_key);
+// The line shown under a chosen lone key (no modifier): what that key costs. `virtual_key` is the key's own code.
+std::string lone_key_warning(unsigned virtual_key);
 // The modifiers held right now, e.g. "Ctrl+Alt", so the box shows the chord building up rather
 // than nothing until a letter arrives.
 std::string chord_preview(bool ctrl, bool alt, bool shift, bool win);
@@ -137,5 +140,25 @@ std::string record_hint(bool manual_active);
 // limits in MiB, and the quick clip's length in seconds. Shared so the two pages cannot disagree.
 std::vector<int> share_limit_choices();
 std::vector<int> quick_clip_choices();
+
+// The quick clip's row: every length it can offer, the one in force, and which choices the buffer cannot keep. A quick
+// clip is a save from the same ring, so a length longer than the buffer is offered greyed rather than chosen, and a
+// length that no longer fits falls to the closest listed length at or below the buffer. Showing the raw 90 next to a
+// 60 s buffer said it would keep 90.
+struct QuickClipRow {
+  std::vector<int> values;
+  std::vector<bool> unavailable;  // the buffer is not longer than this: drawn grey, never selectable
+  int selected = -1;              // -1: nothing in force (the buffer is too short for any listed length)
+};
+QuickClipRow quick_clip_row(int quick_clip_seconds, int buffer_seconds);
+
+// What a Quick clip press does with this buffer. seconds is a listed length no longer than the buffer, or 0 with a
+// refusal to show when the buffer is shorter than every listed length. A press must never save the whole buffer by
+// accident: 0 handed to the engine means the whole buffer (Save clip's job), so the press is refused and explained.
+struct QuickClipPress {
+  int seconds = 0;
+  std::string refusal;  // empty when the press saves
+};
+QuickClipPress quick_clip_press(int quick_clip_seconds, int buffer_seconds);
 
 }  // namespace bx::ui

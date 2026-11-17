@@ -74,6 +74,8 @@ list(REMOVE_ITEM ENGINE_SOURCES
   "${ROOT}/src/engine/crash_log.cpp"
   "${ROOT}/src/engine/rec_mark.cpp"
   "${ROOT}/src/engine/audio_sessions.cpp"
+  "${ROOT}/src/engine/audio_watch.cpp"
+  "${ROOT}/src/engine/process_audio_source.cpp"
   "${ROOT}/src/engine/process_tuning.cpp"
   "${ROOT}/src/engine/share.cpp"
   "${ROOT}/src/engine/link.cpp"

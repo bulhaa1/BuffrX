@@ -7,7 +7,7 @@
 # tools/prepare-linux-runtime.sh, which fetches the Ubuntu OBS packages without root.
 set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
-version="${1:-0.5.0}"
+version="${1:-$(sed -n 's/^#define BUFFRX_VERSION "\(.*\)"/\1/p' "$root/src/version.h")}"
 appdir="$root/work/BuffrX.AppDir"
 out="$root/dist/BuffrX-${version}-x86_64.AppImage"
 runtime="$root/work/linux-app/usr/lib/buffrx"

@@ -88,6 +88,10 @@ public:
   // Turns the Timeline dedupe on: the video keyframes are hashed as they arrive. `other` leaves it off. Before the first packet.
   void configure_dedupe(HashCodec codec) { hash_codec_ = static_cast<int>(codec); }
   bool dedupe_enabled() const { return hash_codec_.load() != static_cast<int>(HashCodec::other); }
+  uint16_t oldest_epoch() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return index_.oldest_epoch(epoch_);
+  }
 
   void enable_disk(const DiskSetup& setup) {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -100,9 +104,41 @@ public:
     if (ceiling_bytes_ > 0) ceiling_bytes_ = std::max<int64_t>(ceiling_bytes_, 2 * kSpillBlockBytes);
   }
 
+  // An encoder swap (plan 008): the packets that follow belong to a new epoch. Packets are never dropped for it; only the clock is looked at.
+  // The new encoder's first packet may come with a clock of its own, so the epoch's packets are moved to where the old epoch's footage ended
+  // plus the time the swap really took (the system clock, which no encoder resets): the index, the time budget and the save's cut all
+  // assume the time only goes forward. The packets themselves are untouched; a part is zeroed on its own when it is written.
+  void begin_epoch(uint16_t epoch) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    epoch_ = epoch;
+    epoch_shift_pending_ = true;
+    // The chunk files of the old epoch end at the swap (Timeline's segment closes with it); nothing new may rely on them.
+    probes_.erase(std::remove_if(probes_.begin(), probes_.end(), [](const Probe& probe) { return !probe.link.linked; }), probes_.end());
+    for (Probe& probe : probes_) probe.usable = false;
+    rebuild_cover_locked();
+  }
+  // What the last begin_epoch worked out, for the log: the shift applied and the gap the swap left (microseconds on the system clock).
+  struct EpochJoin {
+    int64_t shift_us = 0;
+    int64_t gap_us = 0;
+    int64_t first_dts_us = 0;
+    int64_t prev_last_dts_us = 0;
+    bool known = false;
+  };
+  EpochJoin last_epoch_join() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return join_;
+  }
+
   // Everything released and the disk tier off: the ring starts again from nothing.
   void reset() {
     std::lock_guard<std::mutex> lock(mutex_);
+    epoch_ = 0;
+    epoch_shift_pending_ = false;
+    epoch_shift_us_ = 0;
+    last_pushed_dts_ = 0;
+    last_pushed_sys_ = 0;
+    join_ = EpochJoin{};
     for (Packet& packet : packets_) Ops::release(packet);
     packets_.clear();
     index_.clear();
@@ -122,6 +158,7 @@ public:
     RingEntry entry;
     entry.dts_usec = fields.dts_usec;
     entry.size = fields.size;
+    entry.epoch = 0;  // set under the lock below, with the epoch's clock
     entry.video_keyframe = fields.video && fields.keyframe;
     entry.video = fields.video;
     entry.track = static_cast<uint8_t>(fields.track);
@@ -130,6 +167,25 @@ public:
     const HashCodec codec = static_cast<HashCodec>(hash_codec_.load());
     if (entry.video_keyframe && codec != HashCodec::other) digest = vcl_digest(codec, fields.data, fields.size, 0);
     std::lock_guard<std::mutex> lock(mutex_);
+    if (epoch_shift_pending_) {
+      // The first packet of a new epoch: where the old one's footage ended, plus the real time the swap took.
+      epoch_shift_pending_ = false;
+      if (last_pushed_dts_ != 0 || last_pushed_sys_ != 0) {
+        const int64_t gap = fields.sys_dts_usec != 0 && last_pushed_sys_ != 0 ? std::max<int64_t>(0, fields.sys_dts_usec - last_pushed_sys_) : 0;
+        epoch_shift_us_ = last_pushed_dts_ + gap - fields.dts_usec;
+        join_.known = true;
+        join_.gap_us = gap;
+        join_.first_dts_us = fields.dts_usec;
+        join_.prev_last_dts_us = last_pushed_dts_;
+        join_.shift_us = epoch_shift_us_;
+      } else {
+        epoch_shift_us_ = 0;
+      }
+    }
+    entry.epoch = epoch_;
+    entry.dts_usec += epoch_shift_us_;
+    last_pushed_dts_ = entry.dts_usec;
+    last_pushed_sys_ = fields.sys_dts_usec;
     index_.room_for(entry, max_time_us_, ceiling_bytes_);
     for (size_t i = 0, drop = index_.removed_ram(); i < drop && !packets_.empty(); ++i) {
       Ops::release(packets_.front());
@@ -141,7 +197,7 @@ public:
     total_bytes_ += fields.size;
     if (entry.video_keyframe && codec != HashCodec::other) {
       // A keyframe whose hash could not be taken still counts as a place in the ring; it matches nothing.
-      keys_.push_back(RingKey{seq, fields.dts_usec, digest.ok ? digest.hash : 0, digest.ok ? digest.bytes : 0});
+      keys_.push_back(RingKey{seq, entry.dts_usec, digest.ok ? digest.hash : 0, digest.ok ? digest.bytes : 0});
     }
     while (!keys_.empty() && keys_.front().seq < index_.first_video_seq()) keys_.pop_front();
     due_ = index_.spill_due(start_bytes_);
@@ -566,6 +622,12 @@ private:
   std::vector<Probe> probes_;     // the probed chunks, oldest first
   uint32_t next_chunk_id_ = 1;
   uint64_t linked_at_seq_ = 0;    // the ring's end the chunks were last matched at
+  uint16_t epoch_ = 0;
+  bool epoch_shift_pending_ = false;
+  int64_t epoch_shift_us_ = 0;    // added to the index's clock for the packets of this epoch
+  int64_t last_pushed_dts_ = 0;   // the last packet's time on the index's clock and on the system clock
+  int64_t last_pushed_sys_ = 0;
+  EpochJoin join_;
 };
 
 }  // namespace bx

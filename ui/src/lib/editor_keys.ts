@@ -111,7 +111,7 @@ export const SHORTCUTS: { group: string; items: Shortcut[] }[] = [
       { keys: 'Shift+Left / Right', label: 'Back or forward 5 s', action: 'back5', press: { key: 'ArrowLeft', shiftKey: true } },
       { keys: ', / .', label: 'One frame back or forward', action: 'frameBack', press: { key: ',' } },
       { keys: 'Up / Down', label: 'Previous or next clip', action: 'previousClip', press: { key: 'ArrowUp' } },
-      { keys: 'Home / End', label: 'Clip start or end', action: 'clipStart', press: { key: 'Home' } },
+      { keys: 'Home / End', label: 'Start or end of the selection, or of the clip', action: 'clipStart', press: { key: 'Home' } },
       { keys: 'Ctrl+Home / End', label: 'Sequence start or end', action: 'sequenceStart', press: { key: 'Home', ctrlKey: true } },
     ],
   },

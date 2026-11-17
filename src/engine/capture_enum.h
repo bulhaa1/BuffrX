@@ -72,6 +72,10 @@ bool window_id_is_own_process(const std::string& id);
 // Best-effort client size of a configured window id, before the capture source exists.
 bool find_window_size(const std::string& wanted_id, int& width, int& height);
 
+// The monitor a configured window sits on (its GDI device name), for the log: a window capture's picture comes
+// from the card that drives that screen, which is not always the card the device was built on.
+bool window_monitor_device(const std::string& wanted_id, std::string& device);
+
 // Load-time reality check for the persisted capture target. A saved window or game that no longer
 // exists, or that resolves to this process, flips `capture_mode` to "display" (the dead id is kept
 // so the user can see what it was) and fills `reason`. Returns true when nothing changed.

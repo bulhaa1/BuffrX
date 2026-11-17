@@ -11,6 +11,8 @@
 
 #include <windows.h>
 
+#include "hotkey_rules.h"
+
 #include <functional>
 #include <map>
 #include <string>
@@ -29,8 +31,10 @@ struct HotkeyBinding {
   std::string problem;
 };
 
-// Parses a chord like "Alt+C" or "Ctrl+Shift+F10" into modifiers and a virtual key.
+// Parses a chord like "Alt+C", "Ctrl+Shift+F10" or "F8" into modifiers and a virtual key.
 bool parse_chord(const std::string& chord, UINT& modifiers, UINT& virtual_key, std::string& problem);
+// A hotkey with no modifier fires in every app, gaming included. Only keys that are not part of typing may be
+// bound alone, and hotkey_rules.h holds that rule for both platforms.
 std::string format_chord(UINT modifiers, UINT virtual_key);
 
 // WTS_SESSION_LOCK and WTS_SESSION_UNLOCK, named here because this header cannot take wtsapi32.h.

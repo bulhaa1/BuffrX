@@ -120,6 +120,7 @@ export function Editor({ initialFiles }: { initialFiles?: string[] } = {}) {
           height: details.height,
           fps: details.fps,
           bytes: details.bytes,
+          modified: details.modified,
           audio: details.audio,
         }), list[0])])
       } catch (error) {
@@ -156,7 +157,7 @@ export function Editor({ initialFiles }: { initialFiles?: string[] } = {}) {
         if (stopped()) return
         if (!details.ok || details.duration <= 0) throw new Error(details.error ?? 'The Timeline footage could not be read')
         entry = { ...newClip({ path, name: id, duration: details.duration, width: details.width,
-          height: details.height, fps: details.fps, bytes: details.bytes, audio: details.audio }), timelineSession: id }
+          height: details.height, fps: details.fps, bytes: details.bytes, modified: details.modified, audio: details.audio }), timelineSession: id }
         known.current.add(key)
       }
       loadedSessions.current.add(id)
@@ -341,11 +342,12 @@ export function Editor({ initialFiles }: { initialFiles?: string[] } = {}) {
               onBrowse={() => void choose()}
               onForget={forgetClip}
               onExportingChange={setExporting}
+              onShared={closeEditor}
             />
           </div>
           {shot && (
             <ImageEditor key={shot} path={shot} clipsDir={config?.clipsDir ?? ''} hover={hover || dragging} clips={clips.length} onDirtyChange={setShotDirty}
-              onBack={() => leaving(leaveShot)} />
+              onBack={() => leaving(leaveShot)} onShared={closeEditor} />
           )}
         </div>
       </div>

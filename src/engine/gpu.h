@@ -17,6 +17,10 @@ std::string gpu_vendor_from_id(uint32_t vendor_id);
 // rather than guessed.
 bool gpu_adapter(uint32_t& vendor_id, std::string& name);
 
+// Adapter 0's user-mode driver version as "a.b.c.d", empty when DXGI will not say. A reset or a driver update changes
+// what an encoder can do, so what BuffrX learned about it is keyed by this.
+std::string gpu_driver_version();
+
 // One DXGI adapter: its index, its own memory, whether it is the software renderer, and the displays
 // (\\.\DISPLAY1) attached to it.
 struct GpuAdapterInfo {
@@ -24,6 +28,15 @@ struct GpuAdapterInfo {
   uint64_t dedicated_bytes = 0;
   bool software = false;
   std::vector<std::string> outputs;
+  // The output list was actually read to its end. An enumeration that failed is not an empty list: it says
+  // nothing about which screens the adapter drives, and the display follow check must not read a missing name
+  // as proof that a screen is gone. A card with genuinely no outputs still sets this (the list is complete).
+  bool outputs_known = false;
+  // For the compatibility report (plan 009): ids, name and user-mode driver version as DXGI gives them.
+  uint32_t vendor_id = 0;
+  uint32_t device_id = 0;
+  std::string name;
+  std::string driver;
 };
 std::vector<GpuAdapterInfo> gpu_adapters();
 

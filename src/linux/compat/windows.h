@@ -129,6 +129,7 @@ using LRESULT = intptr_t;
 #define ERROR_PATH_NOT_FOUND 3L
 #define ERROR_ACCESS_DENIED 5L
 #define ERROR_ALREADY_EXISTS 183L
+#define ERROR_FILE_EXISTS 80L
 #define ERROR_CANCELLED 1223L
 #define ERROR_PIPE_BUSY 231L
 #define ERROR_SHARING_VIOLATION 32L
@@ -178,6 +179,7 @@ using LRESULT = intptr_t;
 #define MOVEFILE_COPY_ALLOWED 0x2
 #define MOVEFILE_WRITE_THROUGH 0x8
 #define CREATE_NO_WINDOW 0x08000000
+#define CREATE_NEW_PROCESS_GROUP 0x00000200
 #define BELOW_NORMAL_PRIORITY_CLASS 0x00004000
 #define STARTF_USESTDHANDLES 0x00000100
 #define STD_INPUT_HANDLE ((DWORD)-10)
@@ -326,6 +328,14 @@ struct WIN32_FILE_ATTRIBUTE_DATA {
   DWORD dwFileAttributes = 0;
   FILETIME ftCreationTime{}, ftLastAccessTime{}, ftLastWriteTime{};
   DWORD nFileSizeHigh = 0, nFileSizeLow = 0;
+};
+struct BY_HANDLE_FILE_INFORMATION {
+  DWORD dwFileAttributes = 0;
+  FILETIME ftCreationTime{}, ftLastAccessTime{}, ftLastWriteTime{};
+  DWORD dwVolumeSerialNumber = 0;
+  DWORD nFileSizeHigh = 0, nFileSizeLow = 0;
+  DWORD nNumberOfLinks = 0;
+  DWORD nFileIndexHigh = 0, nFileIndexLow = 0;
 };
 struct WIN32_FIND_DATAA {
   DWORD dwFileAttributes = 0;
@@ -799,6 +809,28 @@ inline BOOL GetFileAttributesExA(LPCSTR path, int, WIN32_FILE_ATTRIBUTE_DATA* da
 }
 inline BOOL GetFileAttributesExW(LPCWSTR path, int level, WIN32_FILE_ATTRIBUTE_DATA* data) {
   return GetFileAttributesExA(bx_wide_to_utf8(path).c_str(), level, data);
+}
+
+// The identity and stamp of an open file. Windows hands this out for a file that is still being written;
+// on POSIX the same answer is fstat() on the descriptor behind the handle.
+inline BOOL GetFileInformationByHandle(HANDLE handle, BY_HANDLE_FILE_INFORMATION* info) {
+  auto* h = bxposix::as(handle);
+  if (!h || h->kind != bxposix::HandleKind::File || !info) return FALSE;
+  struct stat st{};
+  if (fstat(h->fd, &st) != 0) return FALSE;
+  info->dwFileAttributes = S_ISDIR(st.st_mode) ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_ARCHIVE;
+  bx_unix_to_filetime(st.st_ctime, info->ftCreationTime);
+  bx_unix_to_filetime(st.st_atime, info->ftLastAccessTime);
+  bx_unix_to_filetime(st.st_mtime, info->ftLastWriteTime);
+  info->dwVolumeSerialNumber = static_cast<DWORD>(st.st_dev);
+  const uint64_t size = static_cast<uint64_t>(st.st_size);
+  info->nFileSizeHigh = static_cast<DWORD>(size >> 32);
+  info->nFileSizeLow = static_cast<DWORD>(size & 0xFFFFFFFFu);
+  info->nNumberOfLinks = static_cast<DWORD>(st.st_nlink);
+  const uint64_t inode = static_cast<uint64_t>(st.st_ino);
+  info->nFileIndexHigh = static_cast<DWORD>(inode >> 32);
+  info->nFileIndexLow = static_cast<DWORD>(inode & 0xFFFFFFFFu);
+  return TRUE;
 }
 enum { GetFileExInfoStandard = 0 };
 inline DWORD GetFileAttributesA(LPCSTR path) {
@@ -1746,6 +1778,11 @@ inline void DebugBreak() { __builtin_trap(); }
 #define VK_NUMPAD7 0x67
 #define VK_NUMPAD8 0x68
 #define VK_NUMPAD9 0x69
+#define VK_MULTIPLY 0x6A
+#define VK_ADD 0x6B
+#define VK_SUBTRACT 0x6D
+#define VK_DECIMAL 0x6E
+#define VK_DIVIDE 0x6F
 #define VK_F1 0x70
 #define VK_F2 0x71
 #define VK_F3 0x72

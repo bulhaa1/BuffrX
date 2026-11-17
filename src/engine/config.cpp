@@ -1,5 +1,5 @@
 #include "config.h"
-#include "encoder_governor.h"
+#include "audio_routing.h"
 #include "encoder_settings.h"
 #include "game_watch.h"
 #include "media_math.h"
@@ -10,6 +10,7 @@
 #include <shlobj.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cmath>
 #include <cstdlib>
@@ -28,12 +29,21 @@ bool directory_exists(const std::string& path) {
 // A directory that merely exists may still be unwritable: a copy unzipped into Program Files passes an
 // existence check and then every write fails. Ask for a real write before calling it usable.
 bool directory_writable(const std::string& path) {
-  const std::string probe = path + "\\.buffrx-write";
-  HANDLE file = CreateFileA(probe.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
-                            FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
-  if (file == INVALID_HANDLE_VALUE) return false;
-  CloseHandle(file);  // FILE_FLAG_DELETE_ON_CLOSE removes the probe
-  return true;
+  // Launches and media workers can check the same directory before single-instance arbitration.
+  // Each check owns its file; CREATE_NEW also preserves any file left by a reused process ID.
+  static std::atomic<unsigned long long> sequence{0};
+  for (int attempt = 0; attempt < 16; ++attempt) {
+    const std::string probe = path + "\\.buffrx-write-" + std::to_string(GetCurrentProcessId()) + "-" +
+                              std::to_string(sequence.fetch_add(1, std::memory_order_relaxed));
+    HANDLE file = CreateFileA(probe.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
+                              FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+    if (file != INVALID_HANDLE_VALUE) {
+      CloseHandle(file);  // FILE_FLAG_DELETE_ON_CLOSE removes the probe
+      return true;
+    }
+    if (GetLastError() != ERROR_FILE_EXISTS && GetLastError() != ERROR_ALREADY_EXISTS) return false;
+  }
+  return false;
 }
 
 bool ensure_directory(const std::string& path) {
@@ -92,7 +102,85 @@ void strings_from_json(const Json& json, std::vector<std::string>& values) {
   }
 }
 
+// The application routes ride in the config file and on the pipe as one array of objects. Normalizing on
+// the way in keeps a hand-edited duplicate from building an encoder nobody reads, and keeps every entry a
+// legacy file holds (up to the stored ceiling): the four slots are chosen from the list, never by deleting
+// what is beyond them here.
+void audio_apps_from_json(const Json& json, std::vector<AudioApp>& apps) {
+  if (!json.is_array()) return;
+  std::vector<AudioApp> parsed;
+  for (const Json& item : json.items()) {
+    if (!item.is_object()) continue;
+    AudioApp app;
+    app.window = item["window"].as_string();
+    app.exe = item["exe"].as_string();
+    app.title = item["title"].as_string();
+    app.kind = item["kind"].as_string();
+    app.track = static_cast<int>(item["track"].as_int(2));
+    // Missing in every file written before faders existed: 1.0 and unmuted, exactly as those files recorded.
+    app.volume = audio_app_volume(item["volume"].as_double(1.0));
+    app.muted = item["muted"].as_bool(false);
+    parsed.push_back(std::move(app));
+  }
+  apps = normalize_audio_apps(parsed);
+}
+
+// Automatic mode's per-program controls (audio_auto.h). The object is keyed by the lower-case executable,
+// and a patch merges field by field: a client that changes one fader must not wipe another program's saved
+// mute or exclusion. Legacy pin fields are ignored.
+Json audio_prefs_to_json(const std::map<std::string, AutoAudioPref>& prefs) {
+  Json out = Json::object();
+  for (const auto& [key, pref] : prefs) {
+    Json entry = Json::object();
+    entry.set("volume", Json(auto_volume(pref.volume)));
+    entry.set("muted", Json(pref.muted));
+    entry.set("excluded", Json(pref.excluded));
+    out.set(key, entry);
+  }
+  return out;
+}
+
+void audio_prefs_from_json(const Json& json, std::map<std::string, AutoAudioPref>& prefs) {
+  if (!json.is_object()) return;
+  for (const auto& [raw_key, value] : json.fields()) {
+    const std::string key = auto_pref_key(raw_key);
+    if (key.empty()) continue;
+    AutoAudioPref& pref = prefs[key];
+    if (!value.is_object()) continue;
+    if (value.has("volume")) pref.volume = auto_volume(value["volume"].as_double(pref.volume));
+    if (value.has("muted")) pref.muted = value["muted"].as_bool(pref.muted);
+    if (value.has("excluded")) pref.excluded = value["excluded"].as_bool(pref.excluded);
+  }
+}
+
+// A program's saved route seeds its automatic preference once. Additive: a preference the file already
+// carries keeps every field, so seeding never overwrites a choice made in automatic mode.
+void seed_audio_apps_prefs(const std::vector<AudioApp>& apps, std::map<std::string, AutoAudioPref>& prefs) {
+  for (const AudioApp& app : apps) {
+    const std::string key = auto_pref_key(app.exe);
+    if (key.empty() || prefs.count(key) != 0) continue;
+    AutoAudioPref pref;
+    pref.volume = auto_volume(app.volume);
+    pref.muted = app.muted;
+    prefs[key] = pref;
+  }
+}
+
+// Automatic capture routes programs by Windows' audio-session events and captures them by process
+// loopback (audio_watch.h). The Linux port records the desktop and the microphone, so a file that asks
+// for automatic capture records the desktop there rather than silence.
+constexpr bool kAutoAudioSupported =
+#ifdef _WIN32
+    true;
+#else
+    false;
+#endif
+
 }  // namespace
+
+Json auto_audio_prefs_json(const std::map<std::string, AutoAudioPref>& prefs) {
+  return audio_prefs_to_json(prefs);
+}
 
 bool resolve_data_root(std::string& data_root, bool& portable) {
   const std::string exe_dir = executable_directory();
@@ -122,28 +210,6 @@ void apply_path_defaults(Config& config, const std::string& data_root) {
   if (!read_known_folder(FOLDERID_Videos, videos)) videos = data_root + "\\media";
   if (config.clips_dir.empty()) config.clips_dir = videos + "\\BuffrX";
   if (config.screenshots_dir.empty()) config.screenshots_dir = config.clips_dir + "\\Screenshots";
-}
-
-CanvasPlan plan_canvas(const Config& config, int target_width, int target_height) {
-  // A size counts only as a complete pair of positive dimensions: half a size is a mistake, not a
-  // request for the other half to be guessed.
-  const bool target_known = target_width > 0 && target_height > 0;
-  const bool configured = config.output_width > 0 && config.output_height > 0;
-
-  CanvasPlan plan;
-  if (target_known) {
-    plan.canvas_width = target_width;
-    plan.canvas_height = target_height;
-  } else if (configured) {
-    plan.canvas_width = config.output_width;
-    plan.canvas_height = config.output_height;
-  } else {
-    plan.canvas_width = 1920;
-    plan.canvas_height = 1080;
-  }
-  plan.output_width = configured ? config.output_width : plan.canvas_width;
-  plan.output_height = configured ? config.output_height : plan.canvas_height;
-  return plan;
 }
 
 void encoder_size(int output_width, int output_height, int canvas_width, int canvas_height, int& width, int& height) {
@@ -204,7 +270,7 @@ Json config_to_json(const Config& c) {
   json.set("custom_kbps", Json(c.custom_kbps));
   json.set("video_preset", Json(c.video_preset));
   json.set("keyframe_seconds", Json(c.keyframe_seconds));
-  json.set("encoder_speed_step", Json(c.encoder_speed_step));
+  // encoder_speed_step is read only so it can be ignored and cleared, and never written: the controller's memory is capacity.json.
   json.set("encoder_mode", Json(c.encoder_mode));
   json.set("display_method", Json(c.display_method));
   json.set("scale_filter", Json(c.scale_filter));
@@ -232,6 +298,13 @@ Json config_to_json(const Config& c) {
   json.set("separate_tracks", Json(c.separate_tracks));
   json.set("audio_tracks", Json(c.audio_tracks));
   json.set("audio_bitrate_kbps", Json(c.audio_bitrate_kbps));
+  json.set("audio_capture_mode", Json(c.audio_capture_mode));
+  json.set("audio_capture_legacy_mode", Json(c.audio_capture_legacy_mode));
+  json.set("audio_apps", audio_apps_json(c.audio_apps));
+  json.set("audio_apps_chosen", Json(c.audio_apps_chosen));
+  json.set("audio_app_prefs", audio_prefs_to_json(c.audio_app_prefs));
+  json.set("audio_other_volume", Json(auto_volume(c.audio_other_volume)));
+  json.set("audio_other_muted", Json(c.audio_other_muted));
   json.set("hotkey_save", Json(c.hotkey_save));
   json.set("hotkey_quick", Json(c.hotkey_quick));
   json.set("hotkey_screenshot", Json(c.hotkey_screenshot));
@@ -271,10 +344,12 @@ Json config_to_json(const Config& c) {
   json.set("pause_on_battery", Json(c.pause_on_battery));
   json.set("crash_recovery", Json(c.crash_recovery));
   json.set("codec_auto_picked", Json(c.codec_auto_picked));
+  json.set("codec_h264_default_migrated", Json(c.codec_h264_default_migrated));
   json.set("chunk_seconds", Json(c.chunk_seconds));
   json.set("recordings_budget_gb", Json(c.recordings_budget_gb));
   json.set("min_free_gb", Json(c.min_free_gb));
   json.set("auto_game_capture", Json(c.auto_game_capture));
+  json.set("game_only", Json(c.game_only));
   json.set("game_exclusions", strings_to_json(c.game_exclusions));
   json.set("active_profile", Json(c.active_profile));
   json.set("config_version", Json(c.config_version));
@@ -297,10 +372,40 @@ void config_apply_audio(const Json& j, Config& c) {
   if (j.has("mic_noise_suppress")) c.mic_noise_suppress = j["mic_noise_suppress"].as_bool(c.mic_noise_suppress);
   if (j.has("mic_noise_gate")) c.mic_noise_gate = j["mic_noise_gate"].as_bool(c.mic_noise_gate);
   if (j.has("audio_bitrate_kbps")) c.audio_bitrate_kbps = static_cast<int>(j["audio_bitrate_kbps"].as_int(c.audio_bitrate_kbps));
+  if (j.has("audio_capture_mode")) {
+    const std::string mode = j["audio_capture_mode"].as_string(c.audio_capture_mode);
+    if (mode == "desktop" || mode == "apps" || mode == "auto") c.audio_capture_mode = mode;  // an unknown mode changes nothing
+    if (c.audio_capture_mode == "auto" && !kAutoAudioSupported) c.audio_capture_mode = "desktop";
+  }
+  if (j.has("audio_app_prefs")) audio_prefs_from_json(j["audio_app_prefs"], c.audio_app_prefs);
+  if (j.has("audio_other_volume")) c.audio_other_volume = auto_volume(j["audio_other_volume"].as_double(c.audio_other_volume));
+  if (j.has("audio_other_muted")) c.audio_other_muted = j["audio_other_muted"].as_bool(c.audio_other_muted);
+  if (j.has("audio_apps")) audio_apps_from_json(j["audio_apps"], c.audio_apps);
+  if (j.has("apps")) audio_apps_from_json(j["apps"], c.audio_apps);
+  // Writing the list at all is a choice, including writing it empty. That is what lets the page tell a
+  // first-ever selection from a list the person emptied on purpose. An explicit flag wins, so a stored
+  // file keeps the answer it was saved with.
+  const bool apps_written = j.has("audio_apps") || j.has("apps");
+  if (j.has("audio_apps_chosen")) c.audio_apps_chosen = j["audio_apps_chosen"].as_bool(c.audio_apps_chosen);
+  else if (apps_written) c.audio_apps_chosen = true;
   c.audio_tracks = std::clamp(c.audio_tracks, 1, 6);
   c.desktop_volume = std::clamp(c.desktop_volume, 0.0, 1.0);
   c.mic_volume = std::clamp(c.mic_volume, 0.0, 1.0);
   c.mic_gain_db = std::clamp(c.mic_gain_db, -12, 20);
+  c.audio_other_volume = auto_volume(c.audio_other_volume);
+}
+
+int quick_clip_for_buffer(int chosen_seconds, int buffer_seconds) {
+  // 0 is not a length and not "off": a Quick clip is always on, so a value left behind by a buffer that was too short
+  // is answered like any other invalid one - the closest listed length shorter than the buffer. That gives the row, the
+  // tray and the hotkey a length again when the buffer grows, instead of leaving them with nothing.
+  int best = 0;
+  for (int choice : kQuickClipChoices) {
+    if (choice >= buffer_seconds) break;  // sorted: a quick clip is shorter than the buffer, so a choice equal to it is out too
+    best = choice;
+    if (choice == chosen_seconds) return choice;  // the chosen length is listed and fits inside the buffer
+  }
+  return best;
 }
 
 void config_from_json(const Json& j, Config& c) {
@@ -465,6 +570,7 @@ void config_from_json(const Json& j, Config& c) {
   if (j.has("notification_sound")) c.notification_sound = j["notification_sound"].as_bool(c.notification_sound);
   if (j.has("notify_sound_while_recording")) c.notify_sound_while_recording = j["notify_sound_while_recording"].as_bool(c.notify_sound_while_recording);
   if (j.has("codec_auto_picked")) c.codec_auto_picked = j["codec_auto_picked"].as_bool(c.codec_auto_picked);
+  if (j.has("codec_h264_default_migrated")) c.codec_h264_default_migrated = j["codec_h264_default_migrated"].as_bool(c.codec_h264_default_migrated);
   if (j.has("notify_over_fullscreen")) c.notify_over_fullscreen = j["notify_over_fullscreen"].as_bool(c.notify_over_fullscreen);
   if (j.has("performance_games")) {
     std::vector<std::string> listed;
@@ -496,21 +602,25 @@ void config_from_json(const Json& j, Config& c) {
         std::clamp<int64_t>(j["recordings_budget_gb"].as_int(c.recordings_budget_gb), 0, 10000));
   if (j.has("min_free_gb")) c.min_free_gb = static_cast<int>(j["min_free_gb"].as_int(c.min_free_gb));
   if (j.has("auto_game_capture")) c.auto_game_capture = j["auto_game_capture"].as_bool(c.auto_game_capture);
+  if (j.has("game_only")) c.game_only = j["game_only"].as_bool(c.game_only);
   if (j.has("game_exclusions")) strings_from_json(j["game_exclusions"], c.game_exclusions);
   if (j.has("active_profile")) c.active_profile = static_cast<int>(j["active_profile"].as_int(c.active_profile));
   if (j.has("config_version")) c.config_version = static_cast<int>(j["config_version"].as_int(c.config_version));
   // Kept inside what the engine can do, whoever wrote the value. A buffer of 99999 s or 0 fps is not a
   // setting, it is a file someone edited by hand, and the engine must still start.
   c.buffer_seconds = std::clamp(c.buffer_seconds, kBufferSecondsMin, kBufferSecondsMax);
-  c.quick_clip_seconds = std::clamp(c.quick_clip_seconds, 5, 1800);
+  c.quick_clip_seconds = std::clamp(c.quick_clip_seconds, 0, 1800);
+  // A quick clip is a save from the same ring, so it never exceeds the buffer and is always one of the lengths the row
+  // offers. A buffer that shrinks (or a profile that applies one) moves the quick clip to the closest listed length at
+  // or below it here, once, so the row, the tray menu and the hotkey all agree. 0 means the buffer is too short for any
+  // of them; a buffer that grows again gets a listed length back from quick_clip_for_buffer.
+  c.quick_clip_seconds = quick_clip_for_buffer(c.quick_clip_seconds, c.buffer_seconds);
   c.capture_fps = std::clamp(c.capture_fps, 1, 240);
   c.keyframe_seconds = std::clamp(c.keyframe_seconds, 1, 10);
   c.chunk_seconds = chunk_seconds_clamped(c.chunk_seconds, c.keyframe_seconds);
   c.min_free_gb = std::clamp(c.min_free_gb, 0, 1000);
-  // The ladder goes past the encoder rungs: 4 is 60 fps and 5 is 30, and a machine that settled there must
-  // start there again. Clamping to kMaxGovernorStep turned a remembered 4 or 5 into a rebuild of the same
-  // encoder at the next launch, which threw away exactly what the memory was for.
-  c.encoder_speed_step = std::clamp(c.encoder_speed_step, 0, buffrx::kMaxReliefStep);
+  // An older version stored a step 1-5 here (the controller reads it once as the level to start at, and no longer writes it).
+  c.encoder_speed_step = std::clamp(c.encoder_speed_step, 0, 5);
   if (c.custom_kbps != 0) c.custom_kbps = std::clamp(c.custom_kbps, 1000, 200000);
   // A size no device can make fails every video variant in turn, and the engine then cannot start -
   // which is also when there is no interface left to fix the file with. Zero still means the native
@@ -519,11 +629,18 @@ void config_from_json(const Json& j, Config& c) {
   c.output_height = std::clamp(c.output_height, 0, 7680) & ~1;
   c.share_limit_mib = std::clamp(c.share_limit_mib, 5, 500);
   c.share_upload_kbps = std::clamp(c.share_upload_kbps, 0, 1000000);
+  // A profile or an older file can still carry the mode, and the Linux port has no automatic router.
+  if (c.audio_capture_mode == "auto" && !kAutoAudioSupported) c.audio_capture_mode = "desktop";
 }
 
 bool load_config(const std::string& path, Config& config, std::string& error) {
   FILE* file = std::fopen(path.c_str(), "rb");
-  if (!file) return true;  // first run: defaults stand
+  if (!file) {
+    // First run: automatic capture is the normal mode where it exists. A directly constructed Config
+    // keeps the old desktop default so callers and tests that mean "legacy desktop" still say so.
+    config.audio_capture_mode = kAutoAudioSupported ? "auto" : "desktop";
+    return true;
+  }  // first run: defaults stand
   std::string text;
   char buffer[4096];
   size_t read = 0;
@@ -544,11 +661,14 @@ bool load_config(const std::string& path, Config& config, std::string& error) {
   }
   config.config_version = 1;  // a file with no version predates versioning
   config_from_json(json, config);
-  migrate_config(config);
+  // A file that already carries a valid recording mode already made that choice: hand-edited, written by a
+  // newer build then downgraded, or saved by a client. Only an absent or unknown value lets the migration guess.
+  const std::string stored_mode = json["audio_capture_mode"].as_string();
+  migrate_config(config, stored_mode == "desktop" || stored_mode == "apps");
   return true;
 }
 
-void migrate_config(Config& config) {
+void migrate_config(Config& config, bool mode_stored) {
   if (config.config_version < 2) {
     if (config.container == "mkv") config.container = "mp4";
     if (config.hotkey_save == "Alt+C") config.hotkey_save = "Alt+1";
@@ -575,6 +695,34 @@ void migrate_config(Config& config) {
   if (config.config_version < 8 && config.hotkey_record_pad.empty() && config.hotkey_toggle_ui_pad == "Pad:VIEW+MENU") {
     config.hotkey_record_pad = "Pad:VIEW+MENU";
     config.hotkey_toggle_ui_pad = "Pad:Y+VIEW";
+  }
+  // Version 10: what to record. A file that already carries application routes recorded them until now,
+  // so it starts in "apps"; a file without them starts in "desktop". The routes themselves are untouched.
+  // A file that already stores a valid mode made that choice, even under an older version (written by a
+  // newer build, a profile or a hand edit), and that choice is never overwritten.
+  if (config.config_version < 10 && !mode_stored) {
+    config.audio_capture_mode = config.audio_apps.empty() ? "desktop" : "apps";
+  }
+  // Version 12: whether an application selection was ever made. Kept for compatibility with files that carry
+  // it; a selection is never seeded from it, so this no longer changes what the page shows or records.
+  if (config.config_version < 12) {
+    config.audio_apps_chosen = config.audio_capture_mode == "apps" || !config.audio_apps.empty();
+  }
+  // Version 13: automatic capture is the normal mode. The mode the file recorded with is kept for
+  // compatibility, the routes stay untouched, and each route's gain and mute seeds an automatic
+  // preference for the same executable. A file already written by this version keeps the mode it has.
+  if (config.config_version < 13) {
+    if (config.audio_capture_legacy_mode.empty()) {
+      if (mode_stored && (config.audio_capture_mode == "desktop" || config.audio_capture_mode == "apps")) {
+        config.audio_capture_legacy_mode = config.audio_capture_mode;
+      } else if (config.config_version < 10) {
+        config.audio_capture_legacy_mode = config.audio_apps.empty() ? "desktop" : "apps";
+      } else {
+        config.audio_capture_legacy_mode = config.audio_capture_mode;
+      }
+    }
+    config.audio_capture_mode = kAutoAudioSupported ? "auto" : "desktop";
+    seed_audio_apps_prefs(config.audio_apps, config.audio_app_prefs);
   }
   config.config_version = Config::kConfigVersion;
 }
@@ -631,7 +779,6 @@ unsigned config_change_bits(const Config& before, const Config& after) {
   note(before.encoder_mode != after.encoder_mode, kConfigSpeedInput | kConfigRebuilds);
   note(before.encoder_options.dump() != after.encoder_options.dump(), kConfigSpeedInput | kConfigRebuilds);
   note(before.scale_filter != after.scale_filter, kConfigRebuilds);
-  note(before.encoder_speed_step != after.encoder_speed_step, kConfigRebuilds);
   note(before.custom_kbps != after.custom_kbps, kConfigRebuilds);
   note(before.peak_mode != after.peak_mode, kConfigRebuilds);
   note(before.buffer_seconds != after.buffer_seconds, kConfigRebuilds);
@@ -642,7 +789,12 @@ unsigned config_change_bits(const Config& before, const Config& after) {
   // let a settings change rebuild the encoder under a manual recording.
   note(before.container != after.container, kConfigRebuilds);
   note(before.audio_tracks != after.audio_tracks, kConfigRebuilds);
+  note(audio_track_count(before) != audio_track_count(after), kConfigRebuilds);
   note(before.audio_bitrate_kbps != after.audio_bitrate_kbps, kConfigRebuilds);
+  // A mode change re-bits which source feeds the mix. A route change counts only while the mode records it:
+  // an app kept for later must not restart the buffer (or be refused) while desktop audio is what records.
+  note(before.audio_capture_mode != after.audio_capture_mode, kConfigRebuilds);
+  note(!audio_apps_equal(effective_audio_apps(before), effective_audio_apps(after)), kConfigRebuilds);
   return changed;
 }
 

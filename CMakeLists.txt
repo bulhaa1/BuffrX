@@ -12,9 +12,13 @@
 cmake_minimum_required(VERSION 3.20)
 project(BuffrX CXX)
 
+option(BUFFRX_TESTS_ONLY "Build native logic checks without OBS or product assets" OFF)
+
 # Resources (the engine manifest) are compiled by the toolchain's own llvm-windres; tools/build.ps1
 # passes it as CMAKE_RC_COMPILER.
-enable_language(RC)
+if(NOT BUFFRX_TESTS_ONLY)
+  enable_language(RC)
+endif()
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -29,7 +33,7 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 set(BUFFRX_RUNTIME "${CMAKE_SOURCE_DIR}/runtime" CACHE PATH "Staged OBS runtime (bin, data, modules, lib)")
-if(NOT EXISTS "${BUFFRX_RUNTIME}/bin/64bit/obs.dll")
+if(NOT BUFFRX_TESTS_ONLY AND NOT EXISTS "${BUFFRX_RUNTIME}/bin/64bit/obs.dll")
   message(FATAL_ERROR "runtime/ is not staged. Run tools/prepare-runtime.ps1 first.")
 endif()
 
@@ -43,6 +47,7 @@ set(BUFFRX_SHARED_SOURCES
 )
 
 # ---------------------------------------------------------------- interface library
+if(NOT BUFFRX_TESTS_ONLY)
 # Dear ImGui (MIT, pinned by tools/bootstrap-toolchain.ps1): the engine's own interface is drawn with
 # it, in-process. Third-party code, compiled without our warnings.
 set(BUFFRX_IMGUI_ROOT "" CACHE PATH "Dear ImGui sources (work/toolchain/imgui/imgui-<version>)")
@@ -69,6 +74,9 @@ add_executable(buffrx-engine
   src/engine/benchmark.cpp
   src/engine/buffer_watch.cpp
   src/engine/capture_enum.cpp
+  src/engine/audio_layout.cpp
+  src/engine/audio_routing.cpp
+  src/engine/audio_auto.cpp
   src/engine/clip_check.cpp
   src/engine/config.cpp
   src/engine/commands.cpp
@@ -89,9 +97,12 @@ add_executable(buffrx-engine
   src/engine/mp4_edit.cpp
   src/engine/obs_host.cpp
   src/engine/audio_sessions.cpp
+  src/engine/audio_watch.cpp
+  src/engine/process_audio_source.cpp
   src/engine/profile_probe.cpp
   src/engine/rec_mark.cpp
   src/engine/crash_log.cpp
+  src/engine/libobs_guard.cpp
   src/engine/platform.cpp
   src/engine/screenshot.cpp
   src/engine/session_store.cpp
@@ -111,6 +122,8 @@ add_executable(buffrx-engine
   src/engine/sleep_patch.cpp
   src/engine/ring_output.cpp
   src/engine/obs_host_dedupe.cpp
+  src/engine/obs_host_controller.cpp
+  src/engine/obs_host_compat.cpp
   src/engine/ring_disk.cpp
   src/engine/performance.cpp
   src/engine/video_probe.cpp
@@ -164,6 +177,7 @@ endif()
 # docs/measurement.md).
 add_executable(buffrx-present-loop src/tools/present_loop.cpp)
 target_link_libraries(buffrx-present-loop PRIVATE d3d11 dxgi user32)
+endif()
 
 # ---------------------------------------------------------------- tests
 # The pure logic only: config, JSON, hotkey chords and library guards. No libobs, no GPU, no window,
@@ -174,6 +188,9 @@ set(BUFFRX_TEST_SOURCES
   src/engine/benchmark.cpp
   src/engine/buffer_watch.cpp
   src/engine/capture_enum.cpp
+  src/engine/audio_layout.cpp
+  src/engine/audio_routing.cpp
+  src/engine/audio_auto.cpp
   src/engine/clip_check.cpp
   src/engine/config.cpp
   src/engine/encoder_settings.cpp
@@ -206,6 +223,10 @@ set(BUFFRX_TEST_SOURCES
   tests/link_secret_tests.cpp
   tests/ring_save_tests.cpp
   tests/save_publish_tests.cpp
+  tests/audio_settings_tests.cpp
+  tests/audio_source_tests.cpp
+  tests/audio_watch_tests.cpp
+  tests/audio_auto_tests.cpp
   ${BUFFRX_SHARED_SOURCES}
 )
 add_executable(buffrx-tests tests/engine_tests.cpp ${BUFFRX_TEST_SOURCES})
@@ -213,6 +234,58 @@ target_include_directories(buffrx-tests PRIVATE "${CMAKE_SOURCE_DIR}/src")
 # The tests read ui/src/themes.css to hold the editor page to the engine's theme table.
 target_compile_definitions(buffrx-tests PRIVATE BUFFRX_SOURCE_DIR="${CMAKE_SOURCE_DIR}" BUFFRX_TEST_HOOKS)
 target_link_libraries(buffrx-tests PRIVATE user32 gdi32 shell32 advapi32 ole32 comdlg32 wtsapi32 dxgi d2d1 dwrite winmm crypt32 bcrypt winhttp)
+
+# The display-replan decisions run without libobs, a GPU or a window.
+add_executable(buffrx-display-tests tests/display_replan_tests.cpp)
+target_include_directories(buffrx-display-tests PRIVATE "${CMAKE_SOURCE_DIR}/src")
+
+# The native panel's present recovery is pure logic on a simulated clock: a deferred frame's retry and its spent re-arms, the hold on
+# ordinary causes while a retry is owed, the device rebuild budget and the test faults. No window, no GPU, no libobs.
+# tools/ui-idle-probe.ps1 checks the same rules on a private engine.
+add_executable(buffrx-ui-present-tests tests/ui_present_tests.cpp)
+target_include_directories(buffrx-ui-present-tests PRIVATE "${CMAKE_SOURCE_DIR}/src")
+
+# The canvas/output shape rule (plan_canvas) is pure math and needs no libobs, GPU or window.
+add_executable(buffrx-canvas-tests tests/canvas_shape_tests.cpp)
+target_include_directories(buffrx-canvas-tests PRIVATE "${CMAKE_SOURCE_DIR}/src")
+
+# ---------------------------------------------------------------- audio session / process capture tests
+if(NOT BUFFRX_TESTS_ONLY)
+# Test-only, never packaged: a quiet WASAPI renderer, the watcher against it, and the native source
+# against it. `audio_watch_tests.cpp` is the pure grace rule and rides in buffrx-tests above.
+add_executable(buffrx-audio-fixture tests/audio_fixture.cpp)
+target_link_libraries(buffrx-audio-fixture PRIVATE ole32 mmdevapi user32)
+
+add_executable(buffrx-audio-watch-tests tests/audio_watch_live_tests.cpp src/engine/audio_watch.cpp)
+target_include_directories(buffrx-audio-watch-tests PRIVATE "${CMAKE_SOURCE_DIR}/src")
+target_link_libraries(buffrx-audio-watch-tests PRIVATE ole32 mmdevapi user32 advapi32)
+
+add_executable(buffrx-process-audio-tests tests/process_audio_tests.cpp src/engine/process_audio_source.cpp)
+target_include_directories(buffrx-process-audio-tests PRIVATE
+  "${BUFFRX_RUNTIME}/include"
+  "${BUFFRX_RUNTIME}/include/libobs"
+  "${CMAKE_SOURCE_DIR}/src"
+)
+# The lane test resets video, as the product does, so it names the graphics module by its full path the way
+# the engine does.
+target_compile_definitions(buffrx-process-audio-tests PRIVATE BUFFRX_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+target_link_directories(buffrx-process-audio-tests PRIVATE "${BUFFRX_RUNTIME}/lib")
+target_link_libraries(buffrx-process-audio-tests PRIVATE obs ole32 mmdevapi user32 advapi32)
+endif()
+
+enable_testing()
+foreach(check IN ITEMS buffrx-tests buffrx-display-tests buffrx-ui-present-tests buffrx-canvas-tests)
+  add_test(NAME ${check} COMMAND ${check})
+  set_tests_properties(${check} PROPERTIES TIMEOUT 180)
+  # Tests-only binaries can run without copying toolchain DLLs into a staged runtime.
+  if(BUFFRX_TESTS_ONLY)
+    target_link_options(${check} PRIVATE -static)
+  endif()
+endforeach()
+
+if(BUFFRX_TESTS_ONLY)
+  return()
+endif()
 
 # The mutation harness (N4): the same units, fed mutated bytes. Test-only, never packaged.
 add_executable(buffrx-fuzz tests/buffrx_fuzz.cpp ${BUFFRX_TEST_SOURCES})
@@ -224,6 +297,10 @@ target_link_libraries(buffrx-fuzz PRIVATE user32 gdi32 shell32 advapi32 ole32 co
 # The package entry: tools/package.ps1 copies it to the package root as BuffrX.exe. It checks the package and
 # starts bin/64bit/buffrx-engine.exe --show.
 add_executable(buffrx-launcher src/launcher/main.cpp src/launcher/launcher.rc)
+# The entry is opened from Explorer and from the registry's Run key, where no console exists to inherit: a
+# console-subsystem entry gets a new console window of its own, which is the flash at launch. It has nothing
+# to print (its WinMain reports through MessageBox), so it is a GUI binary.
+set_target_properties(buffrx-launcher PROPERTIES WIN32_EXECUTABLE TRUE)
 target_include_directories(buffrx-launcher PRIVATE src-tauri/icons)
 # The icon is a binary the resource compiler reads through the .rc; without this a new icon.ico never reached the exes.
 set_source_files_properties(src/engine/engine.rc src/launcher/launcher.rc PROPERTIES OBJECT_DEPENDS "${CMAKE_SOURCE_DIR}/src-tauri/icons/icon.ico;${CMAKE_SOURCE_DIR}/src/launcher/launcher.manifest")

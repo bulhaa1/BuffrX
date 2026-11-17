@@ -9,16 +9,23 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <utility>
 #include <vector>
 
+#include "audio_routing.h"
 #include "capture_enum.h"
+#include "compat_report.h"
 #include "command_policy.h"
 #include "config.h"
 #include "display_target.h"
-#include "encoder_governor.h"
+#include "driver_fault.h"
+#include "encoder_ladder.h"
+#include "hook_memory.h"
+#include "encoder_controller.h"
+#include "encoder_settings.h"
 #include "encoder_watch.h"
 #include "idle_policy.h"
 #include "memory_policy.h"
@@ -94,6 +101,8 @@ struct EngineStats {
   uint64_t ring_deduped_bytes = 0;
   int ring_chunks_linked = 0;
   int ring_chunks_waiting = 0;
+  int ring_epoch = 0;
+  int ring_swaps = 0;
   int ring_disk_state = 0;
   bool ring_stalled = false;
   double process_mb = 0.0;               // this process's working set: what Task Manager shows
@@ -107,7 +116,12 @@ struct EngineStats {
   float level_mic = 0.0;           // RMS level on a -42..0 dBFS scale, 0..1
   bool audio_meters_active = false;
   std::string capture_mode;
-  std::string capture_target;
+  std::string capture_target;  // the name a person reads; for a display fallback, the screen actually captured
+  // The display actually captured (its GDI device name), the one the config asked for, and whether the chosen
+  // screen is gone so the primary stands in. A stale saved index is never reported as the target.
+  std::string capture_display;
+  std::string capture_display_requested;
+  bool capture_display_fallback = false;
   int width = 0;
   int height = 0;
   int fps = 0;
@@ -163,11 +177,6 @@ public:
   bool memory_full() const { return memory_full_; }
   // The length the clip just filed was asked for: the panel tells a quick clip from a buffer save by it.
   int last_clip_seconds() const { return last_clip_seconds_.load(); }
-
-  // What this PC proved it can encode (capacity.json): a step it settled on for a codec, picture, rate and quality, so the
-  // next start begins there. Advisory only; the stored settings are never rewritten.
-  int capacity_remembered_step(const std::string& key) const;
-  void capacity_remember(const std::string& key, int step) const;
 
   // Applies capture, encoder and audio settings. Set `restart_outputs` when the change requires the
   // replay buffer to be recreated (encoder, resolution, frame rate, codec, capture source).
@@ -245,14 +254,80 @@ public:
   // held past kPendingPublishTimeoutMs is logged and left out of the index; it is never deleted.
   void pending_chunk_publish(uint32_t now);
 
-  // The encoder governor (encoder_governor.h). The tick raises the flag when the encoder cannot keep up and the
-  // next step is due; main.cpp takes it and queues the action worker, because a step rebuilds the encoder and
-  // the outputs and must not run on the window thread. `apply_governor_step` takes the step.
-  bool take_governor_step_due() { return governor_due_.exchange(false); }
-  bool apply_governor_step(std::string& error);
+  // The dynamic encoder controller (plan 008, encoder_controller.h). The tick reads the counters and, when a rule says so, raises this flag;
+  // main.cpp takes it and queues the action worker, because a move swaps the encoder and must not run on the window thread.
+  bool take_controller_move_due() { return controller_move_due_.exchange(false); }
+  bool apply_controller_move(std::string& error);
+  void controller_reset();  // "Start from full speed again": forget what this GPU settled at and go back to the person's own settings
+  struct ControllerStatus {
+    bool enabled = false;
+    int level = 0;       // 0 = the person's settings
+    int levels = 0;      // how many levels there are below that
+    int effort = 0;      // the effort step in force (0-3)
+    int divisor = 1;     // the frame-rate divisor in force
+    int canvas_fps = 0;  // the rate the canvas ticks at
+    int fps = 0;         // the rate the encoder keeps
+    std::string label;   // "effort -2", "120 -> 60 fps"; empty at level 0
+  };
+  ControllerStatus controller_status() const;
   int governor_step() const { return governor_step_; }
+  int frame_divisor() const { return frame_divisor_; }
+  // An encoder swap (plan 008): the running buffer gets another video encoder built at effort `step`, and its footage stays (the ring's epochs,
+  // ring_output.cpp). The tick raises the request (a test probe's BUFFRX_TEST_ENCODER_SWAP_MS, and later the controller); main.cpp takes it
+  // and queues the action worker, because a swap stops and starts outputs. -1 when none is asked for.
+  int take_encoder_swap_due() { return encoder_swap_due_.exchange(-1); }
+  bool swap_encoder(int step, int divisor, std::string& error);
+  bool encoder_swapping() const { return encoder_swapping_.load(); }
+  // A deliberate press (buffer start, record) may try the graphics device once even inside the backoff after a failure.
+  void allow_video_init_now() { buffrx::video_init_allow_now(video_backoff_); }
+  // The encoder died twice in ten minutes on the same id (encoder_ladder.h): the tick raises the flag, main.cpp queues the
+  // action worker, and the step down one rung rebuilds the encoder there. "Start from full speed again" clears the rung.
+  bool take_ladder_step_due() { return ladder_due_.exchange(false); }
+  bool apply_ladder_step(std::string& error);
+  void clear_encoder_ladder();
 
   EngineStats stats() const;
+
+  // One selected audio slot as it really is (audio_routing.h): whether its source exists (allocated) and
+  // whether Windows has it hooked to a running program (connected), which is what the page reports instead
+  // of claiming a route records. A slot with no source because the program is not running is waiting, not
+  // failed. Read under the engine lock (status_json does), never by sampling meters.
+  struct AudioSlotHealth {
+    bool game = false;
+    bool covered = false;    // a game slot whose program is already a named slot: no source of its own
+    std::string exe;         // the program the slot was chosen for; empty on a game slot with no game
+    std::string title;
+    int track = 0;
+    bool allocated = false;
+    bool connected = false;
+    bool failed = false;     // the capture source could not be created at all
+  };
+  std::vector<AudioSlotHealth> audio_slot_health() const;
+
+  // Automatic audio (audio_auto.h): the host owns the four fixed buses (tracks 3..5 and Other audio on
+  // track 6). A session snapshot is applied live; an arrival or departure never rebuilds an encoder, never
+  // clears the ring and never cuts a manual recording. Called under the engine lock from the tick, and
+  // with an empty list whenever nothing is capturing, which releases every process capture.
+  void set_auto_audio_sessions(const std::vector<AutoAudioSession>& sessions, uint64_t now_ms,
+                               const std::string& captured_game_exe = std::string());
+  void stop_auto_audio();
+  struct AutoAudioView {
+    bool on = false;        // automatic mode is configured (even while quiet)
+    bool unsupported = false;
+    std::string error;
+    int sources = 0;        // allocated process captures, Other audio members included
+    std::vector<AutoAudioLane> lanes;
+    std::vector<AutoAudioUncaptured> uncaptured;
+  };
+  AutoAudioView auto_audio_view() const;
+  // The routing a recording that started at `start_ms` and ends at `end_ms` writes, with each lane's title
+  // summarising who occupied it. `whole_output` uses the manual recording's own summary, which survives
+  // the rolling journal's pruning. The bus ids never change.
+  AudioRoutingPlan audio_plan_for_span(uint64_t start_ms, uint64_t end_ms, bool whole_output) const;
+  // The game BuffrX is actually capturing, handed in by the protocol from its own capture target (never
+  // from the detector's candidate list). A change updates the one game slot's source in place: no encoder
+  // is rebuilt, so the replay ring is kept across a game change. Caller holds the engine lock.
+  void set_game_audio_target(const GameAudioTarget& target);
 
   // The tick raises this once the engine has been idle past the grace and the sources are released; main.cpp takes
   // it and queues the action worker, because sleeping is a video reset and does not belong on the window thread.
@@ -278,6 +353,18 @@ public:
   // and every build of the capture source honours it. `reconfigure` swaps the source now (under the ring, as a detection
   // does); false only records the state, for the moments when no source is wanted or the caller is about to swap itself.
   bool set_capture_follow(bool display, bool reconfigure, std::string& error);
+  // The tick raises this when the display it follows is not on the running video device's own outputs (another
+  // card, or a screen attached since the device was made): the source alone cannot reach it, so main.cpp takes
+  // the flag and queues the action worker, because moving the device is a video reset.
+  bool take_display_replan_due() { return display_replan_due_.exchange(false); }
+  // Builds the video again so the selected display's card owns the device, keeping every other setting. Refuses
+  // nothing and changes nothing while the engine sleeps: its next wake plans the canvas and the card from config_.
+  // False when the reset landed on a card that cannot duplicate the display (a fallback adapter), because the
+  // source then reaches the screen only through Windows Graphics Capture, which has delivered no frame here.
+  bool rebuild_for_display(std::string& error);
+  // The person chose a display (a card in the picker): whatever was refused before is a fresh ask, not one more
+  // refusal of an old one. Called before apply, so the new choice is not suppressed by the retry cap.
+  void reset_display_replan();
   // The capture mode in effect: the user's, except while the follow layer shows the display in place of a game.
   std::string capture_mode_now() const { return follow_display_ && config_.capture_mode == "game" ? std::string("display") : config_.capture_mode; }
   // What the mode records on this machine's capture target, at the user's own size and rate (what it would, when it is
@@ -353,6 +440,18 @@ public:
   // or options, and the value in force). The advanced encoder page renders this, so a knob a vendor
   // adds appears with no engine change.
   Json encoder_properties(bool configured = false) const;
+  // What the compatibility report reads from libobs (plan 009): adapters, registered encoders and their property lists, the running
+  // encoder's settings and what it reported at init. Never creates an encoder or a source. Under the engine lock.
+  void compat_fill(CompatFacts& facts) const;
+  // The two counters the controller reads, for the report's 10 s speed sample. `active` is false while no buffer encodes.
+  struct EncodeCounters {
+    bool active = false;
+    uint64_t rendered = 0;
+    uint64_t encoded = 0;
+  };
+  EncodeCounters encode_counters() const;
+  // What the Video page says about this card (plan 009 phase 2): the adapter libobs uses, its vendor and the codecs it can encode.
+  Json hardware_json() const;
   // One line describing the replay output's own view of itself: last error, last file, frame counts.
   std::string replay_diagnostics() const;
 
@@ -413,10 +512,55 @@ private:
   // The GDI device name the live display source resolved to, and when it was last compared with the settings.
   std::string capture_display_device_;
   uint32_t display_check_at_ = 0;
+  // The DXGI outputs the video device could duplicate when it was built: its own adapter's list, fixed at
+  // that moment (display_target.h). Refreshed at every video reset. `known` is false when the enumeration
+  // itself failed, which is no evidence that a screen is missing.
+  std::vector<std::string> device_outputs_;
+  bool device_outputs_known_ = false;
+  std::atomic<bool> display_replan_due_{false};
+  // A display the device could not be rebuilt for is not retried every two seconds: that would reset the
+  // video, and stop a recording, over and over. After a few refusals it stops asking until the desk changes.
+  std::string display_replan_failed_for_;
+  int display_replan_attempts_ = 0;
+  uint32_t display_replan_retry_at_ = 0;
+  // What failure was already said in a card, so a retry every half minute is not a card every half minute
+  // (display_target.h has the rule; the last attempt is said once, when it stops).
+  std::string display_replan_told_for_;
+  // The desk the refusal count belongs to (display_topology_signature), read again at most this often while a
+  // refusal stands: a replug or a rearrange is a new episode, not the rest of the run. Nothing is read while no
+  // refusal stands, so a healthy capture never pays for it.
+  std::string display_replan_topology_;
+  uint32_t display_replan_topology_at_ = 0;
+  static constexpr uint32_t kDisplayReplanRetryMs = 30000;
+  static constexpr int kDisplayReplanMaxAttempts = 3;
+  static constexpr uint32_t kDisplayTopologyCheckMs = 10000;
+  // What a build left the device able to see, recorded where the rebuild happened so the follow check does not
+  // ask again on its next 2 s pass (display_target.h has the retry rule).
+  void note_display_replan_failure(const std::string& wanted);
+  // The desk as the retry rule reads it (display_target.h: display_topology_signature).
+  std::string display_topology() const;
+  // The one card a failed display rebuild is allowed to draw, and the last one when it stops retrying.
+  void report_display_replan_failure(const std::string& wanted, const std::string& error);
+  // Set only while rebuild_for_display runs apply: that path reports its own failure with the footage it cost,
+  // so the generic settings error is not drawn a second time for the same attempt.
+  bool display_replan_running_ = false;
   // The missing display already reported as fallen back to the primary, so the 2 s check says it once.
   std::string display_warned_name_;
   static constexpr uint32_t kDisplayCheckMs = 2000;
   bool configure_audio(const Config& config);
+  // Process-loopback captures for the application slots (audio_routing.h). `configure_audio` reconciles
+  // these with the plan; the tick only re-creates one whose source could not be made at all, and reads the
+  // hook state so the page reports allocated and connected truthfully.
+  struct AppAudioChannel;
+  void configure_app_audio(const AudioRoutingPlan& plan);
+  void poll_audio_health();
+  void update_game_audio_channel();
+  bool create_app_channel(AppAudioChannel& channel, const AudioApp& app, uint32_t mixers,
+                          uint32_t view_channel);
+  void release_app_channel(AppAudioChannel& channel);
+  static void on_app_hooked(void* data, struct calldata* call);
+  static void on_app_unhooked(void* data, struct calldata* call);
+  void release_app_audio();
   void apply_mic_filters(const Config& config);
   void attach_meter(obs_source* source, obs_volmeter** meter, std::atomic<float>* into);
   void detach_meter(obs_volmeter** meter);
@@ -471,9 +615,12 @@ private:
   // The tick's half of a file the muxer split: the path only queued by the signal is taken here, the span
   // that closed goes to the index queue and the open one follows the new file. Never blocks: an index entry
   // still waits for its writer (pending_chunk_publish).
-  void poll_timeline_split(uint32_t now);
-  // Drops what the splitter reported but the tick has not taken (a new session, an abandoned output).
+  void poll_timeline_split(uint32_t now);  // Drops what the splitter reported but the tick has not taken (a new session, an abandoned output).
   void clear_split_queue();
+  // Writes the track labels and roles beside a Timeline chunk, with the plan that segment was recorded
+  // with. A single-track plan writes none (audio_layout.h). Called where a chunk is opened, never on a
+  // close, so a chunk that outlives a settings change keeps its own labels.
+  void note_chunk_audio_layout(const std::string& file);
   // One closed span into the index queue, with the session's wall clock. Caller holds recording_mutex_.
   void queue_session_chunk(const std::string& file, uint32_t start_ms, uint32_t end_ms);
   // The tick's half of a closed chunk: indexes it, releases the output, then opens the next chunk or
@@ -518,7 +665,8 @@ private:
   // reports it. A save the output says failed is kept on disk but never filed or announced.
   void process_saved_replay();
   struct SaveRequest;
-  void finish_save(const std::string& path, const SaveRequest& request, int peak_kbps);
+  void finish_save(const std::string& path, const SaveRequest& request, int peak_kbps,
+                   const AudioRoutingPlan& audio_plan);
   // Forces a replay stop that is still unwinding, never waits for it. True once it is down.
   // A start issued while the old stop is still unwinding would otherwise find the output "active" and
   // start nothing.
@@ -540,6 +688,8 @@ private:
   void salvage_buffer(const char* reason, bool wait_for_file = false, bool at_once = false);
   // Every encoder that fits the config's codec and vendor, best first (NVENC, AMF, QSV, then software).
   std::vector<std::string> choose_encoder_ids(const Config& config) const;
+  // What the registered encoders say about this machine (older NVENC, AMD extras): read from libobs, never from a card's name.
+  EncoderTraits encoder_traits() const;
   bool build_video_encoder(const std::string& encoder_id, const Config& config, std::string& error);
   // The config with the codec the engine is really encoding: H.264 when this machine could not start the one asked for.
   Config effective_config() const;
@@ -563,6 +713,9 @@ private:
   void update_capture_fit();
   bool capture_stretched_ = false;
   bool capture_fit_applied_ = false;
+  // The scale filter the scene item was last given (obs_scale_type). When the canvas already has the output's
+  // shape, the item's own bounds scaling is the only scale left, so the Advanced filter has to reach it too.
+  int capture_scale_filter_ = -1;
   // The capture source lives in the scene; this is the only accessor for it.
   obs_source* capture_source() const;
 
@@ -577,8 +730,6 @@ private:
   bool memory_full_ = false;
   std::atomic<int> last_clip_seconds_{0};
   std::string capacity_path_;
-  uint32_t capacity_ok_since_ms_ = 0;
-  int capacity_recorded_step_ = -1;
   MemoryWatch memory_watch_;
   bool spill_wanted_ = false;    // the ring was given a disk part to make; false when the footage fits in RAM or the kill switch is set
   bool spill_noticed_ = false;   // the person was told once that it could not be made
@@ -604,6 +755,82 @@ private:
   struct obs_scene_item* capture_item_ = nullptr;
   obs_source* desktop_ = nullptr;
   obs_source* mic_ = nullptr;
+  // One per application slot, in plan order; the channel is kAppAudioViewChannelBase + index. Held by
+  // pointer so win-wasapi's hooked/unhooked callbacks keep a stable address when a slot is replaced.
+  struct AppAudioChannel {
+    std::string key;     // the executable (lowercase) or "game"
+    std::string window;  // win-capture id the source is bound to
+    std::string exe;
+    bool game = false;
+    bool covered = false;  // the game already has a named slot: this lane makes no source
+    bool failed = false;  // obs_source_create returned null: no source exists at all
+    obs_source* source = nullptr;
+    bool said_missing = false;
+    // Written by win-wasapi's capture thread and read by the tick and the status. The strings are behind
+    // their own lock so a signal can never race a status snapshot into a dangling pointer.
+    std::atomic<bool> connected{false};
+    mutable std::mutex health_mutex;
+    std::string hooked_exe;
+    std::string hooked_title;
+  };
+  std::vector<std::unique_ptr<AppAudioChannel>> app_channels_;
+  // Automatic mode's four buses. Tracks 3..5 hold one program each; track 6 is the remaining programs
+  // together. A bus can mix several process trees of one program (two browser profiles) or of many
+  // programs, so each tree is its own process capture inside one persistent private scene: one output
+  // channel, one encoder, and no tree captured twice (audio_auto.h).
+  struct AutoAudioChannel {
+    int track = 0;
+    std::string key;   // the isolated program's lower-case executable, or "other"
+    std::string exe;
+    uint32_t pid = 0;  // the first process tree the current source captures
+    obs_source* source = nullptr;   // the bus's scene source
+    obs_scene* scene = nullptr;     // the persistent bus mixer
+    std::map<uint32_t, obs_source*> roots;       // root pid -> its process capture
+    std::map<uint32_t, uint64_t> root_created;   // root pid -> the creation time it was made for
+    std::map<uint32_t, struct obs_scene_item*> root_items;
+    bool failed = false;
+    std::string error;
+  };
+  struct AutoBusRoot {
+    AutoAudioRoot root;
+    double volume = 1.0;
+    bool muted = false;
+  };
+  std::vector<std::unique_ptr<AutoAudioChannel>> auto_channels_;  // tracks 3..6, index track-3
+  AutoAudioPlan auto_plan_;
+  AutoLaneMemory auto_lane_memory_;
+  AutoJournal auto_journal_;
+  std::vector<AutoAudioSession> auto_sessions_;
+  std::string auto_game_exe_;   // the game whose picture is being captured, for a freed lane
+  uint64_t auto_journal_at_ = 0;
+  // The process table is walked only when the sessions that grouping reads have changed (audio_auto.h
+  // auto_snapshot_due): a program arriving, leaving or relaunching, or a just-started one not in the
+  // table yet. Grace expiry and a fader are answered from the snapshot already held.
+  std::vector<AutoProcessNode> auto_processes_;
+  std::vector<std::string> auto_snapshot_for_;
+  bool auto_snapshot_valid_ = false;
+  uint64_t auto_snapshot_at_ = 0;
+  void configure_auto_audio(const std::vector<AutoAudioSession>& sessions, uint64_t now_ms);
+  void reconcile_auto_channels(const AutoAudioPlan& plan);
+  void sync_auto_bus(AutoAudioChannel& channel, const std::string& key, const std::string& exe,
+                     const std::string& name, const std::vector<AutoBusRoot>& roots, double bus_volume,
+                     bool bus_muted, uint32_t mixers);
+  void release_auto_channel(AutoAudioChannel& channel);
+  void release_auto_audio();
+
+  static constexpr uint32_t kAudioAppCheckMs = 5000;   // a source that could not be made is retried this slowly
+  static constexpr uint32_t kAudioHealthPollMs = 2000;  // get_hooked is read this often for the page's state
+  uint32_t audio_app_check_at_ = 0;
+  uint32_t audio_health_poll_at_ = 0;
+  // The game the protocol says is being captured, for the Current game slot. Not part of the config: a
+  // game change is a live update, not a settings change.
+  GameAudioTarget game_target_;
+  // The routing the running encoders were built with: encoder titles and the sidecar beside a saved file
+  // describe recording time, never the config as it is when the file finishes.
+  AudioRoutingPlan audio_plan_;
+  // The routing a manual recording started with: its sidecar is written when the file closes, after the
+  // encoders may have been rebuilt for a different config.
+  AudioRoutingPlan manual_audio_plan_;
   obs_source* mic_noise_suppress_ = nullptr;
   obs_source* mic_noise_gate_ = nullptr;
   obs_scene* scene_ = nullptr;
@@ -651,6 +878,11 @@ private:
   bool timeline_wake_gap_pending_ = false;
   std::string timeline_game_exe_;
   std::string timeline_last_error_;  // the last refusal, so a start retried every tick is logged once
+  // The stream layout a Timeline segment is written in (encoder, picture, audio tracks) and the epoch it belongs
+  // to: a segment opened in another layout starts a new epoch, so the strip draws the line and a save never plans across it.
+  // An effort-only swap keeps the layout (NVENC's header is byte for byte the same), so a save still joins across it.
+  std::string timeline_layout_;
+  uint32_t timeline_epoch_ = 0;
   // A manual stop asked for the session to end: the tick closes it as soon as its own segment has let go, and
   // never keeps it for a pause or opens a new one meanwhile. Cleared by close_session.
   bool timeline_closing_ = false;
@@ -747,6 +979,7 @@ private:
   // CQP/CRF). The ring's disk tier sizes itself from the peak.
   int created_kbps_ = 0;
   int created_max_kbps_ = 0;
+  int reserve_peak_kbps_ = 0;  // the peak at no divisor: what the ring's disk file is sized from
   // One pipeline rebuild at a time (see command_policy.h). Taken for the whole of apply().
   RebuildGate rebuild_gate_;
   bool replay_faulted_ = false;
@@ -756,9 +989,60 @@ private:
   uint32_t display_hz_at_ = 0;
   bool governor_disabled_ = false;
   int governor_step_ = 0;
-  uint32_t governor_last_step_ms_ = 0;
-  std::atomic<bool> governor_due_{false};
+  // The controller's state: the level table of the encoder that runs, where it is, and the one move waiting for the action worker.
+  buffrx::ControllerState controller_;
+  std::vector<buffrx::EncoderLevel> controller_levels_;
+  int controller_fps_ = 60;
+  std::string controller_key_;
+  int controller_remembered_ = 0;
+  int controller_pending_move_ = -1;
+  uint32_t controller_pending_since_ = 0;
+  std::string controller_pending_reason_;
+  std::atomic<bool> controller_move_due_{false};
+  bool controller_was_active_ = false;
+  double controller_ratio_ = 1.0;
+  std::set<std::string> divisor_refused_;     // encoders that would not take a frame-rate divisor: no frame-rate levels for them
+  void controller_prepare();
+  void controller_build_levels();
+  void controller_tick(uint32_t now_ms);
+  void controller_grace(uint32_t now_ms, uint32_t ms = 0);
+  std::string controller_memory_key() const;
+  // A dead encoder is not a slow one (encoder_watch.h): it earns a line, never a governor step. The tick samples the last
+  // fault (device lost, stall restart, game stall stop, an output stopped on an encode error) so the governor holds off.
+  bool encoder_frozen_told_ = false;
+  std::atomic<uint32_t> fault_tick_{0};
+  std::atomic<bool> encoder_death_pending_{false};
+  void note_output_stop_code(long long code);
+  uint32_t last_fault_ms() const;
+  // Video that will not start is retried with a backoff (driver_fault.h), and the person is told once each way.
+  buffrx::VideoInitBackoff video_backoff_;
+  bool video_trouble_told_ = false;
+  // The encoder ladder: a rung per GPU, driver and configured encoder, a layer over the config.
+  buffrx::EncoderDeaths encoder_deaths_;
+  int ladder_rung_ = 0;
+  std::string ladder_key_;
+  std::string ladder_vendor_;
+  std::string ladder_path_;
+  std::atomic<bool> ladder_due_{false};
+  std::atomic<bool> ladder_pending_{false};  // a second death was seen; the step waits for the driver and for a recording
+  std::string gpu_identity_;  // GPU name and driver version, read once at start
+  int video_adapter_index_ = -1;         // the DXGI adapter libobs was given (configure_video)
+  std::string video_adapter_reason_;     // why that one, in words, for the compatibility report
+  std::string ladder_key_now() const { return buffrx::ladder_key(gpu_identity_, "", config_.codec, config_.encoder); }
+  int ladder_rung_now() const { return !ladder_key_.empty() && ladder_key_ == ladder_key_now() ? ladder_rung_ : 0; }
+  // Games whose hook delivered nothing (hook_memory.h).
+  std::vector<buffrx::HookEntry> hook_memory_;
+  std::string hook_memory_path_;
   bool force_encoder_rebuild_ = false;  // a governor step rebuilds the encoder with nothing else changed
+  // An encoder swap is running: the ring is stopped for a moment with its footage kept. New saves wait, and the stop is not a fault.
+  std::atomic<bool> encoder_swapping_{false};
+  // Only while a swap that failed twice writes the ring out before the rebuild: the ring holds footage though its output is down.
+  bool ring_kept_for_salvage_ = false;
+  // The next swap's request: effort step in the low 8 bits, frame-rate divisor above them; -1 when none.
+  std::atomic<int> encoder_swap_due_{-1};
+  // The frame-rate lever (plan 008): the encoder keeps every n-th picture (obs_encoder_set_frame_rate_divisor). 1 is the canvas's own rate.
+  int frame_divisor_ = 1;
+  int swap_test_fail_ = 0;  // BUFFRX_TEST_SWAP_FAIL: 1 refuses the new encoder's start, 2 refuses the old one's too
   uint32_t encoder_behind_told_ms_ = 0;
   void watch_encoder(uint32_t now_ms);
   // What the ring holds, asked of the ring itself (the `ring_info` proc of the buffrx_ring output); `ok` is false when no ring runs.
@@ -768,7 +1052,7 @@ private:
     // The disk part (ring_spill.h): what RAM holds, what the file holds, what was written, 0 off / 1 on / 2 unavailable, a disk that could not
     // take what was due, times the disk part was given up at the ceiling, and packets the last save left out (an unreadable disk part).
     int64_t ram_bytes = 0, disk_bytes = 0, spilled_bytes = 0, state = 0, stalled = 0, backstop = 0, skipped = 0;
-    int64_t chunk_bytes = 0, deduped_bytes = 0, chunks_linked = 0, chunks_waiting = 0;
+    int64_t chunk_bytes = 0, deduped_bytes = 0, chunks_linked = 0, chunks_waiting = 0, epoch = 0, swaps = 0;
   };
   RingInfo ring_info() const;
   uint32_t last_restart_tick_ = 0;
@@ -812,6 +1096,8 @@ private:
     std::string held;
     // The peak the encoder was allowed, read on the tick: the black-clip guard compares the file's rate with it.
     int peak_kbps = 0;
+    // The routing the encoders were built with: the sidecar describes recording time, not a later config.
+    AudioRoutingPlan audio_plan;
   };
   // Trims, verifies and files saved clips off the tick, one at a time. The tick enqueues and walks
   // away; it never joins. Two clips deep is the ceiling; past it the clip stays in the clips root,
@@ -857,5 +1143,9 @@ private:
 // Utility used by the engine and the editor: converts the capture source's current NV12 frame into a
 // PNG or JPEG on disk. Returns false with a reason when it cannot.
 bool write_screenshot(obs_source* source, const std::string& path, bool jpeg, std::string& error);
+
+// The two files of the compatibility report (plan 009) in `data_root`, overwritten. `file` is the JSON's path, `summary` the text.
+bool write_compat_report(const std::string& data_root, const CompatFacts& facts, std::string& file, std::string& summary,
+                         std::string& error);
 
 }  // namespace bx

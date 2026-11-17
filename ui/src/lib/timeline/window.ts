@@ -86,3 +86,28 @@ export function seekInside(targetMs: number, window: LoadedWindow | undefined, e
   if (!window) return false
   return targetMs >= Math.max(window.startMs, evictedToMs) && targetMs <= window.endMs
 }
+
+/** The longest hole in the buffered media playback steps over by itself, in seconds. A swap of the encoder or a pause shorter than
+ *  GAP_MS closes one segment and opens the next a quarter of a second later, the window joins them, and the hole between their
+ *  pictures (about 350 ms measured) stalls a MediaSource element with nothing on screen to say why. */
+export const HOLE_SECONDS = 1
+
+/** How far before a hole a stalled element is still held at it: the decoder keeps the last reordered pictures of a stream until
+ *  playback reaches the next stream's headers, and those sit past the hole (measured: stuck 0.27 s short of a swap's seam). */
+export const STALL_LEAD_SECONDS = 0.5
+
+/** Where playback carries on when the picture at `at` (seconds) has reached the end of a buffered range and the next one starts
+ *  within HOLE_SECONDS, or `at` sits inside such a hole: that next range's start. `stalled` (the element said it is waiting) also
+ *  counts a picture up to STALL_LEAD_SECONDS short of the hole. Null when there is footage ahead of `at`, when the buffer simply
+ *  ends (more is coming), or when the hole is longer. */
+export function holeJump(ranges: [number, number][], at: number, maxHole = HOLE_SECONDS, stalled = false): number | null {
+  const lead = stalled ? STALL_LEAD_SECONDS : 0.05
+  for (let i = 0; i < ranges.length; i++) {
+    const [start, end] = ranges[i]
+    if (at < start - 0.001) return start - at <= maxHole ? start : null
+    if (at < end - lead) return null
+    const next = ranges[i + 1]
+    if (next && at < next[0] && next[0] - end <= maxHole) return next[0]
+  }
+  return null
+}

@@ -27,6 +27,7 @@
 #include "ui_bridge.h"
 #include "ui_frame_stats.h"
 #include "ui_images.h"
+#include "ui_present_math.h"
 #include "ui_store.h"
 #include "ui_views.h"
 #include "ui_window_math.h"
@@ -131,13 +132,29 @@ private:
   void begin_hide(UiWindow& window, bool retire);
   void finish_hides();
   void render(UiWindow& window, bool for_capture, bool vsync = true);
+  // The window's back buffer as its render target. Returns the HRESULT of the call that failed (S_OK when made).
+  HRESULT make_target(UiWindow& window);
+  // A frame that did not reach the display, or a target that could not be made: schedules the retry (ui_present_math.h), and when the
+  // fast attempts are spent asks once for the device rebuild (at most kResourceRebuilds times per run of failures). Logs the first miss.
+  void note_frame_failure(UiWindow& window, PresentOutcome outcome, HRESULT hr);
+  // Device rebuilds made in the current run of failures. A frame that shows starts the count over; a deliberate input on a window whose
+  // rebuilds are spent grants one more (grant_rebuild), at most once per kInputRebuildGapUs. Nothing else resets it: a reset in a
+  // rebuild path would remove the cap.
+  int resource_rebuilds_ = 0;
+  int64_t last_rebuild_grant_us_ = 0;  // when the last grant was made (0: never)
+  // Test-only faults for the native probe (BUFFRX_UI_TEST_PRESENT, BUFFRX_UI_TEST_TARGET), read once. Counted per host, so a rebuilt
+  // window does not restart them. Off unless the variables are set.
+  PresentFault test_present_fault_ = PresentFault::none;
+  TargetFault test_target_fault_ = TargetFault::none;
+  int test_present_attempts_ = 0;
+  int test_target_calls_ = 0;
   // Whether the display can take this window's next frame (always, for a window that is not paced).
   bool display_ready(UiWindow& window, bool strict = false);
   // With no window on screen: the sooner of the store's timers and the device's release.
   uint32_t hidden_deadline_ms();
   // An input reached a window: the time it waits for a frame is what `ui.frame_stats` calls latency, kept under its kind.
   void note_input(InputKind kind);
-  void note_reasons(bool forced, bool store, bool dirty, bool moving, bool settle, const char* animation, bool images);
+  void note_reasons(bool forced, bool store, bool dirty, bool moving, bool settle, const char* animation, bool images, bool retry);
   void process_requests();
   // ui.share (the editor's preview): the panel comes forward with the Share sheet open on that file.
   void open_share_for(const std::string& file);

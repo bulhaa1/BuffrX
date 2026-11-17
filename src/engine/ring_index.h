@@ -35,6 +35,9 @@ struct RingEntry {
   bool on_chunk = false;     // its payload is out of RAM and is in chunk `chunk_id`
   uint32_t chunk_id = 0;
   uint64_t video_seq = 0;    // a video packet's ordinal since the ring started; set by push()
+  // The encoder this packet came from (an encoder swap starts a new one, plan 008): its header, size and time base are the epoch's own, so a
+  // save that crosses a swap writes one part per epoch. Held in the index only, never in the disk record.
+  uint16_t epoch = 0;
 };
 
 // Footage a linked chunk holds: its video packets [seq0, seq1) and, for audio, the time [t0, t1) between the keyframes at both ends.
@@ -235,6 +238,8 @@ public:
   int64_t floor() const { return pin_ >= 0 ? std::min(pin_, tail()) : tail(); }
 
   // A save's view: a copy of every entry, and a pin on the oldest disk record so the writer cannot lap it while the save reads.
+  uint16_t oldest_epoch(uint16_t fallback) const { return entries_.empty() ? fallback : entries_.front().epoch; }
+
   std::vector<RingEntry> snapshot() {
     pin_ = disk_count_ > 0 ? disk_offs_.front() : -1;
     return std::vector<RingEntry>(entries_.begin(), entries_.end());

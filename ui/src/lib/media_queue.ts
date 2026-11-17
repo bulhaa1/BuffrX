@@ -6,7 +6,13 @@
 // newer read needs its place: a peaks walk can take minutes, and the clip on screen must not wait
 // behind work nobody is looking at. A finished read stays cached, so coming back to a clip draws at once.
 
-export type MediaProbe = { keyframes?: number[]; peaks?: number[][] }
+export type MediaProbe = {
+  keyframes?: number[]
+  /** The waveform lanes, on one absolute scale (`--media-peaks … raw`), so they compare honestly. */
+  peaks?: number[][]
+  /** Lanes the engine could not decode (file ordinals): their peaks are zeros, not silence. */
+  undecoded?: number[]
+}
 
 type Kind = 'keyframes' | 'peaks'
 type Value = number[] | number[][]
@@ -54,6 +60,8 @@ export function createMediaWork(
 ): MediaWork {
   const cap = { keyframes: limits.keyframes ?? LIMITS.keyframes, peaks: limits.peaks ?? LIMITS.peaks }
   const done = new Map<string, Value>()
+  /** Per lane, whether the engine decoded it: kept beside the waveform, not inside it. */
+  const decodedDone = new Map<string, boolean[]>()
   const inflight = new Map<string, Job>()
   const waiting: Job[] = []
   const running = new Set<Job>()
@@ -65,12 +73,17 @@ export function createMediaWork(
   const keyOf = (kind: Kind, path: string, buckets: number) =>
     kind === 'keyframes' ? `keyframes:${path}` : `peaks:${path}:${buckets}`
 
-  /** The engine's answer, or null when it failed: a failure is not cached, so a later visit tries again. */
-  function read(job: Job, raw: unknown): Value | null {
-    const report = raw as { ok?: boolean; keyframes?: unknown; tracks?: unknown } | null
+  /** The engine's answer, or null when it failed: a failure is not cached, so a later visit tries again.
+   *  A lane the engine could not decode is reported apart from the peaks, never as silence. */
+  function read(job: Job, raw: unknown): { value: Value | null; decoded: boolean[] } | null {
+    const report = raw as { ok?: boolean; keyframes?: unknown; tracks?: unknown; decoded?: unknown } | null
     if (!report || report.ok !== true) return null
     const value = job.kind === 'keyframes' ? report.keyframes : report.tracks
-    return Array.isArray(value) ? (value as Value) : null
+    if (!Array.isArray(value)) return null
+    const decoded = job.kind === 'peaks' && Array.isArray(report.decoded)
+      ? report.decoded.map((lane) => lane === true)
+      : []
+    return { value: value as Value, decoded }
   }
 
   /** A read that never left the queue: nothing to end, and the view gets no answer. */
@@ -115,9 +128,12 @@ export function createMediaWork(
         // A file rewritten or left while its read was out gives no answer: the bytes it describes
         // are not the ones on screen, and caching it would hand them to the next visit.
         const stale = job.cancelled || (generations.get(job.path) ?? 0) !== job.generation
-        if (value && !stale) done.set(job.key, value)
+        if (value && !stale) {
+          if (value.value) done.set(job.key, value.value)
+          if (value.decoded.length) decodedDone.set(job.key, value.decoded)
+        }
         if (inflight.get(job.key) === job) inflight.delete(job.key)
-        job.answer(stale ? null : value)
+        job.answer(stale ? null : value?.value ?? null)
         pump()
       })
   }
@@ -156,7 +172,7 @@ export function createMediaWork(
       live.held = true
       return live.promise
     }
-    const args = kind === 'keyframes' ? ['--media-keyframes', path] : ['--media-peaks', path, String(buckets)]
+    const args = kind === 'keyframes' ? ['--media-keyframes', path] : ['--media-peaks', path, String(buckets), 'raw']
     let answer: (value: Value | null) => void = () => undefined
     const promise = new Promise<Value | null>((resolve) => { answer = resolve })
     const job: Job = {
@@ -188,7 +204,12 @@ export function createMediaWork(
       const keyframes = done.get(keyOf('keyframes', path, buckets))
       if (keyframes) out.keyframes = keyframes as number[]
       const peaks = done.get(keyOf('peaks', path, buckets))
-      if (peaks) out.peaks = peaks as number[][]
+      if (peaks) {
+        out.peaks = peaks as number[][]
+        const decoded = decodedDone.get(keyOf('peaks', path, buckets))
+        const undecoded = decoded?.flatMap((ok, index) => (ok ? [] : [index])) ?? []
+        if (undecoded.length) out.undecoded = undecoded
+      }
       return out
     },
     keyframes: (path) => request('keyframes', path, 0) as Promise<number[] | null>,
@@ -201,7 +222,10 @@ export function createMediaWork(
     forget(path) {
       generations.set(path, (generations.get(path) ?? 0) + 1)
       for (const key of [...done.keys()]) {
-        if (key === `keyframes:${path}` || key.startsWith(`peaks:${path}:`)) done.delete(key)
+        if (key === `keyframes:${path}` || key.startsWith(`peaks:${path}:`)) {
+          done.delete(key)
+          decodedDone.delete(key)
+        }
       }
       // A read that is out describes the bytes that were there before: it must not show, must not be
       // cached, and must not hold the place the rewritten file needs.

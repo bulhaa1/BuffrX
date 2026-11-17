@@ -2,6 +2,7 @@
 work/
 build-linux/
 build/
+build-*/
 build-share-spike/
 
 # Staged runtime: the pinned OBS binaries and generated import libraries. Rebuilt by
@@ -63,12 +64,18 @@ QA_*.md
 HANDOFF_*.md
 AUDIT_*.md
 CAPTURE_OPTIMIZATION_HANDOFF.md
+plans/
 docs/
+# Public contributor contract approved by the owner; the rest of docs remains local.
+!docs/
+docs/*
+!docs/protocol.md
 .impeccable/
 *.bak
 *.local.*
 
 # Generated or personal scratch
+build-contrib/
 *.orig
 *.rej
 ui/PRODUCT.md

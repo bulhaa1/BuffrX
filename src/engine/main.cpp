@@ -31,6 +31,9 @@
 #include "../shared/json.h"
 #include "../shared/log.h"
 #include "crash_log.h"
+#include "libobs_guard.h"
+#include "driver_fault.h"
+#include "encoder_choice.h"
 #include "../shared/pipe.h"
 #include "benchmark.h"
 #include "audio_meter.h"
@@ -119,6 +122,14 @@ int main(int argc, char** argv) {
     open_link = argv[2];
     // Windows starts a link handler in whatever folder the browser was in; the engine works from its own.
     SetCurrentDirectoryA(executable_directory().c_str());
+  }
+  // BuffrX started itself after libobs ended the engine (libobs_guard.cpp): the dying engine's single-instance mutex goes with its
+  // process, so wait for that, then give the driver a moment. After the --open-link guard above, so a link can never reach it.
+  bool relaunched = false;
+  for (int i = 1; i + 1 < argc; ++i) {
+    if (std::strcmp(argv[i], "--relaunch-after") != 0) continue;
+    wait_for_dying_engine(static_cast<unsigned long>(std::strtoul(argv[i + 1], nullptr, 10)));
+    relaunched = true;
   }
   const bool package_smoke = has_argument(argc, argv, "--package-smoke-test");
   const bool capture_smoke = has_argument(argc, argv, "--capture-smoke-test");
@@ -244,6 +255,12 @@ int main(int argc, char** argv) {
       json.set("video_codec", Json(details.video_codec));
       json.set("video_kbps", Json(details.video_kbps));
       json.set("bytes", Json(details.bytes));
+      json.set("modified", Json(details.modified));
+      // The file's own audio layout (audio_layout.h): the editor labels and mixes from this, never from
+      // the capture settings of the moment the file is opened.
+      json.set("audio_buffrx", Json(details.layout.buffrx));
+      json.set("audio_aggregate", Json(details.layout.aggregate));
+      json.set("audio_complete", Json(details.layout.complete));
       Json tracks = Json::array();
       for (const MediaTrack& track : details.audio) {
         Json entry = Json::object();
@@ -251,6 +268,10 @@ int main(int argc, char** argv) {
         entry.set("channels", Json(track.channels));
         entry.set("sample_rate", Json(track.sample_rate));
         entry.set("title", Json(track.title));
+        entry.set("role", Json(track.role));
+        Json sources = Json::array();
+        for (const std::string& source : track.sources) sources.push(Json(source));
+        entry.set("sources", sources);
         tracks.push(entry);
       }
       json.set("audio", tracks);
@@ -361,20 +382,33 @@ int main(int argc, char** argv) {
     }
     if (has_flag("--media-peaks")) {
       std::vector<std::vector<float>> peaks;
+      std::vector<bool> decoded;
       std::string peaks_error;
       const int buckets = std::atoi(argument_after("--media-peaks", 2).c_str());
-      const bool ok = media_peaks(argument_after("--media-peaks", 1), buckets > 0 ? buckets : 600, peaks, peaks_error);
+      // `raw` is opt-in: an older caller gets the per-track normalisation it has always had, while the
+      // editor asks for one absolute scale so its lanes compare honestly.
+      const bool raw = argument_after("--media-peaks", 3) == "raw";
+      const bool ok = media_peaks(argument_after("--media-peaks", 1), buckets > 0 ? buckets : 600, peaks,
+                                  peaks_error, &decoded, !raw);
       Json json = Json::object();
       json.set("ok", Json(ok));
       if (!ok) json.set("error", Json(peaks_error));
       Json lanes = Json::array();
+      // Four decimals only for `raw`: its lanes share one absolute scale, so two rounded a quiet track
+      // (below -46 dBFS) to silence. A normalised lane still gets two, which is plenty and keeps the line short.
+      const float scale = raw ? 10000.0f : 100.0f;
       for (const std::vector<float>& lane : peaks) {
         Json values = Json::array();
-        // Two decimals are plenty for a waveform and keep the line short.
-        for (float value : lane) values.push(Json(std::round(value * 100.0f) / 100.0));
+        for (float value : lane) values.push(Json(std::round(value * scale) / scale));
         lanes.push(values);
       }
       json.set("tracks", lanes);
+      // A lane whose decoder did not open is all zeros in `tracks`; this says which, so the editor can
+      // call it unreadable rather than silent. The ordinals match the file's audio streams.
+      Json readable = Json::array();
+      for (bool lane : decoded) readable.push(Json(lane));
+      json.set("decoded", readable);
+      json.set("raw", Json(raw));
       std::printf("%s\n", json.dump().c_str());
       return ok ? 0 : 3;
     }
@@ -579,7 +613,7 @@ int main(int argc, char** argv) {
   Config& config = protocol.config();
   // Every entry point reaches this check, including Windows startup and buffrx:// links which start
   // the engine directly. A second launch was handed to the existing instance before this point.
-  const bool utility = package_smoke || capture_smoke || has_argument(argc, argv, "--benchmark-seconds");
+  const bool utility = package_smoke || capture_smoke || has_argument(argc, argv, "--benchmark-seconds") || has_argument(argc, argv, "--compat-report");
   if (elevation_needed(config.run_as_admin, process_is_elevated(), utility)) {
     // The elevated copy must be able to acquire the single-instance mutex as soon as UAC returns.
     release_single_instance();
@@ -611,6 +645,20 @@ int main(int argc, char** argv) {
       startup_notes.emplace_back("Recording the whole screen",
                                  "The window you picked is not available, so BuffrX records the whole screen. "
                                  "Pick a window or a game again on the Video page when it is running.");
+    }
+  }
+
+  // The chosen display is not there (unplugged, a docking station left, a remote session): the capture follows the
+  // primary and keeps the saved device, so it returns on its own when the screen does. Say it at start once, because
+  // the tick's notice only fires on a change and a start already fallen back has none.
+  if (config.capture_mode == "display") {
+    const DisplayPick pick = pick_display(host.displays(), config.display_id, config.display_name);
+    if (!pick.found) {
+      startup_notes.emplace_back("No display to record",
+                                 "No display answered Windows, so there is nothing to capture until one is connected.");
+    } else if (pick.primary_fallback) {
+      startup_notes.emplace_back("The display is not connected",
+                                 "BuffrX records the primary display until it comes back. Pick another display on the Video page if you meant to.");
     }
   }
 
@@ -650,9 +698,8 @@ int main(int argc, char** argv) {
   // FFmpeg's messages become the engine's, under one prefix, and its per-file chatter is said once.
   // Installed after libobs starts: the runtime sets its own callback while it loads its modules.
   media_install_log_callback();
-  // A start that picked up the step this PC settled at says so in the settings too, or the page shows full speed while
-  // the encoder runs lighter and the "Start from full speed again" button has nothing to clear.
-  if (host.governor_step() > 0) protocol.note_governor_step(host.governor_step());
+  // An older version's encoder step is ignored and cleared here; config.json does not carry it any more.
+  config.encoder_speed_step = 0;
 
   // The first start picks the codec from the hardware (decided with the user, 2026-11-05): H.264 unless an AV1 encoder is
   // there, and the answer is remembered, so a codec the person chooses afterwards is never overridden again.
@@ -671,6 +718,25 @@ int main(int argc, char** argv) {
     std::string pick_save_error;
     if (!save_config(data_root + "\\config.json", config, pick_save_error)) {
       BX_LOG_WARN("the codec choice was not written: %s", pick_save_error.c_str());
+    }
+  }
+  // Decided with the owner (2026-11-14): AV1 is the default only on NVENC. A config the first start auto-picked AV1 for on another
+  // vendor (AMD's av1_texture_amf ended a user in driver resets) moves to H.264 once; AV1 stays a choice on the Video page.
+  if (!config.codec_h264_default_migrated) {
+    const bool moves = codec_default_migration_due(config.codec, config.codec_auto_picked, false, host.preferred_codec() == "av1");
+    config.codec_h264_default_migrated = true;
+    if (moves) {
+      config.codec = "h264";
+      // A step the governor took on AV1 says nothing about H.264, and on the AMD reports it was taken on a dead encoder.
+      config.encoder_speed_step = 0;
+      std::string move_error;
+      if (!host.apply(config, true, move_error)) BX_LOG_WARN("the move to H.264 did not start (%s); keeping it stored for the next attempt", move_error.c_str());
+      BX_LOG_NOTE("codec moved from the auto-picked AV1 to H.264: this GPU's AV1 encoder is not NVENC");
+      startup_notes.emplace_back("Clips now use H.264", "H.264 is the most compatible choice on this graphics card. AV1 is still on the Video page.");
+    }
+    std::string move_save_error;
+    if (!save_config(data_root + "\\config.json", config, move_save_error)) {
+      BX_LOG_WARN("the codec migration was not written: %s", move_save_error.c_str());
     }
   }
 
@@ -943,6 +1009,7 @@ int main(int argc, char** argv) {
 
   // Tray and hotkey commands route through the same code paths the protocol uses.
   HotkeyEnable hotkey_enable;
+  std::atomic<int> swap_level{0};  // the effort step the next "encoder_swap" action builds (host.take_encoder_swap_due)
   auto run_action = [&](const QueuedAction& job) {
     const std::string& action = job.name;
     // The same engine lock a protocol command takes: a hotkey and a pipe command never race on libobs.
@@ -981,9 +1048,16 @@ int main(int argc, char** argv) {
     };
     // Each action leaves the same session marker its protocol command would.
     if (action == "save_replay" || action == "quick_clip") {
-      const int seconds = action == "save_replay" ? config.buffer_seconds : config.quick_clip_seconds;
-      if (host.save_clip(seconds, action_error) == 0) {
-        protocol.mark("buffer.save", std::to_string(seconds) + " s");
+      // A quick clip is always a listed length no longer than the buffer. A buffer shorter than every length refuses
+      // the press with the same words the panel uses: 0 would keep the whole buffer, which is Save clip's job.
+      const ui::QuickClipPress press = action == "quick_clip"
+                                           ? ui::quick_clip_press(config.quick_clip_seconds, config.buffer_seconds)
+                                           : ui::QuickClipPress{config.buffer_seconds, {}};
+      if (!press.refusal.empty()) {
+        notify(ToastKind::warning, "Quick clip not saved", press.refusal, ToastChime::alert,
+               ui_host.foreground_is_ours());
+      } else if (host.save_clip(press.seconds, action_error) == 0) {
+        protocol.mark("buffer.save", std::to_string(press.seconds) + " s");
       } else if (job.hotkey && action_error == "the buffer is not running") {
         action_error.clear();
         enable_off_feature(false);
@@ -1025,17 +1099,35 @@ int main(int argc, char** argv) {
         protocol.mark("recording.start", "start");
         emit(Protocol::make_event("recording.changed", Json(true)));
       }
-    } else if (action == "governor_step") {
-      // The encoder could not keep up: its speed settings go down a step (encoder_governor.h), and the person is
-      // told, because their own settings are not what is running any more.
-      if (host.apply_governor_step(action_error)) {
-        protocol.note_governor_step(host.governor_step());
-      } else if (!action_error.empty()) {
+    } else if (action == "encoder_move") {
+      // plan 008: the controller moved a level. The swap keeps the buffer's footage; the host says a frame-rate change in a card.
+      if (!host.apply_controller_move(action_error)) {
+        BX_LOG_WARN("the encoder move did not happen: %s", action_error.c_str());
+        action_error.clear();
+      }
+    } else if (action == "encoder_swap") {
+      // plan 008: the buffer takes another encoder and keeps its footage. The level was left by the tick (host.take_encoder_swap_due).
+      const int level = swap_level.load();
+      if (!host.swap_encoder(level & 0xff, level >> 8, action_error)) {
+        BX_LOG_WARN("the encoder swap did not happen: %s", action_error.c_str());
+        action_error.clear();
+      }
+    } else if (action == "ladder_step") {
+      // The encoder died twice in ten minutes: one rung down (encoder_ladder.h). The host says what it did in a card.
+      if (!host.apply_ladder_step(action_error) && !action_error.empty()) {
         notify(ToastKind::warning, "Encoder", action_error);
         action_error.clear();
       }
     } else if (action == "deep_idle") {
       host.enter_deep_idle();
+    } else if (action == "display_replan") {
+      // The display being followed is not on the running device's card (or arrived since it was made): the
+      // device moves, which is a video reset. The host says a failure once (and once more when it stops trying),
+      // so a retry every half minute is not a card every half minute.
+      if (!host.rebuild_for_display(action_error)) {
+        BX_LOG_WARN("the display rebuild failed: %s", action_error.c_str());
+        action_error.clear();
+      }
     } else if (action == "resume") {
       // The machine slept and woke. A sleep takes the graphics device and the encoder sessions with it, and nothing
       // reports that as a fault: the ring would sit there looking alive with a frozen picture. Nothing capturing means
@@ -1053,6 +1145,14 @@ int main(int argc, char** argv) {
       // The session locked. Stopping the buffer takes the engine lock and libobs, so the window thread that
       // heard the notification only queued this.
       if (config.pause_on_lock) host.stop_buffer();
+    } else if (action == "game_only_pause") {
+      protocol.pause_for_game_wait();
+    } else if (action == "game_only_resume") {
+      std::string resume_error;
+      if (!protocol.resume_for_game(resume_error)) {
+        BX_LOG_WARN("games only: the buffer did not start on the game: %s", resume_error.c_str());
+        notify(ToastKind::warning, "The buffer did not start", resume_error, ToastChime::alert);
+      }
     } else if (action == "resume_after_lock") {
       if (config.pause_on_lock) {
         std::string buffer_error;
@@ -1243,6 +1343,12 @@ int main(int argc, char** argv) {
   // - a crash, a Task Manager kill, a power cut - takes the ring with it. What it cannot take is the library, and the
   // first question a person has after a crash is whether their clips survived: one card answers it, and it is drawn by
   // the engine, so a start straight to the tray still says it.
+  // libobs ended the engine (a graphics driver reset it could not rebuild from: libobs_guard.cpp) and left its reason here.
+  // The one card that start draws is this one, and it answers the same question the recovery card does.
+  const std::string crash_marker_path = data_root + "\\driver_crash.json";
+  buffrx::CrashMarker driver_crash;
+  const bool driver_crash_card = buffrx::crash_marker_read(crash_marker_path, driver_crash) && !driver_crash.card.empty();
+  std::string driver_crash_detail;
   const std::string running_marker = data_root + "\\engine.running";
   if (GetFileAttributesA(running_marker.c_str()) != INVALID_FILE_ATTRIBUTES) {
     buffrx::RecoveryFacts facts;
@@ -1262,10 +1368,21 @@ int main(int argc, char** argv) {
       else ++facts.damaged;
     }
     if (buffrx::recovery_notice_wanted(facts)) {
-      notify(ToastKind::info, "Welcome back", buffrx::recovery_notice_text(facts), ToastChime::saved);
+      // A file that looks damaged is the one thing the driver card must not paper over with "your clips are safe".
+      if (driver_crash_card) driver_crash_detail = buffrx::recovery_notice_text(facts);
+      else notify(ToastKind::info, "Welcome back", buffrx::recovery_notice_text(facts), ToastChime::saved);
     }
     BX_LOG_WARN("the last run did not exit cleanly: %d clips and %d screenshots checked, %d damaged",
                 facts.clips_ok + facts.damaged, facts.screenshots_ok + facts.damaged, facts.damaged);
+  }
+  if (driver_crash_card) {
+    const buffrx::CrashCard card = buffrx::crash_card_text(driver_crash.card, driver_crash.message);
+    notify(driver_crash.card == "restarted" ? ToastKind::info : ToastKind::warning, card.title,
+           driver_crash_detail.empty() ? card.detail : driver_crash_detail, ToastChime::none);
+    BX_LOG_WARN("the last run ended in a libobs crash (%s): %s", driver_crash.message.c_str(), driver_crash.card.c_str());
+    // Said once; the history stays, because the next crash decides from it whether BuffrX may start itself again.
+    driver_crash.card.clear();
+    write_file_atomic(crash_marker_path, buffrx::crash_marker_to_json(driver_crash).dump(2));
   }
   // Windows brings BuffrX back after a crash (RegisterApplicationRestart). The relaunched copy shows the notice above
   // and does not start capturing by itself; Windows limits how often it tries, so a crash loop cannot be built here.
@@ -1282,7 +1399,9 @@ int main(int argc, char** argv) {
   // The ring starts unless the user asked it not to. Starting it is not the same as wanting it: the
   // capture source may not have a frame yet, in which case the watchdog starts it when one arrives,
   // and that is what buffer_state "starting" means.
-  if (config.start_buffering && !restarted) {
+  // A relaunch after a libobs crash only happens when something was capturing, and its card says the buffer runs again:
+  // it starts even when the person's own start setting is off.
+  if ((config.start_buffering || relaunched) && !restarted) {
     std::string buffer_error;
     {
       // Already in a game when BuffrX starts (started at sign-in with the game running, or launched after it):
@@ -1290,13 +1409,26 @@ int main(int argc, char** argv) {
       // open across the start: the pipe server is already answering clients, and one of them could change the
       // settings under the start.
       std::lock_guard<std::mutex> engine_lock(protocol.engine_mutex());
-      protocol.start_on_running_game();
-      if (!host.start_buffer(buffer_error)) {
+      // Games only with no game on screen: nothing is started, and the buffer begins on the first game.
+      if (!protocol.wait_for_game_instead(protocol.start_on_running_game()) && !host.start_buffer(buffer_error)) {
         BX_LOG_WARN("buffer did not start yet: %s", buffer_error.c_str());
       }
     }
   } else {
     BX_LOG_INFO("started with the buffer off (start_buffering is false)");
+  }
+
+  if (has_argument(argc, argv, "--compat-report")) {
+    // Plan 009: the same report as the Settings button, for a tester who cannot open the panel. Starts the buffer first when the
+    // settings say so (the 10 s speed sample needs it) and exits with 0 once both files are written.
+    Json report = Json::object();
+    std::string report_error;
+    const bool ok = protocol.diagnostics_report(report, report_error);
+    if (ok) std::printf("BUFFRX_COMPAT_REPORT_OK\n");
+    else std::printf("BUFFRX_COMPAT_REPORT_FAIL %s\n", report_error.c_str());
+    server.stop();
+    host.shutdown();
+    return ok ? 0 : 6;
   }
 
   if (has_argument(argc, argv, "--benchmark-seconds")) {
@@ -1537,9 +1669,19 @@ int main(int argc, char** argv) {
         // The settings the window and notification threads read, taken under the lock they are written under.
         ui_config->set(config);
         // The encoder cannot keep up and the next step down is due: it rebuilds the encoder, so it is not done here.
-        if (host.take_governor_step_due()) queue_action("governor_step");
+        if (host.take_controller_move_due()) queue_action("encoder_move");
+        if (host.take_ladder_step_due()) queue_action("ladder_step");
+        {
+          const int level = host.take_encoder_swap_due();
+          if (level >= 0) {
+            swap_level = level;
+            queue_action("encoder_swap");
+          }
+        }
         // Idle long enough: the canvas drops to the idle rate (a video reset, so not on this thread either).
         if (host.take_deep_idle_due()) queue_action("deep_idle");
+        // The followed display is not on the running device's own card: moving the device is a video reset.
+        if (host.take_display_replan_due()) queue_action("display_replan");
         // A probe, not a setting: a real sleep cannot be produced on demand, so BUFFRX_TEST_RESUME_MS queues the
         // action the power broadcast queues, once, that many milliseconds into the run.
         {
@@ -1554,6 +1696,22 @@ int main(int argc, char** argv) {
             resume_fired = true;
             BX_LOG_NOTE("BUFFRX_TEST_RESUME_MS: asking for the rebuild a wake runs");
             queue_action("resume");
+          }
+        }
+        // The same probe for the display rebuild: a second monitor on another card cannot be produced on
+        // demand here, so BUFFRX_TEST_DISPLAY_REPLAN_MS queues the action the follow check queues, once.
+        {
+          static const uint32_t replan_after_ms = [] {
+            char text[32];
+            if (GetEnvironmentVariableA("BUFFRX_TEST_DISPLAY_REPLAN_MS", text, sizeof(text)) == 0) return 0u;
+            return static_cast<uint32_t>(std::strtoul(text, nullptr, 10));
+          }();
+          static const uint32_t replan_started = GetTickCount();
+          static bool replan_fired = false;
+          if (replan_after_ms && !replan_fired && GetTickCount() - replan_started > replan_after_ms) {
+            replan_fired = true;
+            BX_LOG_NOTE("BUFFRX_TEST_DISPLAY_REPLAN_MS: asking for the display rebuild the follow check queues");
+            queue_action("display_replan");
           }
         }
         // A probe, not a setting: a stop libobs never answers cannot be produced on demand either, so
@@ -1579,10 +1737,20 @@ int main(int argc, char** argv) {
         if (host.take_recording_start_due()) queue_action("start_recording");
         const uint32_t poll_started = GetTickCount();
         protocol.poll_game(now);
+        // Games only: the buffer pauses when the game is gone and starts on the next one. The decision is a few reads
+        // here; the stop and the start are libobs work, so the action worker carries them out.
+        switch (protocol.game_only_tick(now)) {
+          case buffrx::GameOnlyAction::pause: queue_action("game_only_pause"); break;
+          case buffrx::GameOnlyAction::resume: queue_action("game_only_resume"); break;
+          case buffrx::GameOnlyAction::none: break;
+        }
         // The Timeline preview is its own process: its id goes when its window does.
         protocol.poll_timeline_preview(now);
         // Timeline's own tick, beside the game's: it writes while the buffer runs, whatever is in front.
         protocol.poll_timeline(now);
+        // The game BuffrX is capturing, for the Current game audio slot, and the one card an unresolved
+        // audio problem earns. Both are a handful of reads; nothing is enumerated or sampled.
+        protocol.poll_audio(now);
         // A link being downloaded while a game has focus uploads slower, so the game keeps its connection.
         links.set_gaming(protocol.game_in_focus());
         const uint32_t poll_ms = GetTickCount() - poll_started;
@@ -1719,7 +1887,9 @@ int main(int argc, char** argv) {
     tray.buffer_state = stats.buffer_state;
     tray.recording = stats.recording;
     tray.running_seconds = stats.recording_seconds;
-    tray.quick_seconds = settings.quick_clip_seconds;
+    // A quick clip is a save from the ring and never longer than the buffer: the menu says the listed length it will
+    // keep, or no Quick clip row at all when the buffer is shorter than every length.
+    tray.quick_seconds = quick_clip_for_buffer(settings.quick_clip_seconds, settings.buffer_seconds);
     window.set_tray_state(tray);
     // One place says it: the key, the panel button and a share receiver all end in the same state change.
     if (stats.recording && !last_recording) {

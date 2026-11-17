@@ -59,6 +59,12 @@ bool gpu_adapter(uint32_t& vendor_id, std::string& name) {
   return true;
 }
 
+std::string gpu_driver_version() {
+  // Linux has no user-mode driver version to ask for the way DXGI reports one, and the port runs one
+  // adapter. Empty is the contract's "could not say", so the ladder key falls back to the adapter name.
+  return std::string();
+}
+
 std::vector<GpuAdapterInfo> gpu_adapters() {
   std::vector<GpuAdapterInfo> list;
   GpuAdapterInfo info;

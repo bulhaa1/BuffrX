@@ -396,6 +396,37 @@ DedupeRun feed(SpillRig& rig, const std::vector<SpillTestPacket>& all, const std
 
 void test_dedupe_store() {
   using namespace dedupe_test;
+  {
+    SpillRig rig(8 * bx::kSpillBlockBytes, 1, 60 * 1000000LL, 0);
+    rig.store.configure_dedupe(bx::HashCodec::h264);
+    SpillTestPacket old = packet(true, true, 10000000, 1024, 900);
+    old.fields.sys_dts_usec = 10000000;
+    rig.store.push(old);
+    rig.store.begin_epoch(1);
+    std::vector<SpillTestPacket> later;
+    for (int frame = 0; frame <= 20; ++frame) {
+      auto video = packet(true, frame % 10 == 0, frame * kFrameUs, 100 * 1024, frame + 1);
+      video.fields.sys_dts_usec = 11000000 + frame * kFrameUs;
+      later.push_back(video);
+      rig.store.push(video);
+      auto audio = packet(false, false, frame * kFrameUs, 4096, frame + 100);
+      audio.fields.sys_dts_usec = video.fields.sys_dts_usec;
+      rig.store.push(audio);
+    }
+    const uint32_t id = rig.store.add_chunk(probe_of(later, 0, 20, false, "epoch-chunk"));
+    rig.store.set_chunk_usable(id, true);
+    while (rig.store.spill_due() && rig.store.spill_step()) {}
+    auto snapshot = rig.store.begin_save();
+    int covered_video = 0, covered_audio = 0;
+    for (const auto& entry : snapshot->entries) {
+      if (entry.on_chunk && entry.chunk_id == id) {
+        if (entry.video) ++covered_video;
+        else ++covered_audio;
+      }
+    }
+    check(covered_video == 20 && covered_audio == 20,
+          "dedupe after an encoder swap covers sound on the shifted ring clock with its pictures");
+  }
   const int64_t file = 12 * bx::kSpillBlockBytes;
   const int64_t limit = 16 * kMiB;
   const int64_t window_us = 45 * 1000000LL;

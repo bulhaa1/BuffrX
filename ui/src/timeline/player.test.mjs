@@ -26,7 +26,10 @@ class FakeBuffer extends EventTarget {
   refuse = false
   stall = false
   quota = false
+  inits = 0
+  changed = []
   static quotaAll = false
+  changeType(mime) { this.changed.push(mime) }
   get buffered() { return { length: this.end ? 1 : 0, start: () => 0, end: () => this.end } }
   appendBuffer(data) {
     const type = String.fromCharCode(...new Uint8Array(data).subarray(4, 8))
@@ -35,6 +38,7 @@ class FakeBuffer extends EventTarget {
       queueMicrotask(() => this.dispatchEvent(new Event('error')))
       return
     }
+    if (type === 'ftyp' || type === 'moov') this.inits++
     if (type === 'moof') {
       this.appended++
       this.end += 0.5
@@ -720,6 +724,42 @@ test('an append the media buffer refuses resolves and is reported once', async (
   } finally {
     process.off('unhandledRejection', onRejection)
     player.close()
+    globalThis.fetch = oldFetch
+    URL.createObjectURL = oldCreate
+    URL.revokeObjectURL = oldRevoke
+  }
+})
+
+test('a chunk written on new encoder headers gets its own init segment, and a new codec changes type first', async () => {
+  globalThis.window = {}
+  globalThis.MediaSource = FakeMedia
+  const oldFetch = globalThis.fetch
+  const oldCreate = URL.createObjectURL
+  const oldRevoke = URL.revokeObjectURL
+  const initWith = (entry) => bytes(box('ftyp', str('isom')),
+    box('moov', box('trak', tkhd, box('mdia', mdhd, hdlr, box('minf', box('stbl', full('stsd', 0, u32(1), entry)))))))
+  // Same codec string, other parameter sets (an effort step), then another profile (a codec the browser must switch to).
+  const swapped = initWith(box('avc1', new Uint8Array(78), box('avcC', Uint8Array.of(1, 100, 0, 31, 9))))
+  const recoded = initWith(box('avc1', new Uint8Array(78), box('avcC', Uint8Array.of(1, 77, 0, 31))))
+  const files = new Map([
+    ['a', bytes(init, fragment(0))], ['b', bytes(init, fragment(0))],
+    ['c', bytes(swapped, fragment(0))], ['d', bytes(recoded, fragment(0))],
+  ])
+  globalThis.fetch = async (address) => new Response(files.get(decodeURIComponent(new URL(address).pathname.slice(1))), { status: 200 })
+  URL.createObjectURL = () => 'blob:test'
+  URL.revokeObjectURL = () => {}
+  try {
+    const { TimelinePlayer } = await import('./player.ts')
+    const states = []
+    const player = new TimelinePlayer(new FakeVideo(), { onState: (state) => states.push(state) })
+    const chunks = ['a', 'b', 'c', 'd'].map((file, i) => ({ file, startMs: i * 500, endMs: (i + 1) * 500, published: true, epoch: 0 }))
+    await player.load({ id: 's', title: 's', availableStartMs: 0, availableEndMs: 2000, chunks }, 0)
+    assert.equal(media.buffer.appended, 4, 'every chunk is appended')
+    assert.equal(media.buffer.inits, 3, 'the first chunk, then each chunk whose headers changed, and no repeat for an identical one')
+    assert.deepEqual(media.buffer.changed, ['video/mp4; codecs="avc1.4D001F, mp4a.40.2"'], 'a new codec switches the buffer before its init')
+    assert.ok(!states.includes('error') && !states.includes('codec'))
+    player.close()
+  } finally {
     globalThis.fetch = oldFetch
     URL.createObjectURL = oldCreate
     URL.revokeObjectURL = oldRevoke

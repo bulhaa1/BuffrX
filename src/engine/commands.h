@@ -16,7 +16,10 @@
 #include "../shared/json.h"
 #include "../version.h"
 #include "capture_enum.h"
+#include "audio_health.h"
+#include "audio_watch.h"
 #include "config.h"
+#include "game_only.h"
 #include "game_watch.h"
 #include "gamepad_poll.h"
 #include "platform.h"
@@ -85,8 +88,18 @@ public:
   // A buffer that starts while a game runs starts on the game, not on the display with a switch a moment later
   // (which reset the buffer and made the first start slow): the fullscreen foreground game, else the one seen a
   // minute ago that still runs, else any fullscreen game already on screen (BuffrX started after it). The
-  // engine lock held. No-op unless auto_game_capture.
-  void start_on_running_game();
+  // engine lock held. No-op unless auto_game_capture. True when a game is now the capture target.
+  bool start_on_running_game();
+  // "Games only" (config.game_only, with detection on). A start with no game to start on is not a start: the buffer
+  // waits, and `game_waiting()` says so in the status. `wait_for_game_instead(found)` is that decision, with the
+  // engine lock held, for a start that has just asked start_on_running_game.
+  bool wait_for_game_instead(bool game_found);
+  bool game_waiting() const { return game_wait_; }
+  // The tick's side of it (a few reads, no libobs): what the policy wants done now. A pause or a resume is carried out
+  // by the action worker, which calls pause_for_game_wait / resume_for_game; nothing more is asked until it has.
+  buffrx::GameOnlyAction game_only_tick(uint32_t now_ms);
+  void pause_for_game_wait();
+  bool resume_for_game(std::string& error);
   // The tray menu's two switches, with the engine lock held: the buffer on or off (as buffer.start / buffer.stop), and
   // Performance mode (as config.set). Performance waits while a recording runs, like the interface's switch.
   bool toggle_buffer(std::string& error);
@@ -140,7 +153,6 @@ public:
   Json apply_patch(const Json& patch, std::string& error);
   // The governor lowered the encoder's speed settings to `step`: remembered in the config, so the next launch
   // starts there, and the interface is told. Called with the engine lock held, from the action worker.
-  void note_governor_step(int step);
 
   // Registers every configured hotkey with the platform window. Called at startup and whenever a
   // binding changes.
@@ -171,10 +183,23 @@ public:
   // The engine lock (see command_policy.h). main holds it around the tick, the status broadcast and the
   // tray/hotkey actions, so libobs objects are never used from two threads at once.
   std::mutex& engine_mutex() { return engine_mutex_; }
+  // The compatibility report (plan 009): gathers the machine's facts, samples the encoder for 10 s while the buffer runs (the engine
+  // lock is not held while it waits), and writes compat-report.json and .txt to the data root. Used by `diagnostics.report` and
+  // `--compat-report`. `data` is {file, summary}.
+  bool diagnostics_report(Json& data, std::string& error);
 
   // One poll of the running game, from the tick with the engine lock held: the capture target check and,
   // unless auto_game_capture is off, the focus-based capture switch.
   void poll_game(uint32_t now_ms);
+
+  // What the selected audio slots need from the tick, engine lock held: the game BuffrX is actually
+  // capturing (for the Current game slot, updated in place with no encoder rebuilt), and at most one card
+  // per unresolved audio problem (audio_health.h). Nothing is sampled or enumerated here.
+  void poll_audio(uint32_t now_ms);
+  // Automatic audio (audio_auto.h): starts the session watcher only while something is capturing or about
+  // to, applies its snapshot live (never a rebuild), and stops it when nothing wants sound. Engine lock
+  // held, from the tick. Nothing here reads a meter.
+  void poll_auto_audio(uint32_t now_ms);
 
   // The Timeline writer's tick (timeline_state.h): builds the facts the engine cannot see - the setting,
   // the buffer, the captured game, the foreground, the preview - and asks the host to open, pause, resume
@@ -271,10 +296,34 @@ private:
   // front of the game by then) starts on that game instead of on the display (buffer.start).
   std::string last_game_id_, last_game_exe_, last_game_title_;
   uint32_t last_game_seen_ms_ = 0;
+  bool game_wait_ = false;          // games only paused the buffer, or a start found no game: it begins on the next one
+  bool game_only_pending_ = false;  // a pause or resume is queued on the action worker
+  uint32_t game_only_asked_ms_ = 0; // when it was queued: a dropped action must not leave the policy waiting for ever
+  uint32_t game_gone_since_ms_ = 0; // when the game was last seen to go (0: one is here)
+  bool game_only_held_ = false;     // the game left and games only kept the capture on it (never the desktop) until the pause
   uintptr_t active_game_hwnd_ = 0;  // the captured game's window, for the liveness check
   uint32_t idle_sample_ms_ = 0;     // the last foreground read while nothing wanted frames
   uint32_t alive_checked_ms_ = 0;
   bool alive_cached_ = false;
+  // The Current game audio slot follows the game BuffrX captures. A pinned game has no hook state to read,
+  // so its program is looked for once a second; an auto-captured one already has active_game_alive's cache.
+  uint32_t game_audio_checked_ms_ = 0;
+  bool game_audio_alive_ = false;
+  // One card per unresolved audio problem (audio_health.h), never one per tick.
+  AudioNoticeState audio_notice_;
+  // What the last audio poll resolved, for status.audio: the game whose picture the capture covers, which is what
+  // the policy judges (never the Current game routing target), and when it was polled (the notice's grace is
+  // measured against that clock). The page's persistent line uses the same facts, so it says the same thing after
+  // the card is gone.
+  std::string audio_warning_game_;
+  uint32_t audio_poll_ms_ = 0;
+  // Automatic audio's event watcher. It runs only while the buffer/manual/Timeline wants sound, so an
+  // idle engine starts no thread and opens no device. A snapshot is applied when its generation moves or
+  // every 2 s; the watcher itself is event driven and never reads a meter.
+  AudioSessionWatcher auto_watcher_;
+  uint64_t auto_generation_ = ~0ull;
+  uint32_t auto_apply_ms_ = 0;
+  bool auto_failed_reported_ = false;
   uint32_t last_target_check_ = 0;
   std::string observed_exe_, observed_title_;
   ForegroundWindow foreground_;  // the foreground window as game capture needs it (id, title, exe)
@@ -300,6 +349,10 @@ private:
   // What the last poll decided, so `timeline.changed` is a state change and never a per-chunk stream.
   TimelineState last_timeline_state_ = TimelineState::Off;
   bool last_timeline_enabled_ = false;
+  // The game the detectors call running on the last tick (the same fact Timeline's own gate uses, so a game seen
+  // without automatic capture still counts). Empty when no detector knows one. Kept for the audio warning, which
+  // must not run a detection of its own.
+  std::string detected_game_exe_;
   // Names a new lease; only touched with the engine lock held, next to the lease it names.
   uint64_t timeline_lease_seq_ = 0;
   // Serializes an editor's lease handoff with an explicit erase of the same store. An erase releases it

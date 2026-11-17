@@ -52,6 +52,7 @@ inline int64_t spill_reservation_bytes(int64_t peak_kbps, int64_t audio_kbps, in
 
 struct PacketFields {
   int64_t pts = 0, dts = 0, dts_usec = 0;
+  int64_t sys_dts_usec = 0;  // when the packet was made, on the system clock: how long an encoder swap really took (not in the disk record)
   int32_t timebase_num = 1, timebase_den = 1;
   uint32_t track = 0;
   bool video = false, keyframe = false;

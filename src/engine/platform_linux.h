@@ -4,6 +4,7 @@
 #pragma once
 
 #include "linux/compat/windows.h"
+#include "hotkey_rules.h"
 
 #include <cstdint>
 #include <functional>

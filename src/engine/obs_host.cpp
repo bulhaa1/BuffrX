@@ -1,12 +1,18 @@
 #include "obs_host.h"
 #include "sleep_patch.h"
+#include "libobs_guard.h"
+#include "gpu.h"
+#include "libobs_compat.h"
 #include "ring_output.h"
 
 #include "buffer_watch.h"
 #include "capture_follow.h"
 #include "recording_watch.h"
 #include "capacity_memory.h"
+#include "audio_layout.h"
+#include "audio_auto.h"
 #include "audio_meter.h"
+#include "process_audio_source.h"
 
 #include <windows.h>
 #include <tlhelp32.h>
@@ -64,23 +70,8 @@
 // Live level meters: volmeters report peak and RMS dB from the audio thread.
 #include <obs-audio-controls.h>
 
-#if LIBOBS_API_MAJOR_VER >= 33
-#define BX_ENCODER_FRAMES(encoder) obs_encoder_get_encoded_frames(encoder)
-#else
-// libobs 30's public API does not expose the encoder's running frame count. The status keeps the
-// output's own count instead; the picture and the buffer are unaffected.
-#define BX_ENCODER_FRAMES(encoder) static_cast<uint64_t>(obs_get_total_frames())
-#endif
-
 namespace bx {
 namespace {
-
-// What changes how hard the encoder works, as one key for capacity.json: codec, requested encoder, picture, rate and the
-// quality preset. A different key is a different question, and the ladder is asked again.
-std::string capacity_key_for(const Config& config) {
-  return capacity_key(config.codec, config.encoder, config.output_width, config.output_height, config.capture_fps,
-                      config.video_preset);
-}
 
 // The canvas channel each audio source sits on. libobs mixes the audio output from the canvas channels
 // (obs-audio.c sums `root_nodes`, filled only from a canvas's channels), not from the list of audio
@@ -88,6 +79,12 @@ std::string capacity_key_for(const Config& config) {
 // clip came out with a silent AAC track. Channel 0 is the capture scene.
 constexpr uint32_t kDesktopViewChannel = 1;
 constexpr uint32_t kMicViewChannel = 2;
+// Application captures sit above the two fixed channels. Five tracks can carry apps (2..6) and up to
+// eight routes may share them; libobs has 64 channels and only these are cleared and set here.
+constexpr uint32_t kAppAudioViewChannelBase = 16;
+// Automatic mode's four buses (tracks 3..6). Kept clear of the manual slots so the two plans can never
+// share a channel, and small enough that no other view channel is touched.
+constexpr uint32_t kAutoAudioViewChannelBase = 24;
 
 // The capture plugin and its two source ids differ by platform; everything above this line is the
 // same graph either way.
@@ -183,6 +180,17 @@ void apply_encoder_settings(obs_data_t* settings, obs_properties_t* properties,
   for (const EncoderSetting& setting : list) apply_encoder_setting(settings, properties, setting);
 }
 
+// One property read back out of an encoder's settings, typed the way the property is. The running values and the
+// requested ones are both read here, so they can differ only by the settings applied to them.
+Json encoder_value_of(obs_data_t* data, const char* name, obs_property_type type) {
+  switch (type) {
+    case OBS_PROPERTY_BOOL: return Json(obs_data_get_bool(data, name));
+    case OBS_PROPERTY_INT: return Json(static_cast<int64_t>(obs_data_get_int(data, name)));
+    case OBS_PROPERTY_FLOAT: return Json(obs_data_get_double(data, name));
+    default: return Json(obs_data_get_string(data, name));
+  }
+}
+
 // libobs resolves an effect file's "#include" by looking for the last forward slash in the including
 // file's path. Windows-style backslashes make that lookup fail, so every path this engine hands to
 // libobs is converted first — the same convention OBS itself uses on Windows.
@@ -254,22 +262,27 @@ std::vector<DisplayInfo> enumerate_displays() {
 #endif
 }
 
-// The GDI device name (\\.\DISPLAY1) of the configured display: by name when the config carries one,
-// else by its position in EnumDisplayMonitors order (the index libobs's monitor list uses). Empty
-// when no such monitor exists. `warned` remembers which missing display was already reported; it is the
-// host's, written under the engine lock, because a function-local static was written from several threads.
-std::string monitor_device_name(const Config& config, std::string* warned = nullptr) {
+// The display a config means right now: device name followed wherever the enumeration moved it, index only for a
+// config that never saved one, the primary when the saved screen is gone (marked as such), and nothing when the desk
+// has no display at all. `warned` is the host's: it says the fallback once per episode, and is cleared when the
+// chosen screen is back so the next unplug is reported again.
+DisplayPick resolve_display(const Config& config, std::string* warned = nullptr) {
   const DisplayPick pick = pick_display(enumerate_displays(), config.display_id, config.display_name);
-  if (!pick.found) return {};
-  // The display that was chosen is gone (unplugged, a docking station left, a remote session): the capture
-  // goes to the primary display instead of to nothing, and the buffer keeps working.
-  if (pick.primary_fallback && !config.display_name.empty() && warned) {
-    if (*warned != config.display_name) {
+  if (warned) {
+    if (pick.found && !pick.primary_fallback) {
+      warned->clear();
+    } else if (pick.found && pick.primary_fallback && !config.display_name.empty() && *warned != config.display_name) {
       *warned = config.display_name;
       BX_LOG_WARN("the display \"%s\" is not there; capturing the primary display (%s)", config.display_name.c_str(), pick.device.c_str());
     }
   }
-  return pick.device;
+  return pick;
+}
+
+// The GDI device name (\\.\DISPLAY1) of the configured display. Empty when no such monitor exists, which a
+// capture must refuse rather than send to a stale index.
+std::string monitor_device_name(const Config& config, std::string* warned = nullptr) {
+  return resolve_display(config, warned).device;
 }
 
 // The refresh rate the capture's display is running at right now, 0 when it cannot be read.
@@ -372,11 +385,25 @@ bool ObsHost::initialize(const std::string& runtime_root, const std::string& dat
   runtime_root_ = runtime_root;
   data_root_ = data_root;
   capacity_path_ = data_root + "\\capacity.json";
+  ladder_path_ = data_root + "\\encoder_ladder.json";
+  hook_memory_path_ = data_root + "\\hook_memory.json";
+  hook_memory_ = buffrx::hook_memory_load(hook_memory_path_, static_cast<int64_t>(std::time(nullptr)));
+  {
+    uint32_t vendor_id = 0;
+    std::string gpu_name;
+    gpu_adapter(vendor_id, gpu_name);
+    gpu_identity_ = gpu_name + " " + gpu_driver_version();
+    ladder_key_ = ladder_key_now();
+    ladder_rung_ = capacity_read_step(ladder_path_, ladder_key_);
+    if (ladder_rung_ < 0 || ladder_rung_ > buffrx::kMaxLadderRung) ladder_rung_ = 0;
+    if (ladder_rung_ > 0) BX_LOG_WARN("this GPU and driver needed encoder fallback rung %d last time; starting there", ladder_rung_);
+  }
   config_ = config;
   // A probe, not a setting: BUFFRX_NO_GOVERNOR=1 keeps the encoder governor from stepping, which a benchmark of
   // encoder settings needs - it would otherwise lower the very settings it is measuring.
   governor_disabled_ = GetEnvironmentVariableA("BUFFRX_NO_GOVERNOR", nullptr, 0) > 0;
-  governor_step_ = config.encoder_speed_step;  // where the last run settled: the encoder is built at it
+  governor_step_ = 0;
+  frame_divisor_ = 1;
   // A probe, not a setting: BUFFRX_TUNE=gpu:-7,eco,below,io switches the candidate optimizations on, one at a time,
   // for a measurement (process_tuning.h, docs/measurement.md).
   {
@@ -392,21 +419,8 @@ bool ObsHost::initialize(const std::string& runtime_root, const std::string& dat
   // while it loads, and with no device yet it registers the GDI BitBlt monitor capture instead of DXGI
   // duplication and turns WGC off — which is what cost ~18 ms per frame on display capture.
   {
-    // The relief ladder's frame-rate rung is part of what runs, so startup builds the canvas from it too.
+    // The canvas is built at the rate the person chose: the controller's frame-rate levels are the encoder's divisor, never a video reset.
     Config running = config;
-    // Start where this PC landed last time for the same codec, picture, rate and preset: the ladder is not climbed twice.
-    if (running.encoder_speed_step == 0) {
-      const int remembered = capacity_remembered_step(capacity_key_for(running));
-      if (remembered > 0 && remembered <= buffrx::kMaxReliefStep) {
-        running.encoder_speed_step = remembered;
-        governor_step_ = remembered;
-        BX_LOG_INFO("this PC needed step %d at %d fps %s last time; starting there", remembered, running.capture_fps, running.codec.c_str());
-      }
-    }
-    running.capture_fps = buffrx::relief_capture_fps(running.capture_fps, running.encoder_speed_step);
-    // The outputs and the encoders are built from config_, so the step this start runs has to be in it too: the canvas
-    // came from `running`, and a config_ still saying step 0 built the encoder at full effort while the canvas ran at 60.
-    config_.encoder_speed_step = running.encoder_speed_step;
     if (!configure_video(running, error)) return false;
   }
   if (!load_modules(error)) return false;
@@ -455,7 +469,7 @@ bool ObsHost::initialize(const std::string& runtime_root, const std::string& dat
     // The trim worker is a thread of its own: a C++ exception here would end the process, so it is
     // caught and named, where the runtime is safe to use.
     try {
-      finish_save(pending.path, pending.request, pending.peak_kbps);
+      finish_save(pending.path, pending.request, pending.peak_kbps, pending.audio_plan);
     } catch (const std::exception& failure) {
       BX_LOG_ERROR("the trim of %s failed: %s", pending.path.c_str(), failure.what());
     } catch (...) {
@@ -505,6 +519,8 @@ bool ObsHost::start_obs(std::string& error) {
   (void)runtime_root_;
 #endif
 
+  // libobs's warnings reach engine.log, and its bcrash() writes its reason and a marker instead of exit(0).
+  install_libobs_handlers(data_root_);
   const std::string module_config = slashify(data_root_);
 #ifndef _WIN32
   // The Ubuntu obs-ffmpeg build has the muxer helper's path patched in (see
@@ -522,6 +538,9 @@ bool ObsHost::start_obs(std::string& error) {
     return false;
   }
   register_ring_output();
+  // The engine's own process-loopback source. Registered after every obs_startup, because the source
+  // tables belong to that startup and are freed by obs_shutdown.
+  register_process_audio_source();
   const std::string version = obs_get_version_string();
   if (version.rfind(std::to_string(LIBOBS_API_MAJOR_VER) + ".", 0) != 0) {
     // The package pins its engine; a DLL of another major version than the headers it was built with (runtime\pin.json)
@@ -613,6 +632,17 @@ CanvasPlan ObsHost::plan_canvas_for(const Config& user) {
   canvas_height_ = plan.canvas_height;
   BX_LOG_INFO("canvas plan: target %dx%d, canvas %dx%d, output %dx%d", target_width, target_height, plan.canvas_width,
               plan.canvas_height, plan.output_width, plan.output_height);
+  if (target_known && plan.output_width > 0 &&
+      !same_picture_shape(target_width, target_height, plan.output_width, plan.output_height)) {
+    // A note, not an info line: this is why a clip has bars, and the first answer to "my recording is not full frame".
+    if (config.stretch_mode == "stretch") {
+      BX_LOG_NOTE("the output is %dx%d and the capture is %dx%d; the canvas takes the output's shape and Stretch fills it",
+                  plan.output_width, plan.output_height, target_width, target_height);
+    } else {
+      BX_LOG_NOTE("the output is %dx%d and the capture is %dx%d; the canvas takes the output's shape and the picture is fitted inside it, never stretched",
+                  plan.output_width, plan.output_height, target_width, target_height);
+    }
+  }
   return plan;
 }
 
@@ -702,10 +732,15 @@ bool ObsHost::configure_video(const Config& requested, std::string& error) {
   }
 
   // The adapter: the one a display capture's display hangs off, else the card with the most memory (gpu.h).
-  // Adapter 0 is tried after it if libobs refuses the choice, so this can only help a machine that works.
+  // The follow layer makes the display the live capture while a game is chosen, so the display is what the device
+  // has to reach there too. Adapter 0 is tried after it if libobs refuses the choice, so this can only help a
+  // machine that works.
 #ifdef _WIN32
   const std::vector<GpuAdapterInfo> adapters = gpu_adapters();
-  const int chosen_adapter = pick_gpu_adapter(adapters, config.capture_mode == "display" ? monitor_device_name(config, &display_warned_name_) : std::string());
+  const bool display_target =
+      requested.capture_mode == "display" || (follow_display_ && requested.capture_mode == "game");
+  const std::string wanted_display = display_target ? monitor_device_name(requested, &display_warned_name_) : std::string();
+  const int chosen_adapter = pick_gpu_adapter(adapters, wanted_display);
   if (adapters.size() > 1) BX_LOG_INFO("%zu graphics adapters; using adapter %d", adapters.size(), chosen_adapter);
   std::vector<int> adapter_order = {chosen_adapter};
   if (chosen_adapter != 0) adapter_order.push_back(0);
@@ -713,11 +748,15 @@ bool ObsHost::configure_video(const Config& requested, std::string& error) {
   // libobs's OpenGL backend has no adapter index to choose; the driver's default is the one OBS uses.
   std::vector<int> adapter_order = {0};
 #endif
+  // The device that is about to be replaced says nothing about the one that replaces it.
+  device_outputs_.clear();
+  device_outputs_known_ = false;
 
 #ifndef _WIN32
   BX_LOG_INFO("graphics module: %s", graphics.c_str());
 #endif
   int last_code = 0;
+  std::string refused_variants;  // one log line per try, not one per variant and adapter
   for (const int adapter_index : adapter_order)
   for (const Variant& variant : variants) {
     obs_video_info video{};
@@ -738,6 +777,62 @@ bool ObsHost::configure_video(const Config& requested, std::string& error) {
     if (last_code == OBS_VIDEO_SUCCESS) {
       BX_LOG_INFO("video initialised: canvas %ux%u, output %ux%u @ %u fps (%s, adapter %d)", variant.base_width,
                   variant.base_height, variant.output_width, variant.output_height, variant.fps, variant.label, adapter_index);
+      // A fallback variant can build another canvas than the plan asked for ("no canvas scale", the 1080p default).
+      // The scene item is fitted to the canvas that exists, not the one that was planned.
+      canvas_width_ = static_cast<int>(variant.base_width);
+      canvas_height_ = static_cast<int>(variant.base_height);
+      video_adapter_index_ = adapter_index;
+#ifdef _WIN32
+      {
+        bool owns_display = false;
+        for (const GpuAdapterInfo& adapter : adapters) {
+          if (adapter.index != adapter_index) continue;
+          for (const std::string& output : adapter.outputs) owns_display = owns_display || (!wanted_display.empty() && output == wanted_display);
+        }
+        video_adapter_reason_ = adapter_index != chosen_adapter ? "adapter 0, after libobs refused the first choice"
+                                : owns_display                ? "it drives the captured display"
+                                : adapters.size() > 1         ? "the adapter with the most video memory"
+                                                              : "the only adapter";
+      }
+      // What this device can duplicate: its adapter's outputs, as they were when it was created. libobs
+      // resolves a monitor against device->adapter->EnumOutputs, and DXGI hands an adapter the output list
+      // it had when it was enumerated, so a screen on another card or one attached since is not in it.
+      device_outputs_.clear();
+      device_outputs_known_ = false;
+      for (const GpuAdapterInfo& adapter : adapters) {
+        if (adapter.index != adapter_index) continue;
+        device_outputs_ = adapter.outputs;
+        // An enumeration that failed is not an empty list: the follow check then trusts the device rather than
+        // resetting the video for a missing name nobody actually looked for.
+        device_outputs_known_ = adapter.outputs_known;
+      }
+      // A probe, not a setting: a machine with one card cannot produce the reported setup (a display on a second
+      // adapter), so this makes the running device claim it can duplicate no display at all.
+      char probe_outputs[8] = {0};
+      if (GetEnvironmentVariableA("BUFFRX_TEST_DEVICE_OUTPUTS", probe_outputs, sizeof(probe_outputs)) != 0 &&
+          std::string(probe_outputs) == "none") {
+        device_outputs_.clear();
+        BX_LOG_NOTE("BUFFRX_TEST_DEVICE_OUTPUTS=none: the device claims it can duplicate no display");
+      }
+      if (device_outputs_known_ && !wanted_display.empty() && display_capture_needs_card(requested.display_method) &&
+          !device_outputs_have(device_outputs_, wanted_display)) {
+        // The reset landed on the fallback adapter, or the card that owns the screen refuses it. The source will
+        // reach that screen only through Windows Graphics Capture, which has delivered no frame at all here.
+        BX_LOG_WARN("the display %s is not on adapter %d, the device libobs could build; duplication cannot reach it",
+                    wanted_display.c_str(), adapter_index);
+      }
+      if (!device_outputs_known_ && !wanted_display.empty()) {
+        BX_LOG_NOTE("the display list of adapter %d could not be read, so the follow check will not treat %s as missing",
+                    adapter_index, wanted_display.c_str());
+      }
+      if (!device_outputs_.empty()) {
+        std::string listed;
+        for (const std::string& output : device_outputs_) listed += (listed.empty() ? "" : ", ") + output;
+        // A note, not an info line: this is the record a black picture is diagnosed from, and info lines never
+        // reach the file (log.h).
+        BX_LOG_NOTE("adapter %d can duplicate: %s", adapter_index, listed.c_str());
+      }
+#endif
       // Every reset makes a new D3D11 device, and the GPU queue priority belongs to the device.
       if (buffrx::active_tuning().gpu_priority != 0) {
         obs_enter_graphics();
@@ -745,15 +840,29 @@ bool ObsHost::configure_video(const Config& requested, std::string& error) {
         obs_leave_graphics();
         buffrx::apply_gpu_priority(device, buffrx::active_tuning().gpu_priority);
       }
+      if (video_trouble_told_) {
+        video_trouble_told_ = false;
+        BX_LOG_NOTE("the graphics device is back after %d failed tries", video_backoff_.failures);
+        if (on_notice) on_notice("Graphics driver is back", "BuffrX is capturing again.");
+      }
+      buffrx::video_init_ok(video_backoff_);
       return true;
     }
-    BX_LOG_WARN("video variant '%s' refused (code %d)", variant.label, last_code);
+    refused_variants += (refused_variants.empty() ? "" : ", ") + std::string(variant.label) + " " + std::to_string(last_code);
   }
   #ifdef _WIN32
   error = "video initialisation failed (D3D11), code " + std::to_string(last_code);
 #else
   error = "video initialisation failed (OpenGL), code " + std::to_string(last_code);
 #endif
+  BX_LOG_WARN("%s; variants refused: %s", error.c_str(), refused_variants.c_str());
+  // A failure while the engine runs is the driver (a reset that has not finished), not a setup problem: automatic callers
+  // wait out the backoff, and the person is told once that BuffrX keeps trying.
+  buffrx::video_init_failed(video_backoff_, GetTickCount());
+  if (initialized_ && !video_trouble_told_) {
+    video_trouble_told_ = true;
+    if (on_notice) on_notice("Graphics driver not responding", "BuffrX keeps trying to start the capture again.");
+  }
   return false;
 }
 
@@ -766,6 +875,16 @@ bool ObsHost::configure_capture(const Config& requested, std::string& error, boo
     followed.capture_mode = "display";
   }
   const Config& config = follow ? followed : requested;
+  // What the display choice means right now. Resolved once, before the old source is touched: a desk with no
+  // display refuses the capture and leaves what is running alone, and the resolved index/device (never the
+  // saved index) are the ones the source is given.
+  const DisplayPick display =
+      config.capture_mode == "display" ? resolve_display(config, &display_warned_name_) : DisplayPick{};
+  if (config.capture_mode == "display" && !display.found) {
+    error = "No display to capture. Connect a display, then choose it on the Video page.";
+    BX_LOG_WARN("%s", error.c_str());
+    return false;
+  }
   if (!layered) drop_retiring_capture();
   if (capture_item_) {
     if (layered && capture_item_ready()) {
@@ -783,6 +902,12 @@ bool ObsHost::configure_capture(const Config& requested, std::string& error, boo
   const char* source_id = "monitor_capture";
   std::string target = "display";
 
+  // A game whose hook delivered nothing in two earlier captures goes straight to its window (hook_memory.h).
+  if (buffrx::kHookMemorySkips && !window_fallback && config.capture_mode == "game" && !config.game_title.empty() &&
+      buffrx::hook_memory_skips_hook(hook_memory_, buffrx::hook_exe_of(config.game_title), static_cast<int64_t>(std::time(nullptr)))) {
+    window_fallback = true;
+    BX_LOG_NOTE("the game hook delivered nothing for %s before; capturing its window", buffrx::hook_exe_of(config.game_title).c_str());
+  }
   game_fallback_ = window_fallback;
   capture_created_ms_ = GetTickCount();
 #ifdef _WIN32
@@ -820,15 +945,17 @@ bool ObsHost::configure_capture(const Config& requested, std::string& error, boo
     obs_data_set_bool(settings, "client_area", true);
     target = config.window_name.empty() ? "window" : config.window_name;
   } else {
-    obs_data_set_int(settings, "monitor", config.display_id);
-    // The DXGI duplicator ignores "monitor" and resolves "monitor_id"; it accepts the GDI device name
-    // (\\.\DISPLAY1) as a fallback match. Without it the source captures nothing.
-    const std::string device = monitor_device_name(config, &display_warned_name_);
-    if (!device.empty()) obs_data_set_string(settings, "monitor_id", device.c_str());
+    // The bundled duplicator (monitor_capture on this platform) resolves the display from "monitor_id": it first
+    // matches the monitor's device interface id, then the GDI device name. Both are the resolved monitor's, never
+    // the saved index, which after a rearrange belongs to another screen. "monitor" is set to the resolved position
+    // as well: the older GDI capture reads it, and a future reader must not find the saved index here either.
+    obs_data_set_int(settings, "monitor", display.id);
+    obs_data_set_string(settings, "monitor_id", display.device.c_str());
     const int method = capture_method_for(config.display_method);
-    obs_data_set_int(settings, "method", method);  // 0 auto: duplication, WGC fallback
+    obs_data_set_int(settings, "method", method);  // 0 auto: duplication, WGC fallback; Windows Graphics Capture uses the same monitor_id
     obs_data_set_bool(settings, "capture_cursor", config.capture_cursor);
-    target = config.display_name.empty() ? "display" : config.display_name;
+    // The monitor actually captured, so a fallback to the primary is visible in the log and the status line.
+    target = display.name.empty() ? "display" : display.name;
   }
 #else
   if (config.capture_mode == "display" || (config.capture_mode == "game" && config.game_title.empty())) {
@@ -881,12 +1008,22 @@ bool ObsHost::configure_capture(const Config& requested, std::string& error, boo
   capture_item_ = item;
   // Which display this source actually resolved to, so the tick can tell when the choice moved. Set only
   // once the source is in the scene: a failed configure leaves the old value, and the tick retries.
-  capture_display_device_ = config.capture_mode == "display" ? monitor_device_name(config, &display_warned_name_) : std::string();
+  capture_display_device_ = config.capture_mode == "display" ? display.device : std::string();
   obs_source_release(capture_);
   capture_ = nullptr;
   // A new source starts unlimited.
   capture_fit_applied_ = false;
   update_capture_fit();
+  // Evidence, not a conclusion: which card a window's picture comes from is the first question a black window
+  // capture raises, and nothing else in the log answers it. Across two cards the picture can only come through
+  // Windows Graphics Capture.
+  if (config.capture_mode == "window" && device_outputs_known_) {
+    std::string monitor;
+    if (window_monitor_device(config.window_id, monitor) && !device_outputs_have(device_outputs_, monitor)) {
+      BX_LOG_NOTE("window capture: %s is on %s, which is not on the capture's graphics card; Windows Graphics Capture is the only route there",
+                  target.c_str(), monitor.c_str());
+    }
+  }
   BX_LOG_INFO("capture source %s -> %s", source_id, target.c_str());
   return true;
 }
@@ -931,6 +1068,8 @@ void ObsHost::release_idle_sources() {
   detach_meter(&mic_volmeter_);
   obs_set_output_source(kDesktopViewChannel, nullptr);
   obs_set_output_source(kMicViewChannel, nullptr);
+  release_app_audio();
+  release_auto_audio();
   if (desktop_) {
     obs_source_release(desktop_);
     desktop_ = nullptr;
@@ -957,7 +1096,7 @@ bool ObsHost::ensure_capture_sources(std::string& error) {
       return false;
     }
   }
-  configure_audio(config_);
+  configure_audio(effective_config());
   sources_released_ = false;
   return true;
 }
@@ -966,7 +1105,8 @@ bool ObsHost::enter_deep_idle() {
   if (!initialized_ || deep_idle_) return true;
   RebuildGuard rebuilding(rebuild_gate_);
   // Re-checked here, under the lock: the tick asked a moment ago, and a start may have come in since.
-  if (buffer_intent_ || recording_active_ || manual_active_ || recording_pending_ || !sources_released_ || capture_item_ || desktop_ || mic_) return false;
+  if (buffer_intent_ || recording_active_ || manual_active_ || recording_pending_ ||
+      !sources_released_ || capture_item_ || desktop_ || mic_ || !app_channels_.empty() || !auto_channels_.empty()) return false;
   const uint32_t started = GetTickCount();
   // The outputs and encoders hold the video handler that the reset frees, so they go first, as in a video change.
   // The encoder's settings stay as a snapshot of what last ran; the Video page derives the next settings from the config.
@@ -1005,6 +1145,13 @@ bool ObsHost::enter_deep_idle() {
 
 bool ObsHost::wake_from_deep_idle(std::string& error) {
   if (!deep_idle_) return true;
+  // After a failed video start nothing automatic tries again until the backoff ends (driver_fault.h); a press the person
+  // made clears the deadline first (allow_video_init_now), so it may try once at once.
+  if (!buffrx::video_init_allowed(video_backoff_, GetTickCount())) {
+    error = "the graphics driver is not answering; BuffrX tries again in " +
+            std::to_string((buffrx::video_init_wait_ms(video_backoff_, GetTickCount()) + 999) / 1000) + " s";
+    return false;
+  }
   RebuildGuard rebuilding(rebuild_gate_);
   const uint32_t started = GetTickCount();
   // No capture source exists (sleep requires them released), so the video may be reset: the same order as a
@@ -1029,8 +1176,17 @@ bool ObsHost::wake_from_deep_idle(std::string& error) {
 
 void ObsHost::check_game_fallback() {
   if (game_fallback_ || capture_mode_now() != "game" || config_.game_title.empty()) return;
-  if (capture_item_ready() || GetTickCount() - capture_created_ms_ < kGameHookGraceMs) return;
+  if (capture_item_ready()) {
+    // The hook works for this game after all: forget its earlier misses (a list of a few games, checked per tick).
+    if (!hook_memory_.empty() && buffrx::hook_memory_forget(hook_memory_, buffrx::hook_exe_of(config_.game_title))) {
+      buffrx::hook_memory_save(hook_memory_path_, hook_memory_);
+    }
+    return;
+  }
+  if (GetTickCount() - capture_created_ms_ < kGameHookGraceMs) return;
   BX_LOG_WARN("game capture produced no frame in %u ms; capturing the game's window instead", kGameHookGraceMs);
+  buffrx::hook_memory_record(hook_memory_, buffrx::hook_exe_of(config_.game_title), static_cast<int64_t>(std::time(nullptr)));
+  buffrx::hook_memory_save(hook_memory_path_, hook_memory_);
   std::string error;
   if (!configure_capture(config_, error, true, true)) {
     BX_LOG_WARN("window fallback for the game failed: %s", error.c_str());
@@ -1050,12 +1206,68 @@ void ObsHost::check_display_present() {
   display_check_at_ = now;
   if (capture_mode_now() != "display" || rebuild_gate_.busy()) return;
   const std::string wanted = monitor_device_name(config_, &display_warned_name_);
-  if (!display_follow_needed(capture_display_device_, wanted)) return;
+  if (wanted.empty()) {
+    reset_display_replan();
+    return;
+  }
   // Idle sources are released, not lost: nothing is delivering and there is nothing to follow until the
   // buffer or a recording asks for a source again.
   if (!capture_item_ && capture_display_device_.empty()) return;
+  // Both reasons below end the same way: the source alone cannot make the picture right, so the action worker builds
+  // the video again (main.cpp's display_replan). Each try is a video reset and an emptied ring, so a refused rebuild
+  // is retried for half a minute and stops after kDisplayReplanMaxAttempts; it is not refused for the rest of the run,
+  // because a replug or a rearranged desk is a new episode (display_target.h: display_topology_signature), read here at
+  // most every kDisplayTopologyCheckMs and only while a refusal stands.
+  const auto queue_replan = [&](const std::string& reason) {
+    if (display_replan_attempts_ > 0 && now - display_replan_topology_at_ >= kDisplayTopologyCheckMs) {
+      display_replan_topology_at_ = now;
+      if (display_topology() != display_replan_topology_) {
+        BX_LOG_INFO("the desk changed while the rebuild for the display %s was refused; it is tried again", wanted.c_str());
+        reset_display_replan();
+      }
+    }
+    if (!display_replan_due(display_replan_failed_for_, wanted, display_replan_attempts_, now, display_replan_retry_at_,
+                            kDisplayReplanRetryMs, kDisplayReplanMaxAttempts, recording_busy())) {
+      return;
+    }
+    if (!display_replan_due_.exchange(true)) BX_LOG_INFO("%s", reason.c_str());
+  };
+  // The running device's own DXGI output list decides, not the source's idea of the display. A reconnect can hand
+  // the same GDI name back to a device built before that screen was there, and the source then claims the very
+  // display the device cannot duplicate: comparing the two names alone would never look again. A display the
+  // running device cannot duplicate (another card, or a screen attached since the device was made) needs more
+  // than a new source: the device itself moves. An explicit Windows Graphics Capture choice needs no card at all
+  // (display_target.h).
+  const bool needs_card = display_capture_needs_card(config_.display_method);
+  if (needs_card && !device_can_duplicate(device_outputs_, device_outputs_known_, wanted)) {
+    queue_replan("the display " + wanted + " is not on the running graphics adapter; the capture is rebuilt for it");
+    return;
+  }
+  // The device reaches the screen (or the person chose Windows Graphics Capture). A Native output is the display's own
+  // pixel size, so a screen that comes back - or a primary standing in for one that left - at another size would keep
+  // the old canvas, and the old output resolution, for as long as the capture runs. That is the second reason to plan
+  // the video again; the source swap below is not enough for it.
+  int target_width = 0;
+  int target_height = 0;
+  // The mode the device serves: a followed game is the display, and the canvas was planned at the display's size.
+  Config served = config_;
+  if (follow_display_ && served.capture_mode == "game") served.capture_mode = "display";
+  win32_target_size(served, target_width, target_height);
+  const Config running = effective_config();
+  const bool native_size_stale = display_native_size_needs_replan(
+      target_width, target_height, canvas_width_, canvas_height_, running.output_width > 0 && running.output_height > 0,
+      config_.capture_mode == "game" && follow_display_);
+  if (native_size_stale) {
+    queue_replan("the display " + wanted + " delivers " + std::to_string(target_width) + "x" + std::to_string(target_height) +
+                 " and the canvas is " + std::to_string(canvas_width_) + "x" + std::to_string(canvas_height_) +
+                 "; the video is planned again");
+  } else {
+    // Whatever was refused before is not being refused now, so the next display change starts a fresh count.
+    reset_display_replan();
+  }
   // The monitor the capture resolved to is not the one the settings mean now. The source moves; the
   // config keeps the choice, so the screen coming back is followed back without the user fixing anything.
+  if (!display_follow_needed(capture_display_device_, wanted)) return;
   std::string error;
   if (!configure_capture(config_, error, false, true)) {
     BX_LOG_WARN("display follow failed: %s", error.c_str());
@@ -1073,10 +1285,18 @@ void ObsHost::update_capture_fit() {
   obs_source_t* source = capture_source();
   const int width = source ? static_cast<int>(obs_source_get_width(source)) : 0;
   const int height = source ? static_cast<int>(obs_source_get_height(source)) : 0;
-  const bool fill = capture_fills_canvas(config_.stretch_mode, width, height, canvas_width_, canvas_height_);
-  if (capture_fit_applied_ && fill == capture_stretched_) return;
+  // The effective settings, not the user's: Performance mode owns the picture (and its bilinear choice).
+  const Config config = layered(config_);
+  const bool fill = capture_fills_canvas(config.stretch_mode, width, height, canvas_width_, canvas_height_);
+  const int filter = scale_type_for_filter(config.scale_filter);
+  if (capture_fit_applied_ && fill == capture_stretched_ && filter == capture_scale_filter_) return;
   obs_sceneitem_set_bounds_type(capture_item_, fill ? OBS_BOUNDS_STRETCH : OBS_BOUNDS_SCALE_INNER);
+  // When the canvas already has the output's shape (config.h: plan_canvas) the video output scale is 1:1, so the
+  // item's own bounds scaling is the only scale the picture gets. The Advanced filter has to reach it too, or
+  // choosing Lanczos changes nothing. One enum (obs_scale_type) drives both scales.
+  obs_sceneitem_set_scale_filter(capture_item_, static_cast<obs_scale_type>(filter));
   capture_stretched_ = fill;
+  capture_scale_filter_ = filter;
   capture_fit_applied_ = true;
   if (width > 0) {
     BX_LOG_INFO("capture %dx%d %s the %dx%d canvas", width, height, fill ? "stretched to fill" : "fitted inside",
@@ -1170,7 +1390,17 @@ bool ObsHost::update_audio_channel(obs_source*& source, obs_volmeter** meter, st
   obs_data_t* settings = obs_data_create();
   obs_data_set_string(settings, "device_id", device_id);
   obs_data_set_bool(settings, "use_device_timing", true);
-  source = obs_source_create(source_id, source_name, settings, nullptr);
+  // Test only: BUFFRX_TEST_MIC_FILE=<audio file> makes the microphone a looping media source, so the mic filters can be
+  // measured on a known signal instead of a room (tools: the noise-suppression check). Its filters attach as they would to a mic.
+  const char* test_mic = std::strcmp(source_id, "wasapi_input_capture") == 0 ? std::getenv("BUFFRX_TEST_MIC_FILE") : nullptr;
+  if (test_mic && *test_mic) {
+    obs_data_set_string(settings, "local_file", slashify(test_mic).c_str());
+    obs_data_set_bool(settings, "is_local_file", true);
+    obs_data_set_bool(settings, "looping", true);
+    source = obs_source_create("ffmpeg_source", source_name, settings, nullptr);
+  } else {
+    source = obs_source_create(source_id, source_name, settings, nullptr);
+  }
   obs_data_release(settings);
   if (source) {
     bound_device = device_id;
@@ -1195,22 +1425,716 @@ bool ObsHost::configure_audio(const Config& config) {
     if (mic_noise_suppress_) { obs_source_filter_remove(mic_, mic_noise_suppress_); obs_source_release(mic_noise_suppress_); mic_noise_suppress_ = nullptr; }
     if (mic_noise_gate_) { obs_source_filter_remove(mic_, mic_noise_gate_); obs_source_release(mic_noise_gate_); mic_noise_gate_ = nullptr; }
   }
-  uint32_t desktop_mixers = 1u << 0;
-  if (config.separate_tracks) desktop_mixers |= 1u << 1;  // track 2: desktop audio alone
-  uint32_t mic_mixers = 1u << 0;
-  if (config.separate_tracks) mic_mixers |= 1u << 2;      // track 3: microphone alone
-
+  // Automatic mode owns the four buses itself (audio_auto.h). The device loopback is never part of it:
+  // there is no fallback that could record an excluded program or BuffrX's own playback, so the desktop
+  // source is disabled and the microphone keeps track 2.
+  if (config.audio_capture_mode == "auto") {
+    const AudioRoutingPlan plan = plan_auto_audio_routing(config, auto_plan_.lanes);
+    const double mic_gain = std::pow(10.0, config.mic_gain_db / 20.0);
+    update_audio_channel(desktop_, &desktop_volmeter_, &desktop_level_db_, desktop_device_, "wasapi_output_capture",
+                         "Desktop audio", config.desktop_device.empty() ? "default" : config.desktop_device.c_str(),
+                         static_cast<float>(config.desktop_volume), config.desktop_muted, plan.desktop_mixers,
+                         false, kDesktopViewChannel);
+    update_audio_channel(mic_, &mic_volmeter_, &mic_level_db_, mic_device_, "wasapi_input_capture", "Microphone",
+                         config.mic_device.empty() ? "default" : config.mic_device.c_str(),
+                         static_cast<float>(config.mic_volume * mic_gain), config.mic_muted, plan.mic_mixers,
+                         config.mic_enabled, kMicViewChannel);
+    // Any manual application slots are released: the two plans must never share a channel.
+    configure_app_audio(AudioRoutingPlan{});
+    configure_auto_audio(auto_sessions_, GetTickCount64());
+    apply_mic_filters(config);
+    return desktop_ != nullptr || mic_ != nullptr || !auto_channels_.empty();
+  }
+  // One plan owns the mixer bits, so the device loopback, the microphone and every application source
+  // cannot disagree about their tracks. While an application slot exists the desktop loopback is off:
+  // Windows cannot capture the desktop without an app that is also captured on its own track.
+  release_auto_audio();
+  const AudioRoutingPlan plan = plan_audio_routing(config, game_target_);
   const double mic_gain = std::pow(10.0, config.mic_gain_db / 20.0);
   update_audio_channel(desktop_, &desktop_volmeter_, &desktop_level_db_, desktop_device_, kDesktopCaptureSource,
                        "Desktop audio", config.desktop_device.empty() ? "default" : config.desktop_device.c_str(),
-                       static_cast<float>(config.desktop_volume), config.desktop_muted, desktop_mixers,
-                       config.desktop_enabled, kDesktopViewChannel);
+                       static_cast<float>(config.desktop_volume), config.desktop_muted, plan.desktop_mixers,
+                       config.desktop_enabled && plan.desktop_captured, kDesktopViewChannel);
   update_audio_channel(mic_, &mic_volmeter_, &mic_level_db_, mic_device_, kMicCaptureSource, "Microphone",
                        config.mic_device.empty() ? "default" : config.mic_device.c_str(),
-                       static_cast<float>(config.mic_volume * mic_gain), config.mic_muted, mic_mixers,
+                       static_cast<float>(config.mic_volume * mic_gain), config.mic_muted, plan.mic_mixers,
                        config.mic_enabled, kMicViewChannel);
+  configure_app_audio(plan);
   apply_mic_filters(config);
-  return desktop_ != nullptr || mic_ != nullptr;
+  return desktop_ != nullptr || mic_ != nullptr || !app_channels_.empty();
+}
+
+void ObsHost::configure_app_audio(const AudioRoutingPlan& plan) {
+  // The plan and the channels are index-aligned. A slot whose key and window are unchanged keeps its
+  // source: a device switch, a microphone filter or another app's edit must never tear down a healthy
+  // capture (and its hook). A slot that is gone has its channel released; a game slot with no game keeps
+  // its place with no source, so the selected track stays silently empty instead of recording the desktop.
+  while (app_channels_.size() < plan.apps.size()) app_channels_.push_back(std::make_unique<AppAudioChannel>());
+  for (size_t i = plan.apps.size(); i < app_channels_.size(); ++i) {
+    obs_set_output_source(kAppAudioViewChannelBase + static_cast<uint32_t>(i), nullptr);
+    release_app_channel(*app_channels_[i]);
+  }
+  if (app_channels_.size() > plan.apps.size()) app_channels_.resize(plan.apps.size());
+  for (size_t i = 0; i < plan.apps.size(); ++i) {
+    AppAudioChannel& channel = *app_channels_[i];
+    const AudioApp& app = plan.apps[i];
+    const uint32_t view_channel = kAppAudioViewChannelBase + static_cast<uint32_t>(i);
+    const std::string key = audio_app_key(app);
+    if (app.exe.empty() || app.window.empty()) {
+      if (channel.source) {
+        obs_set_output_source(view_channel, nullptr);
+        release_app_channel(channel);
+      }
+      channel.key = key;
+      channel.game = audio_app_is_game(app);
+      channel.covered = false;
+      channel.window.clear();
+      channel.exe.clear();
+      if (channel.game) {
+        // A game the person selected by name already records this program: the lane stays (and is
+        // labelled Game) but it makes no second capture. Otherwise the lane waits silently for a game.
+        channel.covered = plan.game_covered_slot >= 0;
+        if (channel.covered) channel.exe = game_target_.exe;
+        if (!channel.said_missing) {
+          BX_LOG_INFO(channel.covered ? "current game audio is covered by a selected app"
+                                      : "current game audio waits: no game is being captured yet");
+          channel.said_missing = true;
+        }
+      }
+      continue;
+    }
+    if (channel.source && channel.key == key) {
+      // The same program: a retitled window is bound in place; any other window id is followed by
+      // win-wasapi's own reconnect thread, so nothing is destroyed here.
+      if (channel.window != app.window) {
+        obs_data_t* settings = obs_data_create();
+        obs_data_set_string(settings, "window", app.window.c_str());
+        obs_data_set_int(settings, "priority", 2);  // WINDOW_PRIORITY_EXE
+        obs_source_update(channel.source, settings);
+        obs_data_release(settings);
+        channel.window = app.window;
+      }
+      channel.exe = app.exe;
+      channel.game = audio_app_is_game(app);
+      channel.covered = false;
+      // A gain or mute change applies to the source that is already capturing: the same channel keeps the
+      // same program (and its hook), so the ring and a running recording continue untouched.
+      obs_source_set_volume(channel.source, static_cast<float>(audio_app_volume(app.volume)));
+      obs_source_set_muted(channel.source, app.muted);
+      obs_source_set_audio_mixers(channel.source, plan.app_mixers[i]);
+      continue;
+    }
+    if (channel.source) {
+      obs_set_output_source(view_channel, nullptr);
+      release_app_channel(channel);
+    }
+    channel.game = audio_app_is_game(app);
+    if (create_app_channel(channel, app, plan.app_mixers[i], view_channel)) {
+      BX_LOG_INFO("application audio %s on track %d", app.exe.c_str(), app.track);
+    }
+  }
+  audio_app_check_at_ = GetTickCount();
+  audio_health_poll_at_ = audio_app_check_at_;
+}
+
+bool ObsHost::create_app_channel(AppAudioChannel& channel, const AudioApp& app, uint32_t mixers,
+                                 uint32_t view_channel) {
+  channel.key = audio_app_key(app);
+  channel.game = audio_app_is_game(app);
+  channel.window = app.window;
+  channel.exe = app.exe;
+  channel.failed = false;
+  channel.connected.store(false);
+  {
+    std::lock_guard<std::mutex> lock(channel.health_mutex);
+    channel.hooked_exe.clear();
+    channel.hooked_title.clear();
+  }
+  obs_data_t* settings = obs_data_create();
+  obs_data_set_string(settings, "window", app.window.c_str());
+  // Match by executable after the title: a Discord window retitles itself, an executable does not.
+  // 2 is WINDOW_PRIORITY_EXE in win-wasapi.
+  obs_data_set_int(settings, "priority", 2);
+  const std::string name = channel.game ? std::string("BuffrX game audio") : "BuffrX app " + app.exe;
+  obs_source_t* source =
+      obs_source_create("wasapi_process_output_capture", name.c_str(), settings, nullptr);
+  obs_data_release(settings);
+  if (!source) {
+    // The capture source itself could not be made (Windows older than 1703, or no process-loopback
+    // support). This is the one state that is a failure, and the page says so.
+    channel.failed = true;
+    if (!channel.said_missing) {
+      BX_LOG_WARN("application audio %s could not be created; its track stays empty", app.exe.c_str());
+      channel.said_missing = true;
+    }
+    return false;
+  }
+  channel.source = source;
+  channel.said_missing = false;
+  // The hook state, before a transition could be missed between the source starting and this connection.
+  signal_handler_t* handler = obs_source_get_signal_handler(source);
+  signal_handler_connect(handler, "hooked", &ObsHost::on_app_hooked, &channel);
+  signal_handler_connect(handler, "unhooked", &ObsHost::on_app_unhooked, &channel);
+  obs_source_set_volume(source, static_cast<float>(audio_app_volume(app.volume)));
+  obs_source_set_muted(source, app.muted);
+  obs_source_set_audio_mixers(source, mixers);
+  // Last, as with every audio source: the canvas channel is what makes the mixer read it.
+  obs_set_output_source(view_channel, source);
+  return true;
+}
+
+void ObsHost::release_app_channel(AppAudioChannel& channel) {
+  if (channel.source) {
+    // The callbacks point at this channel: they must be gone before the source that could call them.
+    signal_handler_t* handler = obs_source_get_signal_handler(channel.source);
+    signal_handler_disconnect(handler, "hooked", &ObsHost::on_app_hooked, &channel);
+    signal_handler_disconnect(handler, "unhooked", &ObsHost::on_app_unhooked, &channel);
+    obs_source_release(channel.source);
+    channel.source = nullptr;
+  }
+  channel.failed = false;
+  channel.connected.store(false);
+  channel.window.clear();
+  channel.exe.clear();
+  std::lock_guard<std::mutex> lock(channel.health_mutex);
+  channel.hooked_exe.clear();
+  channel.hooked_title.clear();
+}
+
+void ObsHost::on_app_hooked(void* data, calldata_t* call) {
+  auto* channel = static_cast<AppAudioChannel*>(data);
+  if (!channel) return;
+  const char* exe = calldata_string(call, "executable");
+  const char* title = calldata_string(call, "title");
+  {
+    std::lock_guard<std::mutex> lock(channel->health_mutex);
+    channel->hooked_exe = exe ? exe : "";
+    channel->hooked_title = title ? title : "";
+  }
+  channel->connected.store(true);  // after the strings, so a reader never sees connected with no name
+}
+
+void ObsHost::on_app_unhooked(void* data, calldata_t* call) {
+  (void)call;
+  auto* channel = static_cast<AppAudioChannel*>(data);
+  if (!channel) return;
+  channel->connected.store(false);
+}
+
+void ObsHost::poll_audio_health() {
+  // win-wasapi owns reconnection: its own thread retries every two seconds and follows a retitled window,
+  // a restarted program, a new process id and a minimized window, all by the executable it was given. The
+  // engine's job is only what the plugin cannot say for itself: the hook state for the page (get_hooked,
+  // twice a second at most) and a source that could not be created at all (retried slowly). No window or
+  // session list is enumerated here, and nothing is sampled.
+  if (app_channels_.empty()) return;
+  const uint32_t now = GetTickCount();
+  const bool poll = audio_health_poll_at_ == 0 || now - audio_health_poll_at_ >= kAudioHealthPollMs;
+  if (poll) audio_health_poll_at_ = now;
+  bool missing = false;
+  for (const std::unique_ptr<AppAudioChannel>& ptr : app_channels_) {
+    AppAudioChannel& channel = *ptr;
+    if (!channel.source) {
+      // A waiting game slot has no window to make a source for; it is not missing.
+      missing = missing || !channel.window.empty();
+      continue;
+    }
+    if (!poll) continue;
+    proc_handler_t* proc = obs_source_get_proc_handler(channel.source);
+    if (!proc) continue;
+    calldata_t* call = calldata_create();
+    proc_handler_call(proc, "get_hooked", call);
+    const bool hooked = calldata_bool(call, "hooked");
+    if (hooked) {
+      const char* exe = calldata_string(call, "executable");
+      const char* title = calldata_string(call, "title");
+      std::lock_guard<std::mutex> lock(channel.health_mutex);
+      channel.hooked_exe = exe ? exe : "";
+      channel.hooked_title = title ? title : "";
+    }
+    channel.connected.store(hooked);
+    calldata_free(call);
+  }
+  if (!missing) return;
+  if (audio_app_check_at_ != 0 && now - audio_app_check_at_ < kAudioAppCheckMs) return;
+  audio_app_check_at_ = now;
+  configure_app_audio(plan_audio_routing(config_, game_target_));
+}
+
+void ObsHost::set_game_audio_target(const GameAudioTarget& target) {
+  if (target.active == game_target_.active && target.exe == game_target_.exe &&
+      target.window == game_target_.window) {
+    return;
+  }
+  game_target_ = target;
+  update_game_audio_channel();
+}
+
+void ObsHost::update_game_audio_channel() {
+  // The game slot's own channel follows the captured game in place: no encoder, no output and no ring is
+  // touched, so a clip or a Timeline chunk that spans two games is still one file, and the track's labels
+  // stay generic ("Game") because they are decided at recording time.
+  const AudioRoutingPlan plan = plan_audio_routing(config_, game_target_);
+  if (plan.game_slot < 0 || static_cast<size_t>(plan.game_slot) >= app_channels_.size()) return;
+  const size_t slot = static_cast<size_t>(plan.game_slot);
+  AppAudioChannel& channel = *app_channels_[slot];
+  const AudioApp& app = plan.apps[slot];
+  const uint32_t view_channel = kAppAudioViewChannelBase + static_cast<uint32_t>(slot);
+  if (plan.game_covered_slot >= 0) {
+    // A named slot already records this program: the game lane keeps its reserved track and its generic
+    // label but makes no second capture, so the same sound cannot be heard twice.
+    if (channel.source) {
+      obs_set_output_source(view_channel, nullptr);
+      release_app_channel(channel);
+    }
+    channel.key = audio_app_key(app);
+    channel.game = true;
+    channel.covered = true;
+    channel.exe = game_target_.exe;
+    BX_LOG_INFO("current game audio is covered by a selected app; no second capture");
+    return;
+  }
+  channel.covered = false;
+  if (app.exe.empty() || app.window.empty()) {
+    if (channel.source) {
+      obs_set_output_source(view_channel, nullptr);
+      release_app_channel(channel);
+      BX_LOG_INFO("current game audio waits: no game is being captured");
+    }
+    channel.key = audio_app_key(app);
+    channel.game = true;
+    channel.covered = false;
+    channel.window.clear();
+    channel.exe.clear();
+    return;
+  }
+  if (!channel.source) {
+    channel.game = true;
+    if (create_app_channel(channel, app, plan.app_mixers[slot], view_channel)) {
+      BX_LOG_INFO("current game audio follows %s on track %d", app.exe.c_str(), app.track);
+    }
+    return;
+  }
+  if (channel.window != app.window) {
+    obs_data_t* settings = obs_data_create();
+    obs_data_set_string(settings, "window", app.window.c_str());
+    obs_data_set_int(settings, "priority", 2);
+    obs_source_update(channel.source, settings);
+    obs_data_release(settings);
+    channel.window = app.window;
+    channel.exe = app.exe;
+    BX_LOG_INFO("current game audio follows %s", app.exe.c_str());
+  }
+  obs_source_set_volume(channel.source, static_cast<float>(audio_app_volume(app.volume)));
+  obs_source_set_muted(channel.source, app.muted);
+  obs_source_set_audio_mixers(channel.source, plan.app_mixers[slot]);
+}
+
+std::vector<ObsHost::AudioSlotHealth> ObsHost::audio_slot_health() const {
+  std::vector<AudioSlotHealth> out;
+  out.reserve(app_channels_.size());
+  for (size_t i = 0; i < app_channels_.size(); ++i) {
+    const AppAudioChannel& channel = *app_channels_[i];
+    AudioSlotHealth health;
+    health.game = channel.game;
+    health.covered = channel.covered;
+    health.exe = channel.exe;
+    health.track = kAudioAppFirstTrack + static_cast<int>(i);
+    health.allocated = channel.source != nullptr;
+    health.connected = channel.source != nullptr && channel.connected.load();
+    health.failed = channel.failed;
+    {
+      std::lock_guard<std::mutex> lock(channel.health_mutex);
+      health.title = channel.connected.load() ? channel.hooked_title : std::string();
+      if (health.title.empty()) health.title.clear();
+    }
+    out.push_back(std::move(health));
+  }
+  return out;
+}
+
+void ObsHost::release_app_audio() {
+  for (size_t i = 0; i < app_channels_.size(); ++i) {
+    obs_set_output_source(kAppAudioViewChannelBase + static_cast<uint32_t>(i), nullptr);
+    release_app_channel(*app_channels_[i]);
+  }
+  app_channels_.clear();
+}
+
+namespace {
+// One process-tree capture for automatic mode. The settings are the pid and a label; the source takes the
+// whole tree below it, which is why the policy roots it at the topmost same-executable ancestor.
+obs_source* create_auto_process_source(uint32_t pid, const std::string& name) {
+  obs_data_t* settings = obs_data_create();
+  obs_data_set_int(settings, kProcessAudioPidSetting, static_cast<long long>(pid));
+  obs_data_set_string(settings, kProcessAudioLabelSetting, name.c_str());
+  obs_source_t* source = obs_source_create(kProcessAudioSourceId, name.c_str(), settings, nullptr);
+  obs_data_release(settings);
+  return source;
+}
+
+std::string join_lane_names(const std::vector<std::string>& names) {
+  std::string out;
+  for (const std::string& name : names) {
+    if (!out.empty()) out += " + ";
+    out += name;
+  }
+  return out;
+}
+
+// A lane's process trees, with a one-tree plan (a lane built by hand in a test or by an older caller)
+// read through its single pid.
+std::vector<AutoAudioRoot> lane_roots(const AutoAudioLane& lane) {
+  if (!lane.roots.empty()) return lane.roots;
+  std::vector<AutoAudioRoot> roots;
+  if (lane.pid != 0) roots.push_back(AutoAudioRoot{lane.pid, 0});
+  return roots;
+}
+
+std::vector<AutoAudioRoot> app_roots(const AutoAudioApp& app) {
+  if (!app.roots.empty()) return app.roots;
+  std::vector<AutoAudioRoot> roots;
+  if (app.pid != 0) roots.push_back(AutoAudioRoot{app.pid, 0});
+  return roots;
+}
+}  // namespace
+
+void ObsHost::set_auto_audio_sessions(const std::vector<AutoAudioSession>& sessions, uint64_t now_ms,
+                                      const std::string& captured_game_exe) {
+  auto_game_exe_ = captured_game_exe;
+  configure_auto_audio(sessions, now_ms);
+}
+
+void ObsHost::configure_auto_audio(const std::vector<AutoAudioSession>& sessions, uint64_t now_ms) {
+  if (!initialized_ || deep_idle_) {
+    auto_sessions_ = sessions;
+    return;
+  }
+  if (config_.audio_capture_mode != "auto") {
+    auto_sessions_ = sessions;
+    release_auto_audio();
+    return;
+  }
+  // The process table is the expensive part of this pass (a Toolhelp walk and an OpenProcess for every
+  // process). A stable session can acquire a new child without an event, so refresh at a coarse interval
+  // while a session exists as well as when session identities change.
+  if (auto_snapshot_due(sessions, auto_snapshot_for_, auto_snapshot_valid_, auto_processes_) ||
+      (!sessions.empty() && auto_tree_refresh_due(now_ms, auto_snapshot_at_))) {
+    auto_processes_ = auto_process_snapshot();
+    auto_snapshot_for_ = auto_session_identities(sessions);
+    auto_snapshot_valid_ = true;
+    auto_snapshot_at_ = now_ms;
+  }
+  auto_sessions_ = sessions;
+  AutoAudioInputs inputs;
+  inputs.sessions = sessions;
+  inputs.processes = auto_processes_;
+  inputs.prefs = config_.audio_app_prefs;
+  inputs.now_ms = now_ms;
+  inputs.grace_ms = 1500;
+  inputs.game_exe = !auto_game_exe_.empty() ? auto_game_exe_
+                                            : (game_target_.active ? game_target_.exe : std::string());
+  inputs.other_volume = config_.audio_other_volume;
+  inputs.other_muted = config_.audio_other_muted;
+  auto_plan_ = plan_auto_audio(inputs, auto_lane_memory_);
+  auto_plan_.on = true;
+  audio_plan_ = plan_auto_audio_routing(config_, auto_plan_.lanes);
+  reconcile_auto_channels(auto_plan_);
+  auto_journal_.observe(auto_plan_, now_ms);
+  auto_journal_at_ = now_ms;
+  // The rolling window must cover the longest ring a clip can ask for; a manual recording's own summary
+  // is never pruned (AutoJournal::output_names), so a long one keeps every name it carried.
+  const uint64_t keep = std::max<uint64_t>(600000, static_cast<uint64_t>(std::max(1, config_.buffer_seconds)) * 1000 + 60000);
+  auto_journal_.prune(now_ms, keep);
+}
+
+void ObsHost::release_auto_channel(AutoAudioChannel& channel) {
+  const uint32_t view = kAutoAudioViewChannelBase + static_cast<uint32_t>(channel.track - 3);
+  if (channel.source) {
+    obs_set_output_source(view, nullptr);
+    obs_source_release(channel.source);
+    channel.source = nullptr;
+  }
+  if (channel.scene) {
+    obs_scene_release(channel.scene);
+    channel.scene = nullptr;
+  }
+  for (auto& [pid, source] : channel.roots) {
+    (void)pid;
+    obs_source_release(source);
+  }
+  channel.roots.clear();
+  channel.root_created.clear();
+  channel.root_items.clear();
+  channel.key.clear();
+  channel.exe.clear();
+  channel.pid = 0;
+  channel.failed = false;
+  channel.error.clear();
+}
+
+void ObsHost::release_auto_audio() {
+  for (auto& channel : auto_channels_) {
+    if (channel) release_auto_channel(*channel);
+  }
+  auto_channels_.clear();
+  auto_plan_ = AutoAudioPlan{};
+  if (config_.audio_capture_mode == "auto") audio_plan_ = plan_auto_audio_routing(config_, {});
+}
+
+void ObsHost::stop_auto_audio() {
+  auto_sessions_.clear();
+  auto_snapshot_valid_ = false;
+  release_auto_audio();
+}
+
+void ObsHost::sync_auto_bus(AutoAudioChannel& channel, const std::string& key, const std::string& exe,
+                            const std::string& name, const std::vector<AutoBusRoot>& roots, double bus_volume,
+                            bool bus_muted, uint32_t mixers) {
+  if (!channel.key.empty() && channel.key != key) release_auto_channel(channel);
+  channel.key = key;
+  channel.exe = exe;
+  channel.failed = false;
+  channel.error.clear();
+
+  // A scene exists even for a single tree, so growing or shrinking the bus never requires replacing
+  // its output or its unaffected process clients. The view owns a reference while it is connected.
+  if (!channel.scene) {
+    channel.scene = obs_scene_create_private(("BuffrX " + name).c_str());
+    if (!channel.scene) {
+      channel.failed = true;
+      channel.error = "the lane's mixer could not be created";
+      return;
+    }
+    channel.source = obs_source_get_ref(obs_scene_get_source(channel.scene));
+    obs_source_set_volume(channel.source, static_cast<float>(auto_volume(bus_volume)));
+    obs_source_set_muted(channel.source, bus_muted);
+    obs_source_set_audio_mixers(channel.source, mixers);
+    obs_set_output_source(kAutoAudioViewChannelBase + static_cast<uint32_t>(channel.track - 3), channel.source);
+  }
+
+  for (auto it = channel.roots.begin(); it != channel.roots.end();) {
+    const uint32_t pid = it->first;
+    const auto created = channel.root_created.find(pid);
+    const AutoAudioRoot existing{pid, created == channel.root_created.end() ? 0 : created->second};
+    const auto wanted = std::find_if(roots.begin(), roots.end(), [&](const AutoBusRoot& item) {
+      return auto_root_retain(existing, item.root);
+    });
+    if (wanted != roots.end()) {
+      // Remember a later known identity, so a subsequent PID reuse is detectable.
+      if (existing.created_ms == 0 && wanted->root.created_ms != 0)
+        channel.root_created[pid] = wanted->root.created_ms;
+      ++it;
+      continue;
+    }
+    const auto item = channel.root_items.find(pid);
+    if (item != channel.root_items.end()) {
+      obs_sceneitem_remove(item->second);
+      channel.root_items.erase(item);
+    }
+    obs_source_release(it->second);
+    channel.root_created.erase(pid);
+    it = channel.roots.erase(it);
+  }
+
+  for (const AutoBusRoot& wanted : roots) {
+    auto found = channel.roots.find(wanted.root.pid);
+    if (found == channel.roots.end()) {
+      obs_source* source = create_auto_process_source(wanted.root.pid, "BuffrX " + name);
+      if (!source) {
+        channel.failed = true;
+        channel.error = "process audio could not be created";
+        BX_LOG_WARN("automatic audio for %s could not be created (pid %u)", exe.c_str(), wanted.root.pid);
+        continue;
+      }
+      // Set controls before joining the live scene: an excluded level must never briefly sound at unity.
+      obs_source_set_volume(source, static_cast<float>(auto_volume(wanted.volume)));
+      obs_source_set_muted(source, wanted.muted);
+      obs_source_set_audio_mixers(source, mixers);
+      obs_scene_item* item = obs_scene_add(channel.scene, source);
+      if (!item) {
+        obs_source_release(source);
+        channel.failed = true;
+        channel.error = "process audio could not be added to the lane";
+        continue;
+      }
+      channel.roots[wanted.root.pid] = source;
+      channel.root_created[wanted.root.pid] = wanted.root.created_ms;
+      channel.root_items[wanted.root.pid] = item;
+      found = channel.roots.find(wanted.root.pid);
+    }
+    obs_source_set_volume(found->second, static_cast<float>(auto_volume(wanted.volume)));
+    obs_source_set_muted(found->second, wanted.muted);
+    obs_source_set_audio_mixers(found->second, mixers);
+  }
+  obs_source_set_volume(channel.source, static_cast<float>(auto_volume(bus_volume)));
+  obs_source_set_muted(channel.source, bus_muted);
+  obs_source_set_audio_mixers(channel.source, mixers);
+}
+
+void ObsHost::reconcile_auto_channels(const AutoAudioPlan& plan) {
+  while (auto_channels_.size() < 4) {
+    auto channel = std::make_unique<AutoAudioChannel>();
+    channel->track = 3 + static_cast<int>(auto_channels_.size());
+    auto_channels_.push_back(std::move(channel));
+  }
+  std::map<int, const AutoAudioLane*> lanes;
+  for (const AutoAudioLane& lane : plan.lanes) lanes[lane.track] = &lane;
+
+  for (int track = 3; track <= 5; ++track) {
+    AutoAudioChannel& channel = *auto_channels_[static_cast<size_t>(track - 3)];
+    const auto found = lanes.find(track);
+    const AutoAudioLane* lane = found == lanes.end() ? nullptr : found->second;
+    const std::vector<AutoAudioRoot> roots = lane ? lane_roots(*lane) : std::vector<AutoAudioRoot>();
+    if (!lane || lane->exe.empty() || roots.empty()) {
+      if (channel.source || !channel.key.empty()) release_auto_channel(channel);
+      continue;
+    }
+    std::vector<AutoBusRoot> wanted;
+    wanted.reserve(roots.size());
+    for (const AutoAudioRoot& root : roots) wanted.push_back(AutoBusRoot{root, 1.0, false});
+    const uint32_t mixers = (1u << 0) | (1u << (track - 1));
+    sync_auto_bus(channel, auto_pref_key(lane->exe), lane->exe, lane->name, wanted,
+                  auto_volume(lane->volume), lane->muted, mixers);
+    channel.pid = lane->pid;
+  }
+
+  // Track 6: one private scene mixes every remaining program through a single output channel. A process
+  // capture of its own for each member would exhaust libobs's finite view channels at about sixty
+  // programs; this way any number of them share the one bus and the one encoder.
+  AutoAudioChannel& other = *auto_channels_[3];
+  const auto found = lanes.find(6);
+  const AutoAudioLane* lane = found == lanes.end() ? nullptr : found->second;
+  if (!lane || lane->apps.empty()) {
+    if (other.source || !other.key.empty()) release_auto_channel(other);
+    return;
+  }
+  std::vector<AutoBusRoot> wanted;
+  for (const AutoAudioApp& app : lane->apps) {
+    for (const AutoAudioRoot& root : app_roots(app)) {
+      wanted.push_back(AutoBusRoot{root, auto_volume(app.volume), app.muted});
+    }
+  }
+  if (wanted.empty()) {
+    if (other.source || !other.key.empty()) release_auto_channel(other);
+    return;
+  }
+  // The group's own gain and mute are already in each member's effective level (audio_auto.h), so the bus
+  // itself stays at unity.
+  const uint32_t mixers = (1u << 0) | (1u << 5);
+  sync_auto_bus(other, "other", std::string(), "Other audio", wanted, 1.0, false, mixers);
+  other.pid = wanted.front().root.pid;
+}
+
+ObsHost::AutoAudioView ObsHost::auto_audio_view() const {
+  AutoAudioView view;
+  view.on = config_.audio_capture_mode == "auto";
+  view.lanes = auto_plan_.lanes;
+  // A tree that was refused (audio_auto.h) is reported before any capture failure: it is a decision, not
+  // a fault, and the panel's error line must not turn it into one.
+  view.uncaptured = auto_plan_.uncaptured;
+  auto& channels = const_cast<std::vector<std::unique_ptr<AutoAudioChannel>>&>(auto_channels_);
+  // One bus mixes several process trees: the row's state is the aggregate of the trees under it.
+  const auto aggregate = [&](AutoAudioChannel& channel, const std::vector<AutoAudioRoot>& roots, int& ready,
+                             int& failed, std::string& error) {
+    for (const AutoAudioRoot& root : roots) {
+      const auto found = channel.roots.find(root.pid);
+      if (found == channel.roots.end()) {
+        ++failed;
+        if (error.empty()) error = channel.error.empty() ? "process audio could not be created" : channel.error;
+        continue;
+      }
+      const ProcessAudioState state = process_audio_state(found->second);
+      if (state.failed) {
+        ++failed;
+        if (error.empty()) error = state.error;
+      } else if (state.ready) {
+        ++ready;
+      }
+    }
+  };
+  for (AutoAudioLane& lane : view.lanes) {
+    if (lane.track >= 3 && lane.track <= 5) {
+      if (lane.track - 3 >= static_cast<int>(channels.size())) continue;
+      AutoAudioChannel& channel = *channels[static_cast<size_t>(lane.track - 3)];
+      if (channel.source) {
+        int ready = 0, failed = 0;
+        std::string error;
+        aggregate(channel, lane_roots(lane), ready, failed, error);
+        const int total = static_cast<int>(lane_roots(lane).size());
+        lane.state = total > 0 && failed == total ? "failed" : ready > 0 ? "connected" : "waiting";
+        if (!lane.apps.empty()) lane.apps[0].state = lane.state;
+        if (failed > 0) {
+          view.uncaptured.push_back(AutoAudioUncaptured{lane.exe, lane.name, "failed", error});
+          view.unsupported = view.unsupported || auto_error_is_unsupported(error);
+          view.error = view.error.empty() ? error : view.error;
+        }
+      } else if (channel.failed) {
+        lane.state = "failed";
+        if (!lane.apps.empty()) lane.apps[0].state = lane.state;
+        view.uncaptured.push_back(AutoAudioUncaptured{lane.exe, lane.name, "failed", channel.error});
+      }
+    } else if (lane.track == 6) {
+      if (channels.size() < 4) continue;
+      AutoAudioChannel& channel = *channels[3];
+      int ready = 0, failed = 0;
+      for (AutoAudioApp& app : lane.apps) {
+        const std::vector<AutoAudioRoot> roots = app_roots(app);
+        int app_ready = 0, app_failed = 0;
+        std::string error;
+        aggregate(channel, roots, app_ready, app_failed, error);
+        app.state = !roots.empty() && app_failed == static_cast<int>(roots.size())
+                        ? "failed"
+                        : app_ready > 0 ? "connected" : "waiting";
+        if (app_failed > 0) {
+          if (app.state == "failed") ++failed;
+          view.uncaptured.push_back(AutoAudioUncaptured{app.exe, app.name, "failed", error});
+          view.unsupported = view.unsupported || auto_error_is_unsupported(error);
+          view.error = view.error.empty() ? error : view.error;
+        }
+        if (app.state == "connected") ++ready;
+      }
+      lane.state = failed == static_cast<int>(lane.apps.size()) && failed > 0 ? "failed"
+                   : ready > 0 ? "connected"
+                               : "waiting";
+      if (!view.error.empty() && view.uncaptured.empty()) view.error = channel.error;
+    }
+  }
+  for (const auto& channel : channels) {
+    if (!channel) continue;
+    view.sources += static_cast<int>(channel->roots.size());
+  }
+  if (view.unsupported && view.error.empty()) view.error = "process audio is not supported here";
+  return view;
+}
+
+AudioRoutingPlan ObsHost::audio_plan_for_span(uint64_t start_ms, uint64_t end_ms, bool whole_output) const {
+  AudioRoutingPlan plan = audio_plan_;
+  if (config_.audio_capture_mode != "auto") return plan;
+  for (AudioTrackInfo& track : plan.tracks) {
+    if (track.track < 3) continue;
+    std::vector<std::string> names =
+        whole_output ? auto_journal_.output_names(track.track)
+                     : auto_journal_.names_in_span(track.track, start_ms, end_ms);
+    if (names.empty()) continue;
+    // A lane that was occupied during the span carries its bus even when the program has since left. The
+    // mix must name every bus that holds sound in the file, or the editor would call a recording complete
+    // while some of its mix has no stem of its own.
+    track.sources = {auto_bus_source(track.track)};
+    track.role = track.track == 6 ? "combined" : "application";
+    track.title = track.track == 6 ? "BuffrX Other audio" : "BuffrX " + join_lane_names(names);
+  }
+  // Track 1 is the exact union of the buses that are present in the span, plus the microphone. This is
+  // what makes read_audio_layout's complete test hold for a file whose lane changed occupants.
+  if (!plan.tracks.empty()) {
+    std::vector<std::string> mix;
+    if (config_.mic_enabled) mix.push_back("microphone");
+    for (size_t index = 1; index < plan.tracks.size(); ++index) {
+      for (const std::string& source : plan.tracks[index].sources) mix.push_back(source);
+    }
+    plan.tracks[0].sources = std::move(mix);
+  }
+  return plan;
 }
 
 void ObsHost::apply_mic_filters(const Config& config) {
@@ -1222,7 +2146,11 @@ void ObsHost::apply_mic_filters(const Config& config) {
   if (config.mic_noise_suppress) {
     if (!mic_noise_suppress_) {
       obs_data_t* s = obs_data_create();
-      obs_data_set_default_string(s, "method", "rnnoise");
+      // Set, not defaulted: the filter's own defaults run at create and would replace a default of ours. RNNoise is the voice
+      // model (48 kHz only, which is the engine's rate); Speex, the other method, is a plain spectral subtractor.
+      // Measured 2026-11-14 on a test file through BUFFRX_TEST_MIC_FILE: fan-like noise 0.052 -> 0.000 peak (Speex: 0.013);
+      // flat white hiss is RNNoise's weak case (about 1 dB), where Speex took 24 dB. Fans and hum are what mics pick up.
+      obs_data_set_string(s, "method", "rnnoise");
       mic_noise_suppress_ = obs_source_create("noise_suppress_filter", "BuffrX mic noise suppress", s, nullptr);
       obs_data_release(s);
       if (mic_noise_suppress_) obs_source_filter_add(mic_, mic_noise_suppress_);
@@ -1251,6 +2179,24 @@ void ObsHost::apply_mic_filters(const Config& config) {
     obs_source_release(mic_noise_gate_);
     mic_noise_gate_ = nullptr;
   }
+}
+
+EncoderTraits ObsHost::encoder_traits() const {
+  // obs-nvenc registers its AV1 encoders only when the driver's own probe says the GPU can encode AV1 (nvenc.c register_encoders,
+  // is_codec_supported(CODEC_AV1)), and only Ada and newer can. So a registered NVENC H.264 without NVENC AV1 is Pascal, Turing or Ampere.
+  bool nvenc = false;
+  bool nvenc_av1 = false;
+  for (size_t index = 0;; ++index) {
+    const char* id = nullptr;
+    if (!obs_enum_encoder_types(index, &id) || !id) break;
+    const std::string name = id;
+    if (name.find("nvenc") == std::string::npos) continue;
+    nvenc = true;
+    if (name.find("av1") != std::string::npos) nvenc_av1 = true;
+  }
+  EncoderTraits traits;
+  traits.nvenc_pre_ada = nvenc && !nvenc_av1;
+  return traits;
 }
 
 std::vector<std::string> ObsHost::choose_encoder_ids(const Config& config) const {
@@ -1300,7 +2246,13 @@ bool ObsHost::build_video_encoder(const std::string& encoder_id, const Config& c
 
   // One quality choice becomes two numbers: a constant-quality target the encoder aims at, and a peak rate it may not pass.
   const std::string quality = effective_quality(config);
-  const int cap_kbps = peak_kbps_for(config, canvas_width_, canvas_height_);
+  // The bit rate is planned for the pictures the encoder keeps: a divisor halves the work and the rate that suits it.
+  Config planned = config;
+  planned.capture_fps = std::max(1, config.capture_fps / std::max(1, frame_divisor_));
+  const int cap_kbps = peak_kbps_for(planned, canvas_width_, canvas_height_);
+  // The ring's disk reservation is sized for the highest rate this encoder may be asked to reach, which is the one with no divisor: a move back up
+  // from a divided level must not outgrow a file that was sized for half.
+  reserve_peak_kbps_ = peak_kbps_for(config, canvas_width_, canvas_height_);
   const int target = cq_for_codec(config.codec, quality_target(quality));
   const EncoderFamily family = encoder_family(encoder_id);
   BX_LOG_INFO("encoder %s: codec %s, quality %s -> target %d, peak %d kbps, ring %d s, speed step %d", encoder_id.c_str(),
@@ -1332,8 +2284,8 @@ bool ObsHost::build_video_encoder(const std::string& encoder_id, const Config& c
   // options from Advanced over it. Both go through apply_encoder_setting, so a value the encoder does
   // not offer is refused instead of silently ignored.
   // The mode picks the speed tier (Auto follows the quality level); the person's own rows only count in Custom.
-  std::vector<EncoderSetting> encoder_settings = configured_encoder_settings(family, config, governor_step_);
-  // The governor's steps (encoder_governor.h) go over what was chosen: an encoder that cannot keep up with the
+  std::vector<EncoderSetting> encoder_settings = configured_encoder_settings(family, config, governor_step_, encoder_traits());
+  // The controller's effort levels (encoder_controller.h) go over what was chosen: an encoder that cannot keep up with the
   // speed settings it was given is not helped by being given them again.
   // One tuning for everyone, not a setting (decided with the user, 2026-10-25): NVENC's high-quality tune. Ultra high
   // quality encoded 30-62% of the frames, and the low-latency tunes needed 5-55% more bits for the same quality, which in a
@@ -1346,6 +2298,15 @@ bool ObsHost::build_video_encoder(const std::string& encoder_id, const Config& c
   if (properties) obs_properties_destroy(properties);
   if (!video_encoder_) {
     error = "encoder could not be created: " + encoder_id;
+    return false;
+  }
+  // The frame-rate lever, set before the encoder starts. An encoder that will not take it (or takes another) is refused here, so a level that
+  // needs it is never offered for this vendor.
+  if (frame_divisor_ > 1 && (!obs_encoder_set_frame_rate_divisor(video_encoder_, static_cast<uint32_t>(frame_divisor_)) ||
+                             obs_encoder_get_frame_rate_divisor(video_encoder_) != static_cast<uint32_t>(frame_divisor_))) {
+    obs_encoder_release(video_encoder_);
+    video_encoder_ = nullptr;
+    error = "the encoder does not take a frame-rate divisor of " + std::to_string(frame_divisor_) + ": " + encoder_id;
     return false;
   }
   encoder_id_ = encoder_id;
@@ -1383,7 +2344,13 @@ bool ObsHost::configure_encoders(const Config& requested, std::string& error) {
   std::vector<Attempt> attempts;
   Config effective = config;
   if (!codec_override_.empty()) effective.codec = codec_override_;
-  for (const std::string& id : choose_encoder_ids(effective)) attempts.push_back({effective, id});
+  const int ladder_rung = ladder_rung_now();
+  const buffrx::LadderLayer ladder = buffrx::ladder_layer(ladder_rung, ladder_vendor_, effective.codec, effective.encoder);
+  effective.codec = ladder.codec;
+  effective.encoder = ladder.encoder;
+  for (const std::string& id : buffrx::ladder_order_ids(choose_encoder_ids(effective), ladder.system_first)) {
+    attempts.push_back({effective, id});
+  }
   if (effective.encoder != "auto") {
     Config automatic = effective;
     automatic.encoder = "auto";
@@ -1414,8 +2381,9 @@ bool ObsHost::configure_encoders(const Config& requested, std::string& error) {
     if (attempt.config.codec != effective.codec) {
       codec_override_ = attempt.config.codec;
       pending_notice_title_ = "Using H.264";
-      pending_notice_detail_ = "This PC could not start a " + std::string(effective.codec == "av1" ? "AV1" : "HEVC") +
-                               " encoder, so BuffrX is recording H.264. Your setting is unchanged.";
+      // Says what was observed: no encoder for this codec started (none was registered, or each one failed to start).
+      pending_notice_detail_ = "No " + std::string(effective.codec == "av1" ? "AV1" : "HEVC") +
+                               " encoder started on this PC, so BuffrX is recording H.264. Your setting is unchanged.";
       BX_LOG_WARN("no %s encoder could be started here (%s); recording H.264", effective.codec.c_str(), failures.c_str());
     } else if (attempt.config.encoder != effective.encoder) {
       last_error_ = "the " + effective.encoder + " encoder is not available here; using " + attempt.id;
@@ -1430,16 +2398,23 @@ bool ObsHost::configure_encoders(const Config& requested, std::string& error) {
     error = "no encoder could be created: " + failures;
     return false;
   }
+  // The level table of the encoder that started, and the level this run starts at (the controller, plan 008).
+  controller_prepare();
 
   // Tracks 1..6 as OBS counts them. `separate_tracks` is the older two-source alias: on means three
   // tracks unless the explicit count asks for more. audio_track_count is the spill's own answer too.
   const int track_count = audio_track_count(config);
+  audio_plan_ = plan_audio_routing(config, game_target_);
   for (int track = 0; track < track_count; ++track) {
     obs_data_t* audio_settings = obs_data_create();
     obs_data_set_int(audio_settings, "bitrate", std::max(64, config.audio_bitrate_kbps));
+    // The encoder's title is the track's recorded-time label ("BuffrX Mix", "BuffrX Discord"). OBS's muxer
+    // writes no stream title, so the sidecar beside a multitrack file is what an editor reads (audio_routing.h).
+    const std::string title = track < static_cast<int>(audio_plan_.tracks.size())
+                                  ? audio_plan_.tracks[static_cast<size_t>(track)].title
+                                  : "BuffrX Track " + std::to_string(track + 1);
     obs_encoder_t* encoder =
-        obs_audio_encoder_create("ffmpeg_aac", ("BuffrX audio " + std::to_string(track + 1)).c_str(),
-                                 audio_settings, static_cast<size_t>(track), nullptr);
+        obs_audio_encoder_create("ffmpeg_aac", title.c_str(), audio_settings, static_cast<size_t>(track), nullptr);
     obs_data_release(audio_settings);
     if (!encoder) {
       error = "audio encoder could not be created";
@@ -1478,7 +2453,7 @@ bool ObsHost::create_outputs(std::string& error) {
       limit = std::min<int64_t>(ceiling_bytes, std::atoll(probe) * 1024 * 1024);
     }
     const bool disabled = GetEnvironmentVariableA("BUFFRX_NO_SPILL", nullptr, 0) > 0;
-    const int64_t peak_kbps = std::max(created_max_kbps_, created_kbps_);  // 0 for a rate control with no peak (CQP)
+    const int64_t peak_kbps = std::max<int64_t>(std::max(created_max_kbps_, created_kbps_), reserve_peak_kbps_);  // 0 for a rate control with no peak (CQP)
     const int64_t audio_kbps = static_cast<int64_t>(audio_track_count(config_)) * std::max(64, config_.audio_bitrate_kbps);
     const int64_t file_bytes = disabled ? 0 : spill_reservation_bytes(peak_kbps, audio_kbps, std::max(1, config_.buffer_seconds), limit);
     if (file_bytes > 0) {
@@ -1686,6 +2661,9 @@ void ObsHost::stop_buffer() {
     buffer_stop_issued_ms_ = GetTickCount();
   }
   buffer_active_ = false;
+  // "Not producing frames" describes a running buffer: left behind by a stop it read as a fault on a buffer that is
+  // simply off (a pause for games only, or the person's own stop).
+  if (last_error_ == "the capture source is not producing frames") last_error_.clear();
 }
 
 // True once the output is down. It never waits: every caller runs on the tick or on a pipe command,
@@ -1704,7 +2682,7 @@ bool ObsHost::force_replay_stopped() {
 }
 
 int ObsHost::save_clip(int seconds, std::string& error) {
-  if (!replay_ || !obs_output_active(replay_) || buffer_stopping_) {
+  if (!replay_ || (!obs_output_active(replay_) && !ring_kept_for_salvage_) || buffer_stopping_) {
     // A buffer waiting for its first frame is starting, not stopping: the save was refused either way,
     // but the person reading the message was told the opposite of what the engine was doing.
     error = buffer_stopping_ ? "the buffer is still stopping"
@@ -1749,9 +2727,10 @@ bool ObsHost::create_recording_encoders(std::string& error) {
 
   for (size_t index = 0; index < audio_encoders_.size(); ++index) {
     obs_data_t* audio_settings = obs_encoder_get_settings(audio_encoders_[index]);
+    // These encoders coexist with the buffer's encoders, so their libobs names must be distinct.
+    const std::string title = "BuffrX recording audio " + std::to_string(index + 1);
     obs_encoder_t* encoder = obs_audio_encoder_create(
-        "ffmpeg_aac", ("BuffrX recording audio " + std::to_string(index + 1)).c_str(), audio_settings,
-        static_cast<size_t>(index), nullptr);
+        "ffmpeg_aac", title.c_str(), audio_settings, static_cast<size_t>(index), nullptr);
     obs_data_release(audio_settings);
     if (!encoder) {
       error = "a recording audio encoder could not be created";
@@ -1827,6 +2806,8 @@ obs_output_t* ObsHost::create_chunk_output(const std::string& path, obs_encoder_
 bool ObsHost::start_recording_output(std::string& error) {
   release_recording_output();
   const bool timeline = timeline_writer_.load();
+  // A manual file's labels are its own for its whole life, whichever encoder path it took.
+  if (!timeline) manual_audio_plan_ = audio_plan_;
   const bool shared = shared_encoders_ok_ && video_encoder_ && !audio_encoders_.empty();
   recording_shared_ = shared;
   if (!shared) {
@@ -1867,10 +2848,26 @@ bool ObsHost::start_recording_output(std::string& error) {
   current_chunk_ = path;
   current_chunk_start_ms_ = GetTickCount();
   chunk_start_unconfirmed_ = true;
+  // The automatic lanes' names for this file start being summarised now. A manual recording keeps every
+  // identity it carries until it stops, even after the rolling journal has pruned the buffer's window.
+  if (!timeline) auto_journal_.start_output(GetTickCount64());
+  if (timeline) {
+    const Config running = effective_config();
+    const int width = running.output_width > 0 ? running.output_width : canvas_width_;
+    const int height = running.output_height > 0 ? running.output_height : canvas_height_;
+    const std::string layout = timeline_layout_key(encoder_id_, width, height, audio_plan_.track_count);
+    timeline_epoch_ = next_timeline_epoch(timeline_epoch_, timeline_layout_, layout);
+    timeline_layout_ = layout;
+  }
   // The session index follows the files the splitter opens from here; the first one is the file just started.
   if (timeline && !timeline_chunks_.begin(path, current_chunk_start_ms_)) {
     BX_LOG_WARN("the timeline segment's first span was not opened: %s", path.c_str());
   }
+  // The labels and roles of the tracks this segment is being written with, beside its first file. A
+  // chunk written later in the same segment writes its own, so every file is labelled on its own and a
+  // save never has to guess which segment a file belonged to (audio_layout.h). A manual recording is one
+  // file and gets its sidecar when it stops, so a recording that is thrown away leaves none.
+  if (timeline) note_chunk_audio_layout(path);
   // The library neither lists nor opens the chunk while it is being written: a file that is still
   // growing has no index yet, and handing it to a decoder is how the engine used to die on a
   // half-written recording.
@@ -1904,7 +2901,11 @@ bool ObsHost::start_shared_manual_recording(std::string& error) {
     }
     const std::string directory = recordings_folder(config_);
     CreateDirectoryA(directory.c_str(), nullptr);
+    // The routing this file is written with, kept for the sidecar a stop writes: a settings change while
+    // the file runs must not rename tracks that were already recorded.
+    manual_audio_plan_ = audio_plan_;
     manual_file_ = reserve_output_path(directory, timestamped_stem_now("Recording"), std::string(".") + config_.container);
+    auto_journal_.start_output(GetTickCount64());
     manual_closed_ = false;
     manual_stop_requested_ms_ = 0;
     manual_stop_code_ = 0;
@@ -1948,7 +2949,21 @@ void ObsHost::release_manual_recording() {
   if (!manual_file_.empty()) {
     // A muxer that died before writing a byte still counted encoded frames, and its empty file would be
     // listed as a clip that cannot play.
-    if (frames == 0 || file_size_now(manual_file_) == 0) DeleteFileA(manual_file_.c_str());
+    const bool empty = frames == 0 || file_size_now(manual_file_) == 0;
+    if (empty) {
+      DeleteFileA(manual_file_.c_str());
+    } else {
+      // Automatic lanes are named by everyone who occupied them while the file ran, not by the program
+      // that happened to be on the lane at the start. The bus ids keep the decomposition exact.
+      const AudioRoutingPlan plan =
+          config_.audio_capture_mode == "auto"
+              ? audio_plan_for_span(0, GetTickCount64(), true)
+              : manual_audio_plan_;
+      if (!write_audio_sidecar(manual_file_, plan)) {
+        BX_LOG_WARN("the audio track labels for %s were not written", manual_file_.c_str());
+      }
+    }
+    auto_journal_.end_output(GetTickCount64());
     library_release(manual_file_);
     if (frames != 0 && on_session_changed) on_session_changed(std::string(), false);
   }
@@ -2469,9 +3484,14 @@ Config ObsHost::effective_config() const { return effective_for(config_); }
 
 Config ObsHost::effective_for(const Config& user) const {
   Config config = layered(user);
-  // The relief ladder's last two rungs lower the capture rate, never the resolution (encoder_governor.h).
-  config.capture_fps = buffrx::relief_capture_fps(config.capture_fps, config.encoder_speed_step);
   if (!codec_override_.empty()) config.codec = codec_override_;
+  // The encoder ladder (encoder_ladder.h) is a layer over the person's settings, like the codec fallback above.
+  const int rung = ladder_rung_now();
+  if (rung > 0) {
+    const buffrx::LadderLayer layer = buffrx::ladder_layer(rung, ladder_vendor_, config.codec, config.encoder);
+    config.codec = layer.codec;
+    config.encoder = layer.encoder;
+  }
   return config;
 }
 
@@ -2506,6 +3526,7 @@ bool ObsHost::set_performance_game(bool listed, std::string& error) {
 }
 
 bool ObsHost::recover_after_sleep(std::string& error) {
+  controller_grace(GetTickCount());
   // Nothing inside libobs reports a lost device after a sleep: the outputs keep their old state and the next frame
   // never comes. The pipeline is therefore built from the settings that were running, through the same teardown a
   // video change uses (sources down before obs_reset_video). A sleeping engine has nothing to rebuild.
@@ -2524,51 +3545,404 @@ bool ObsHost::recover_after_sleep(std::string& error) {
   return ok;
 }
 
-bool ObsHost::apply_governor_step(std::string& error) {
-  if (governor_step_ >= buffrx::kMaxReliefStep) return false;
-  // The tick only queues a step while nothing records, but the action queue can run it after a Record
-  // click in the same pass: rebuilding here would cut that recording in two. The ladder re-arms next tick.
-  if (recording_busy()) return false;
-  // One step per four seconds is a minute of choppy footage on a setting that is far too heavy, and every step empties the
-  // ring. A ratio this bad says where it has to end up, so the ladder jumps: under half the frames goes straight to the
-  // frame-rate rungs, under seven tenths takes two.
-  const int before = governor_step_;
-  const double ratio = encoder_watch_.ratio;
-  const int bump = ratio < 0.5 ? 3 : ratio < 0.7 ? 2 : 1;
-  // Frame rate is the last resort: the effort rungs (1-3) are used up before a single fps step is taken, and from there
-  // the rate falls one step at a time. A very bad ratio may skip preset rungs, never the frame rate.
-  governor_step_ = governor_step_ < 3 ? std::min(governor_step_ + bump, 3)
-                                      : std::min(governor_step_ + 1, buffrx::kMaxReliefStep);
-  force_encoder_rebuild_ = true;
-  Config config = config_;
-  config.encoder_speed_step = governor_step_;
-  BX_LOG_WARN("the encoder could not keep up (%d%% of the frames at %d fps): lowering its speed settings to step %d of %d",
-              static_cast<int>(std::lround(ratio * 100.0)), config_.capture_fps, governor_step_,
-              buffrx::kMaxReliefStep);
-  const bool ok = apply(config, true, error);
-  force_encoder_rebuild_ = false;
-  // The cooldown starts when the new encoder is running, not when the step was asked for.
-  governor_last_step_ms_ = GetTickCount();
-  // Said over the game, every time it changes: the person must know why the picture or the rate is not what they chose.
-  if (ok && on_notice) {
-    const int running_fps = buffrx::relief_capture_fps(config_.capture_fps, governor_step_);
-    // Name the change, nothing else: one short line fits the card.
-    std::string title;
+void ObsHost::reset_display_replan() {
+  display_replan_failed_for_.clear();
+  display_replan_attempts_ = 0;
+  display_replan_retry_at_ = 0;
+  display_replan_told_for_.clear();
+  display_replan_topology_.clear();
+  display_replan_topology_at_ = 0;
+}
+
+std::string ObsHost::display_topology() const {
+  // The choice as the config means it now, and which adapters list it: what the retry rule compares
+  // (display_target.h: display_topology_signature). The warning is not raised here; the follow check owns it.
+  const DisplayPick display = pick_display(enumerate_displays(), config_.display_id, config_.display_name);
+  return display_topology_signature(display, gpu_adapters());
+}
+
+void ObsHost::note_display_replan_failure(const std::string& wanted) {
+  if (display_replan_failed_for_ != wanted) display_replan_attempts_ = 0;
+  display_replan_failed_for_ = wanted;
+  ++display_replan_attempts_;
+  display_replan_retry_at_ = GetTickCount();
+  // The desk this refusal belongs to: equal next time means the same failed state, a different one a new episode.
+  display_replan_topology_ = display_topology();
+  display_replan_topology_at_ = display_replan_retry_at_;
+  if (display_replan_attempts_ == kDisplayReplanMaxAttempts) {
+    BX_LOG_WARN("the display %s is still not on the capture's graphics card after %d rebuilds; it is not tried again until the desk changes",
+                wanted.c_str(), display_replan_attempts_);
+  }
+}
+
+void ObsHost::report_display_replan_failure(const std::string& wanted, const std::string& error) {
+  if (!on_notice) return;
+  if (!display_replan_report_due(display_replan_told_for_, wanted, display_replan_attempts_, kDisplayReplanMaxAttempts)) return;
+  display_replan_told_for_ = wanted;
+  const bool gave_up = display_replan_attempts_ >= kDisplayReplanMaxAttempts;
+  on_notice(gave_up ? "The display stays where it is" : "Display did not move to its card",
+            error + (gave_up ? " BuffrX will not retry until the display changes." : " It will try again in a moment."));
+}
+
+bool ObsHost::rebuild_for_display(std::string& error) {
+  if (!initialized_) {
+    error = "engine is not initialized";
+    return false;
+  }
+  // Asleep there is no device to move: the wake plans the canvas and the card from config_ (configure_video
+  // picks the display's own adapter), so nothing here has to be remembered.
+  if (deep_idle_) return true;
+  // A queued display change must not split a manual recording. The follow check asks again after it ends.
+  if (recording_busy()) return true;
+  // Nothing automatic resets the video while the driver is in backoff; the tick asks again.
+  if (!buffrx::video_init_allowed(video_backoff_, GetTickCount())) return true;
+  // Nothing to do when no display is captured any more, and nothing when the capture is already right: the device
+  // reaches the display (a queued ask another rebuild answered, or the display moved back) and, with a Native output,
+  // the canvas is the display's own size. An explicit Windows Graphics Capture choice needs no card, but it does need
+  // the canvas planned again when its display's size changed: the size is the reason there, never the card. Each try
+  // is a video reset and an emptied ring.
+  const std::string wanted = capture_mode_now() == "display" ? monitor_device_name(config_) : std::string();
+  const auto target_size = [&](int& width, int& height) {
+    // The mode the device serves: a followed game is the display, and the canvas was planned at the display's size.
+    Config served = config_;
+    if (follow_display_ && served.capture_mode == "game") served.capture_mode = "display";
+    return win32_target_size(served, width, height);
+  };
+  const auto native_size_stale = [&]() {
+    int width = 0;
+    int height = 0;
+    if (!target_size(width, height)) return false;  // the display's size is not known: nothing to plan
+    const Config running = effective_config();
+    return display_native_size_needs_replan(width, height, canvas_width_, canvas_height_,
+                                            running.output_width > 0 && running.output_height > 0,
+                                            config_.capture_mode == "game" && follow_display_);
+  };
+  const bool needs_card = display_capture_needs_card(config_.display_method);
+  const bool device_reaches = !needs_card || device_can_duplicate(device_outputs_, device_outputs_known_, wanted);
+  if (wanted.empty() || !display_replan_action_needed(device_reaches, native_size_stale())) {
+    reset_display_replan();
+    return true;
+  }
+  const bool card_move = needs_card && !device_reaches;
+  // What a video reset interrupts, read before it runs: the person is told the truth afterwards, once.
+  const bool was_buffer = buffer_wanted();
+  const bool was_recording = recording_busy();
+  const bool was_timeline = timeline_writer_active();
+  // The buffer's own words: "restarted" only while it is running, otherwise what it is doing. The reset empties the
+  // ring either way, and a start that is still waiting for its first frame is not a restart.
+  const auto buffer_words = [&]() -> std::string {
+    if (buffer_active_) return "The buffer was cleared and restarted.";
+    if (buffer_wanted()) return "The buffer was cleared and is starting again.";
+    return "The buffer was stopped.";
+  };
+  // What the reset cost, read after it ran: the ring is empty and a recording that was running is a new file (or
+  // gone). Said with the outcome either way, so nobody has to guess what happened to the footage.
+  const auto footage_cost = [&]() {
     std::string detail;
-    if (running_fps < config_.capture_fps) {
-      title = "Clips at " + std::to_string(running_fps) + " fps";
-      detail = "Your GPU cannot encode " + std::to_string(config_.capture_fps) + " fps in real time, so clips are made at " +
-               std::to_string(running_fps) + " fps. Resolution is unchanged.";
-    } else {
-      title = "Encoder effort lowered";
-      detail = "Your GPU cannot encode this setting at real time. Resolution unchanged.";
+    if (was_recording) detail = recording_busy() ? "The recording continued in a new file." : "The recording was stopped.";
+    if (was_buffer) detail += std::string(detail.empty() ? "" : " ") + buffer_words();
+    if (was_timeline) {
+      detail += std::string(detail.empty() ? "" : " ") +
+                (timeline_writer_active() ? "Timeline continued in a new segment." : "Timeline is paused.");
     }
-    if (governor_step_ > before) BX_LOG_INFO("relief: step %d -> %d, running %d fps", before, governor_step_, running_fps);
-    on_notice(title, detail);
+    return detail;
+  };
+  force_video_rebuild_ = true;
+  display_replan_running_ = true;
+  const bool applied = apply(config_, false, error);
+  display_replan_running_ = false;
+  force_video_rebuild_ = false;
+  // Each failed try advances the retry state once, whichever way it failed: the follow check waits half a minute
+  // and stops after kDisplayReplanMaxAttempts until the desk changes (display_target.h has the rule).
+  if (!applied) {
+    note_display_replan_failure(wanted);
+    const std::string cost = footage_cost();
+    if (!cost.empty()) error += " " + cost;
+    BX_LOG_WARN("the capture could not be rebuilt for the display: %s", error.c_str());
+    report_display_replan_failure(wanted, error);
+    return false;
+  }
+  // A reset can land on the fallback adapter when the display's own card refuses it. That is not the device the
+  // person's display is on, and the source reaches it only through Windows Graphics Capture, which has delivered
+  // no frame at all here: said, retried later, never reported as the device having moved.
+  if (card_move && !device_can_duplicate(device_outputs_, device_outputs_known_, wanted)) {
+    note_display_replan_failure(wanted);
+    const std::string cost = footage_cost();
+    error = "The display is on a graphics card the capture device could not move to.";
+    if (!cost.empty()) error += " " + cost;
+    BX_LOG_WARN("the display %s is still not on the capture's graphics card", wanted.c_str());
+    report_display_replan_failure(wanted, error);
+    return false;
+  }
+  // The canvas is planned from the display's size, so the size asked for is the size it should have now. One that did
+  // not take is bounded like a refused card: a reset every tick for a size that never arrives would cut every
+  // recording and empty the ring for nothing.
+  if (native_size_stale()) {
+    note_display_replan_failure(wanted);
+    const std::string cost = footage_cost();
+    error = "The display's size could not be applied to the capture.";
+    if (!cost.empty()) error += " " + cost;
+    BX_LOG_WARN("the canvas was not planned at the display's size after a rebuild", wanted.c_str());
+    report_display_replan_failure(wanted, error);
+    return false;
+  }
+  reset_display_replan();
+  if ((was_buffer || was_recording || was_timeline) && on_notice) {
+    // Nothing here claims a frame from the new source: only that the device now reaches the display's card, or that
+    // the canvas has the display's own size.
+    std::string detail;
+    if (was_recording) detail = recording_busy() ? "The recording continued in a new file." : "The recording was stopped.";
+    if (was_buffer) detail += std::string(detail.empty() ? "" : " ") + buffer_words();
+    // Timeline is brought back by the tick after every rebuild, in a new segment.
+    if (was_timeline) detail += std::string(detail.empty() ? "" : " ") + "Timeline starts a new segment.";
+    on_notice(card_move ? "The capture device moved to the display's card" : "The display's size changed", detail);
+  }
+  return true;
+}
+
+// The latest of: a stall restart, a game-capture stall stop, an output stopped on an encode error, a device reset in libobs.
+uint32_t ObsHost::last_fault_ms() const {
+  const uint32_t ours = fault_tick_.load();
+  const uint32_t lost = static_cast<uint32_t>(libobs_device_lost_at_ms());
+  if (ours == 0) return lost;
+  if (lost == 0) return ours;
+  return static_cast<int32_t>(ours - lost) >= 0 ? ours : lost;
+}
+
+// Runs on libobs's thread (an output's stop signal): only sets what the tick reads.
+void ObsHost::note_output_stop_code(long long code) {
+  if (code != -8) return;  // OBS_OUTPUT_ENCODE_ERROR
+  const uint32_t now = GetTickCount();
+  fault_tick_ = now == 0 ? 1 : now;
+  encoder_death_pending_ = true;
+}
+
+namespace {
+const char* ladder_rung_name(int rung) {
+  if (rung == 1) return "its system-memory variant";
+  return rung == 2 ? "H.264" : "software H.264";
+}
+}  // namespace
+
+// The encoder died twice in ten minutes: one rung down, as a layer, remembered for this GPU and driver.
+bool ObsHost::apply_ladder_step(std::string& error) {
+  if (recording_busy()) {
+    ladder_pending_ = true;  // a rebuild would cut the recording in two: it waits for the recording to end
+    return false;
+  }
+  const std::string failed_id = encoder_id_;
+  const bool has_system_variant = [&] {
+    for (const std::string& id : choose_encoder_ids(effective_config())) {
+      if (buffrx::encoder_is_system_memory(id)) return true;
+    }
+    return false;
+  }();
+  const int before = ladder_rung_now();
+  const int next = buffrx::ladder_next_rung(before, has_system_variant, effective_config().codec == "h264",
+                                            buffrx::encoder_vendor_of(failed_id) == "software");
+  if (next == before) return false;
+  ladder_key_ = ladder_key_now();
+  ladder_rung_ = next;
+  capacity_write_step(ladder_path_, ladder_key_, next);
+  BX_LOG_WARN("the video encoder %s died twice within ten minutes: stepping down to rung %d of %d (%s)", failed_id.c_str(), next,
+              buffrx::kMaxLadderRung, ladder_rung_name(next));
+  force_encoder_rebuild_ = true;
+  const bool ok = apply(config_, true, error);
+  force_encoder_rebuild_ = false;
+  if (on_notice) {
+    on_notice("Encoder changed", "The " + failed_id + " encoder kept stopping, so BuffrX now uses " + std::string(ladder_rung_name(next)) +
+                                     ". Your settings are unchanged.");
   }
   return ok;
 }
 
+// "Start from full speed again" also forgets the rung: the layer goes and so does its record.
+void ObsHost::clear_encoder_ladder() {
+  if (ladder_rung_ == 0 && ladder_key_.empty()) return;
+  capacity_forget_key(ladder_path_, ladder_key_);
+  ladder_rung_ = 0;
+  ladder_key_.clear();
+  encoder_deaths_ = buffrx::EncoderDeaths{};
+}
+
+// Gives the running buffer another video encoder, built at effort `step`, without emptying it (plan 008). One encoder at a time: Timeline's
+// segment and the ring's output stop, the new encoder is bound to the ring and the ring starts again with its footage kept (a new epoch,
+// ring_output.cpp), and Timeline's own tick opens a new segment on the new encoder as it does after any rebuild. The gap is the encoder's
+// start, a tenth of a second or so. Runs on the action worker, which holds the engine lock, so nothing here waits for the tick.
+bool ObsHost::swap_encoder(int step, int divisor, std::string& error) {
+  if (!initialized_ || deep_idle_) {
+    error = "the buffer is not running";
+    return false;
+  }
+  if (dedupe_wanted()) {
+    error = "encoder swaps are unavailable while Timeline deduplication is enabled";
+    return false;
+  }
+  // One rebuild at a time. Let go before the fallback below, which is a rebuild itself.
+  auto rebuilding = std::make_unique<RebuildGuard>(rebuild_gate_);
+  if (!replay_ || !obs_output_active(replay_) || buffer_stopping_ || !buffer_intent_ || !video_encoder_) {
+    error = "the buffer is not running";
+    return false;
+  }
+  // A manual recording is one file that never splits; a save in flight is reading the ring; a driver that just faulted is not to be
+  // asked for a new encoder session (the encoder step that hung the engine once).
+  if (recording_busy()) {
+    error = "a recording is running";
+    return false;
+  }
+  if (save_in_flight_ || !save_queue_.empty()) {
+    error = "a clip is being saved";
+    return false;
+  }
+  if (buffrx::governor_held(GetTickCount(), last_fault_ms())) {
+    error = "the graphics driver faulted a moment ago";
+    return false;
+  }
+  const uint32_t began = GetTickCount();
+  proc_handler_t* procs = obs_output_get_proc_handler(replay_);
+  const auto ring_call = [&](const char* name, bool* flag) {
+    calldata_t call{};
+    calldata_init(&call);
+    const bool called = procs && proc_handler_call(procs, name, &call);
+    if (flag) *flag = called && calldata_bool(&call, "ok");
+    calldata_free(&call);
+    return called;
+  };
+  bool prepared = false;
+  ring_call("swap_prepare", &prepared);
+  if (!prepared) {
+    error = "the ring is being written";
+    return false;
+  }
+  encoder_swapping_ = true;
+  struct Done {
+    std::atomic<bool>& flag;
+    ~Done() { flag = false; }
+  } done{encoder_swapping_};
+
+  // The new encoder is built before anything stops: creating it opens no hardware session (the start does), so this costs the gap nothing.
+  obs_encoder_t* const old_encoder = video_encoder_;
+  const int old_step = governor_step_;
+  const int old_divisor = frame_divisor_;
+  video_encoder_ = nullptr;
+  governor_step_ = step;
+  frame_divisor_ = std::max(1, divisor);
+  std::string build_error;
+  if (!build_video_encoder(encoder_id_, effective_config(), build_error)) {
+    video_encoder_ = old_encoder;
+    governor_step_ = old_step;
+    frame_divisor_ = old_divisor;
+    ring_call("swap_cancel", nullptr);
+    error = "the new encoder could not be created: " + build_error;
+    return false;
+  }
+  obs_encoder_t* const new_encoder = video_encoder_;
+
+  // Timeline's segment shares the encoder, so it closes first and the tick resumes it on the new one (the path a rebuild takes).
+  bool segment = false;
+  {
+    std::lock_guard<std::mutex> lock(recording_mutex_);
+    segment = timeline_writer_.load() && (recording_ != nullptr || recording_active_);
+  }
+  if (segment) {
+    if (!timeline_paused_) {
+      timeline_paused_ = true;
+      timeline_pause_state_ = TimelineState::PausedRebuild;
+      timeline_paused_at_ms_ = GetTickCount();
+    }
+    stop_primary_recording();
+    const uint32_t waited = GetTickCount();
+    for (;;) {
+      bool active = false;
+      {
+        std::lock_guard<std::mutex> lock(recording_mutex_);
+        active = recording_ && obs_output_active(recording_);
+      }
+      if (!active) break;
+      if (GetTickCount() - waited > 3000) {
+        // The old Timeline output still owns an active encoder session. Starting another one here can exceed the device's session limit.
+        obs_encoder_release(new_encoder);
+        video_encoder_ = old_encoder;
+        governor_step_ = old_step;
+        frame_divisor_ = old_divisor;
+        ring_call("swap_cancel", nullptr);
+        error = "the Timeline segment did not stop in time";
+        BX_LOG_WARN("the encoder swap was given up: %s", error.c_str());
+        return false;
+      }
+      Sleep(2);
+    }
+  }
+
+  obs_output_stop(replay_);
+  const uint32_t stop_began = GetTickCount();
+  while (obs_output_active(replay_) && GetTickCount() - stop_began < 5000) Sleep(1);
+  if (obs_output_active(replay_)) {
+    // Neither forced nor cancelled: the ring is still asked to keep its footage, and the stop finishes with the next packet. The old encoder is
+    // still the one it is bound to, so the watchdog's restart continues the same footage (the ask is good for twenty seconds).
+    buffer_active_ = false;
+    if (video_encoder_ != old_encoder) obs_encoder_release(video_encoder_);
+    video_encoder_ = old_encoder;
+    governor_step_ = old_step;
+    frame_divisor_ = old_divisor;
+    error = "the buffer did not stop in time";
+    BX_LOG_WARN("the encoder swap was given up: %s", error.c_str());
+    return false;
+  }
+  const uint32_t stopped_ms = GetTickCount() - stop_began;
+
+  const auto start_with = [&](obs_encoder_t* encoder, int fail_when) {
+    obs_output_set_video_encoder(replay_, encoder);
+    if (swap_test_fail_ >= fail_when) return false;
+    return obs_output_start(replay_);
+  };
+  bool started = start_with(new_encoder, 1);
+  bool restored_old = false;
+  if (!started) {
+    BX_LOG_WARN("the new encoder would not start (%s); starting the previous settings again",
+                obs_output_get_last_error(replay_) ? obs_output_get_last_error(replay_) : "no reason given");
+    started = start_with(old_encoder, 2);
+    restored_old = started;
+    if (!started) {
+      // Neither would start: what the ring holds is written out while it still can be, and the buffer is rebuilt the ordinary way.
+      BX_LOG_ERROR("neither the new nor the previous encoder would start; saving the ring, then rebuilding the buffer");
+      ring_kept_for_salvage_ = true;
+      salvage_buffer("the encoder could not be swapped", true);
+      ring_kept_for_salvage_ = false;
+      ring_call("swap_cancel", nullptr);
+      obs_output_set_video_encoder(replay_, old_encoder);
+      obs_encoder_release(new_encoder);
+      video_encoder_ = old_encoder;
+      governor_step_ = old_step;
+      frame_divisor_ = old_divisor;
+      buffer_active_ = false;
+      error = "the buffer could not restart on a new encoder; it is rebuilt";
+      std::string rebuild_error;
+      force_encoder_rebuild_ = true;
+      Config again = config_;
+      encoder_swapping_ = false;
+      rebuilding.reset();
+      const bool rebuilt = apply(again, true, rebuild_error);
+      force_encoder_rebuild_ = false;
+      if (!rebuilt) error += " (" + rebuild_error + ")";
+      return false;
+    }
+  }
+  if (restored_old) {
+    obs_encoder_release(new_encoder);
+    video_encoder_ = old_encoder;
+    governor_step_ = old_step;
+    frame_divisor_ = old_divisor;
+    error = "the new encoder would not start; the previous settings carry on";
+  } else {
+    obs_encoder_release(old_encoder);  // the ring's output and Timeline's old output let go of theirs
+  }
+  encoder_watch_ = buffrx::EncoderWatch{};  // the new encoder counts its frames from zero: that is not a frozen encoder
+  buffer_active_ = true;
+  BX_LOG_NOTE("encoder swap: %s at effort step %d -> %d, divisor %d -> %d, output down %u ms, whole swap %u ms%s", encoder_id_.c_str(), old_step, step,
+              old_divisor, frame_divisor_, stopped_ms, GetTickCount() - began, restored_old ? " (the new encoder failed; the old one carries on)" : "");
+  return !restored_old;
+}
 
 // The splitter's word that the session is writing a new file. It runs on the output's own thread, inside
 // libobs, where no engine lock may be taken and nothing may block, so the signal only queues the path and the
@@ -2588,6 +3962,8 @@ void ObsHost::poll_timeline_split(uint32_t now) {
     }
     current_chunk_ = change.file;
     current_chunk_start_ms_ = timeline_chunks_.current_start_ms();
+    // The muxer's own split: this file is written with the same plan as the segment it belongs to.
+    note_chunk_audio_layout(change.file);
     // The new file begins on the frame the splitter cut on, so no first-frame correction is owed for it.
     chunk_start_unconfirmed_ = false;
     library_hold(change.file);
@@ -2605,6 +3981,16 @@ void ObsHost::clear_split_queue() {
   split_changes_.clear();
 }
 
+void ObsHost::note_chunk_audio_layout(const std::string& file) {
+  if (file.empty() || audio_plan_.track_count <= 1) return;
+  // The labels are recorded now, at the routing this segment was started with; the media's identity is
+  // bound when the writer has closed (pending_chunk_publish_locked), so an unfinished chunk is an import
+  // rather than a claim about bytes that are still growing.
+  if (!write_audio_sidecar_pending(file, audio_plan_)) {
+    BX_LOG_WARN("the audio track labels for the timeline chunk %s were not written", file.c_str());
+  }
+}
+
 // One closed span into the index queue, with the session's wall clock. Filed, not yet indexed: the entry waits
 // until nobody holds the file (pending_chunk_publish_locked), because an index that names a file a writer still
 // holds is a cut or a playback that fails. Caller holds recording_mutex_.
@@ -2620,6 +4006,7 @@ void ObsHost::queue_session_chunk(const std::string& file, uint32_t start_ms, ui
   chunk.wall_start_ms = session_wall_ms + static_cast<int64_t>(start_ms - session_.started_ms);
   chunk.wall_end_ms = chunk.wall_start_ms + static_cast<int64_t>(end_ms - start_ms);
   chunk.published = true;
+  chunk.epoch = timeline_epoch_;
   pending_chunks_.push_back(PendingChunk{session_.id, chunk, GetTickCount()});
 }
 
@@ -2650,6 +4037,23 @@ void ObsHost::index_open_chunk(uint32_t now) {
     if (empty && DeleteFileA(current_chunk_.c_str())) {
       BX_LOG_INFO("an empty recording chunk was dropped: %s", current_chunk_.c_str());
     }
+    // A manual recording kept on the fallback encoder path has no session to publish it, so its labels
+    // are written here, once the writer has closed. A file still held by its writer gets none: it reads
+    // as an import, and no claim is made about bytes that can still change.
+    if (!empty && session_.id.empty()) {
+      if (file_writer_closed(current_chunk_)) {
+        const AudioRoutingPlan plan =
+            config_.audio_capture_mode == "auto"
+                ? audio_plan_for_span(0, GetTickCount64(), true)
+                : manual_audio_plan_;
+        if (!write_audio_sidecar(current_chunk_, plan)) {
+          BX_LOG_WARN("the audio track labels for %s were not written", current_chunk_.c_str());
+        }
+      } else {
+        BX_LOG_WARN("the audio track labels for %s were not written: its writer had not closed",
+                    current_chunk_.c_str());
+      }
+    }
     library_release(current_chunk_);
   }
   current_chunk_.clear();
@@ -2665,9 +4069,25 @@ void ObsHost::pending_chunk_publish(uint32_t now) {
 }
 
 void ObsHost::pending_chunk_publish_locked(uint32_t now) {
+  const uint64_t now64 = GetTickCount64();
   for (std::ptrdiff_t index = 0; index < static_cast<std::ptrdiff_t>(pending_chunks_.size());) {
     const PendingChunk& pending = pending_chunks_[static_cast<size_t>(index)];
     if (file_writer_closed(pending.chunk.file)) {
+      // Automatic lanes collect the names that were on them during this chunk; a program that arrived
+      // after the chunk opened is named before the labels are bound to the final bytes. A chunk's span is
+      // kept on Windows' 32-bit tick, so it is placed on the journal's 64-bit clock here.
+      if (config_.audio_capture_mode == "auto" && audio_plan_.track_count > 1) {
+        write_audio_sidecar_pending(
+            pending.chunk.file,
+            audio_plan_for_span(auto_tick64(pending.chunk.start_ms, now64),
+                                auto_tick64(pending.chunk.end_ms, now64), false));
+      }
+      // The writer has let go: the bytes are final, so the pending labels can name them. A failure here
+      // costs the labels, not the footage: the chunk reads as an import and both files stay.
+      if (!bind_audio_layout(pending.chunk.file)) {
+        BX_LOG_WARN("the audio track labels for the timeline chunk %s could not be bound to its final file",
+                    pending.chunk.file.c_str());
+      }
       std::string error;
       // The session may have closed in the pass that queued the chunk (the last chunk of a recording), and
       // then session_ is empty: the entry goes to the index on disk instead, under the session it belongs to.
@@ -2711,6 +4131,9 @@ void ObsHost::close_session(uint32_t now) {
     BX_LOG_WARN("the session index was not closed: %s", error.c_str());
   }
   session_ = SessionEntry{};
+  // The next session starts at epoch 0 with no layout before it.
+  timeline_layout_.clear();
+  timeline_epoch_ = 0;
   note_open_timeline("");
   // No session is open any more, so the Timeline writer is not active: a failed rotation, a stop the tick
   // finished and a plain stop all end here, and a manual recording must not be refused for ever by one.
@@ -2978,7 +4401,7 @@ void ObsHost::process_save_queue() {
     // without a packet is the exception: its buffer is stopped on purpose while the ring writes itself out,
     // and a long ring takes longer than five seconds to write.
     const uint32_t down_limit_ms = in_flight_.now ? kSaveTimeoutMs : 5000;
-    if ((!replay_ || !obs_output_active(replay_)) && GetTickCount() - in_flight_since_ > down_limit_ms) {
+    if ((!replay_ || (!obs_output_active(replay_) && !ring_kept_for_salvage_)) && GetTickCount() - in_flight_since_ > down_limit_ms) {
       save_in_flight_ = false;
       save_timeout_reported_ = false;
       last_error_ = "the buffer stopped before the clip was saved";
@@ -2999,7 +4422,7 @@ void ObsHost::process_save_queue() {
     return;
   }
   if (save_queue_.empty()) return;
-  if (!replay_ || !obs_output_active(replay_)) {
+  if (!replay_ || (!obs_output_active(replay_) && !ring_kept_for_salvage_)) {
     if (GetTickCount() - save_queue_.front().queued_at > 5000) {
       last_error_ = "the buffer stopped before the clip could be saved";
       if (on_error) on_error("buffer", last_error_);
@@ -3150,8 +4573,17 @@ void ObsHost::process_saved_replay() {
   // Off the tick, and the tick never waits for it: a trim reads and writes the whole clip, and the
   // worker below takes one at a time. Joining here (as this used to) froze the tick — and so the
   // watchdog, the status broadcast and every hotkey — for the length of the previous trim.
-  PendingSave pending{path, request, held};
+  PendingSave pending{path, request, held, 0, AudioRoutingPlan{}};
   pending.peak_kbps = peak_kbps_for(config_, canvas_width_, canvas_height_);
+  // A clip asks for the last N seconds of the ring: the automatic lanes are named by who occupied them in
+  // that window, not by the whole buffer's history.
+  const uint64_t now64_ms = GetTickCount64();
+  const uint64_t span_seconds = request.seconds > 0 ? static_cast<uint64_t>(request.seconds)
+                                                     : static_cast<uint64_t>(std::max(1, config_.buffer_seconds) + 2);
+  const uint64_t span_ms = span_seconds * 1000;
+  pending.audio_plan = config_.audio_capture_mode == "auto"
+                            ? audio_plan_for_span(now64_ms > span_ms ? now64_ms - span_ms : 0, now64_ms, false)
+                            : audio_plan_;
   if (!save_worker_.push(std::move(pending))) {
     // The queue is full or shutting down. Trimming here would run a whole remux on the tick, under the
     // engine lock, freezing the panel, the tray, the hotkeys and the watchdog for its length. The clip
@@ -3187,7 +4619,8 @@ std::string ObsHost::capture_folder() const {
   return kDisplayFolder;
 }
 
-void ObsHost::finish_save(const std::string& saved_path, const SaveRequest& request, int peak_kbps) {
+void ObsHost::finish_save(const std::string& saved_path, const SaveRequest& request, int peak_kbps,
+                          const AudioRoutingPlan& audio_plan) {
   // The trim, the verify and the move live in save_filing.cpp, where every branch is exercised without
   // libobs or a decoder. What stays here is what belongs to the host: the counters and who to tell.
   SaveFilingMedia media;
@@ -3209,6 +4642,12 @@ void ObsHost::finish_save(const std::string& saved_path, const SaveRequest& requ
   }
   ++saved_clips_;
   last_clip_seconds_ = request.seconds;
+  // A multitrack clip gets one sidecar beside it naming its tracks and roles. The container itself cannot
+  // carry stream titles through OBS's muxer, so this is the editor's contract (audio_routing.h). A single
+  // track writes none, exactly like every clip saved before the feature.
+  if (!write_audio_sidecar(filed.path, audio_plan)) {
+    BX_LOG_WARN("the audio track labels for %s were not written", filed.path.c_str());
+  }
   // A clip whose file carries a picture's worth of almost nothing is black: the display source said it was 2560x1440
   // and delivered no frames, and six minutes of it were saved without a word. This worker thread is off the tick and
   // outside the media lock (the probe took it and let it go), so the notice costs the engine nothing. The line is
@@ -3364,7 +4803,11 @@ void ObsHost::watchdog() {
     // A restart empties the ring, so a frozen counter that keeps recurring is not allowed to wipe the
     // buffer every three seconds.
     if (GetTickCount() - last_restart_tick_ < kStallRestartCooldownMs) return;
+    // The driver has just reset the device: libobs is rebuilding it, and an output restarted on top of that rebuild is
+    // what hung the engine. Ten seconds to come back; after that the ordinary restart below runs once.
+    if (buffrx::stall_restart_held(GetTickCount(), static_cast<uint32_t>(libobs_device_lost_at_ms()))) return;
     last_restart_tick_ = GetTickCount();
+    fault_tick_ = last_restart_tick_ == 0 ? 1 : last_restart_tick_;
     stall_ticks_ = 0;
     last_tick_frames_ = 0;
     BX_LOG_WARN("replay buffer stalled at %llu frames; restarting", static_cast<unsigned long long>(obs_output_get_total_frames(replay_)));
@@ -3460,7 +4903,7 @@ void ObsHost::salvage_buffer(const char* reason, bool wait_for_file, bool at_onc
   const uint32_t now = GetTickCount();
   // The ring only holds the past while it runs, and a save needs the output that holds it. A paused ring (a
   // recording took the encoders) has nothing to dump, and saying so would be a warning about nothing.
-  if (!replay_ || !obs_output_active(replay_) || buffer_stopping_ || !buffer_intent_) return;
+  if (!replay_ || (!obs_output_active(replay_) && !ring_kept_for_salvage_) || buffer_stopping_ || !buffer_intent_) return;
   const uint32_t buffer_ms = static_cast<uint32_t>(stats().ring_filled * 1000.0);
   if (!buffrx::salvage_wanted(config_.crash_recovery, true, buffer_ms, now - last_salvage_ms_)) return;
   last_salvage_ms_ = now;
@@ -3565,14 +5008,60 @@ void ObsHost::tick() {
       if (wait[0] == '2') stop_buffer();
     }
   }
+  // A probe, not a setting: BUFFRX_TEST_ENCODER_SWAP_MS="10000,15000,20000" asks for an encoder swap that many milliseconds after the
+  // buffer first ran, one per entry; BUFFRX_TEST_ENCODER_SWAP_LEVELS="0,1,3" gives each swap its effort step (default 0: the same settings).
+  // BUFFRX_TEST_SWAP_FAIL=1|2 makes the new (1) or also the old (2) encoder refuse to start. tools/encoder-swap-probe.ps1 drives them.
+  {
+    struct SwapTest {
+      std::vector<uint32_t> at;
+      std::vector<int> levels;  // effort step | divisor << 8
+      size_t next = 0;
+      uint32_t from = 0;
+    };
+    static SwapTest test = [this] {
+      SwapTest t;
+      char text[256] = {0};
+      const auto parse = [](const char* name, auto&& put) {
+        char value[256] = {0};
+        if (GetEnvironmentVariableA(name, value, sizeof(value)) == 0) return;
+        const char* cursor = value;
+        while (*cursor) {
+          char* end = nullptr;
+          long number = std::strtol(cursor, &end, 10);
+          if (end == cursor) break;
+          if (*end == '/') {  // "effort/divisor"
+            const long divisor = std::strtol(end + 1, &end, 10);
+            number |= divisor << 8;
+          }
+          put(number);
+          cursor = *end == ',' ? end + 1 : end;
+        }
+      };
+      (void)text;
+      parse("BUFFRX_TEST_ENCODER_SWAP_MS", [&t](long v) { t.at.push_back(static_cast<uint32_t>(v)); });
+      parse("BUFFRX_TEST_ENCODER_SWAP_LEVELS", [&t](long v) { t.levels.push_back(static_cast<int>(v)); });
+      char fail[8] = {0};
+      if (GetEnvironmentVariableA("BUFFRX_TEST_SWAP_FAIL", fail, sizeof(fail)) > 0) swap_test_fail_ = std::atoi(fail);
+      return t;
+    }();
+    if (!test.at.empty() && test.next < test.at.size() && buffer_active_ && !encoder_swapping_) {
+      const uint32_t tick_now = GetTickCount();
+      if (test.from == 0) test.from = tick_now == 0 ? 1 : tick_now;
+      if (tick_now - test.from >= test.at[test.next]) {
+        encoder_swap_due_ = test.next < test.levels.size() ? test.levels[test.next] : 0;
+        ++test.next;
+      }
+    }
+  }
   settle_retiring_capture();
   check_game_fallback();
   check_display_present();
   update_capture_fit();
+  poll_audio_health();
 
   // Idle: the buffer off and no manual record means nobody is watching, so the capture and audio
   // sources go away and the engine stops pulling frames. The next buffer start makes them again.
-  if (!buffer_intent_ && !recording_active_ && !manual_active_ && !recording_pending_ && (capture_item_ || desktop_ || mic_ || !sources_released_)) {
+  if (!buffer_intent_ && !recording_active_ && !manual_active_ && !recording_pending_ && (capture_item_ || desktop_ || mic_ || !app_channels_.empty() || !sources_released_)) {
     const uint32_t idle_now = GetTickCount();
     if (idle_since_ms_ == 0) {
       idle_since_ms_ = idle_now;
@@ -3602,6 +5091,8 @@ void ObsHost::tick() {
     last_tick_frames_ = frames;
     last_tick_time_ = now;
   }
+  // What the crash handler reads to decide whether BuffrX comes back by itself: it may not take the engine lock.
+  libobs_set_capture_wanted(capture_wanted() || timeline_writer_.load());
   if (!deep_idle_) {  // asleep there is no encoder, no tap and no ring to look at
     watch_encoder(now);
   }
@@ -3618,50 +5109,43 @@ void ObsHost::tick() {
 
 void ObsHost::watch_encoder(uint32_t now_ms) {
   if (!video_encoder_) return;
-  const bool changed = buffrx::encoder_watch_feed(encoder_watch_, now_ms, obs_get_total_frames(),
+  const bool was_frozen = encoder_watch_.frozen;
+  // A divisor makes the encoder keep every n-th picture: that is the rate it is judged by, not the canvas's.
+  const bool changed = buffrx::encoder_watch_feed(encoder_watch_, now_ms, obs_get_total_frames() / static_cast<uint64_t>(std::max(1, frame_divisor_)),
                                                   BX_ENCODER_FRAMES(video_encoder_),
                                                   obs_encoder_active(video_encoder_));
-  // The relief ladder runs in every effort, Maximum included (decided with the user, 2026-11-05): a person must never
-  // be left with a clip missing frames. It is a layer over the stored settings and never rewrites them.
-  if (encoder_watch_.behind && !governor_disabled_ &&
-      buffrx::governor_should_step(governor_step_, true, now_ms, governor_last_step_ms_, recording_busy())) {
-    governor_due_ = true;
-  }
-  // What encoded in real time for ten seconds is what this machine can do here: remembered so the next start begins at it.
-  if (!encoder_watch_.behind) {
-    if (capacity_ok_since_ms_ == 0) capacity_ok_since_ms_ = now_ms;
-    if (now_ms - capacity_ok_since_ms_ >= 10000 && capacity_recorded_step_ != governor_step_) {
-      capacity_recorded_step_ = governor_step_;
-      capacity_remember(capacity_key_for(config_), governor_step_);
+  // An output that stopped on an encode error (-8) is a death of the encoder, as a frozen verdict is. Two inside ten minutes
+  // on one id step the encoder down a rung (encoder_ladder.h).
+  bool encoder_died = encoder_death_pending_.exchange(false);
+  if (encoder_watch_.frozen && !was_frozen) {
+    encoder_died = true;
+    if (!encoder_frozen_told_) {
+      encoder_frozen_told_ = true;
+      // The one thing this must not say is "slow": the encoder is not running (a driver reset or a failed encoder), and no
+      // speed setting changes that.
+      BX_LOG_WARN("the video encoder produced %d%% of the frames at %d fps (%s): it is not running (a driver reset or an encoder failure), not slow; "
+                  "the controller stays out of it",
+                  static_cast<int>(std::lround(encoder_watch_.ratio * 100.0)), effective_config().capture_fps, encoder_id_.c_str());
     }
-  } else {
-    capacity_ok_since_ms_ = 0;
   }
+  if (!encoder_watch_.frozen) encoder_frozen_told_ = false;
+  if (encoder_died && !encoder_id_.empty() && buffrx::encoder_death_note(encoder_deaths_, encoder_id_, now_ms)) {
+    ladder_vendor_ = buffrx::encoder_vendor_of(encoder_id_);
+    ladder_pending_ = true;
+  }
+  // The step rebuilds the encoder: not while the driver is settling, and not under a manual recording.
+  if (ladder_pending_ && !buffrx::governor_held(now_ms, last_fault_ms()) && !recording_busy()) {
+    ladder_pending_ = false;
+    ladder_due_ = true;
+  }
+  if (encoder_watch_.frozen) return;
+  // The controller (plan 008) decides what to do about an encoder that is short, in both directions and without emptying the buffer; this
+  // function only says when something is wrong that it cannot fix.
+  controller_tick(now_ms);
   if (!changed || !encoder_watch_.behind) return;
   const int percent = static_cast<int>(std::lround(encoder_watch_.ratio * 100.0));
-  BX_LOG_WARN("the video encoder is not keeping up: %d%% of the frames at %d fps (%s)", percent, effective_config().capture_fps,
-              encoder_id_.c_str());
-  // A step still to come fixes this by itself (its own "Encoder stepped down" notice follows), so an alarm here would be
-  // noise. Only what BuffrX cannot fix on its own is said: the ladder out of steps, or a frame-rate rung saved but not
-  // yet applied because a source is live.
-  if (!governor_disabled_ && governor_step_ < buffrx::kMaxReliefStep) {
-    // The first word is said while there is still something to fix: the person sees the problem and what BuffrX is doing
-    // about it, not only the outcome. Once per two minutes, so a long session is not a stream of cards.
-    if (on_notice && (encoder_behind_told_ms_ == 0 || now_ms - encoder_behind_told_ms_ >= 120000)) {
-      encoder_behind_told_ms_ = now_ms;
-      on_notice("Encoder cannot keep up",
-                std::to_string(percent) + " of 100 frames encoded. Lowering the effort.");
-    }
-    return;
-  }
-  // Said once, and again only after two minutes: the interface keeps showing it while it is true.
-  if (encoder_behind_told_ms_ != 0 && now_ms - encoder_behind_told_ms_ < 120000) return;
-  encoder_behind_told_ms_ = now_ms;
-  if (on_notice) {
-    // The person's own symptom first (why the clip looks wrong), then where the choice is.
-    const std::string encoded = "Only " + std::to_string(percent) + " of every 100 frames reached the last clip. ";
-    on_notice("Encoder effort lowered", encoded + "Lighter settings keep every frame. Try full quality again in Settings.");
-  }
+  BX_LOG_WARN("the video encoder is not keeping up: %d%% of the frames at %d fps (%s), level %d of %d", percent, effective_config().capture_fps,
+              encoder_id_.c_str(), controller_.level, std::max(0, static_cast<int>(controller_levels_.size()) - 1));
 }
 
 EngineStats ObsHost::stats() const {
@@ -3677,6 +5161,30 @@ EngineStats ObsHost::stats() const {
   stats.capture_mode = capture_mode_now();
   // The name a person reads ("Counter-Strike 2", "Display Capture"): the same one the clip's folder gets.
   stats.capture_target = capture_folder();
+  if (stats.capture_mode == "display") {
+    // The screen the capture source was actually built for, never the saved index and never a pick that has not been
+    // applied: a source that has not switched yet, or a rebuild that failed, leaves the running screen reported with
+    // its own name. Only while the sources are released (nothing is capturing) does the choice the settings mean now
+    // stand in, and the fallback flag still says the chosen screen is gone. Nothing here claims a frame was delivered.
+    const std::vector<DisplayInfo> displays = enumerate_displays();
+    const DisplayPick pick = pick_display(displays, config_.display_id, config_.display_name);
+    const std::string configured = capture_display_device_;
+    stats.capture_display = configured.empty() ? pick.device : configured;
+    stats.capture_display_requested = config_.display_name;
+    stats.capture_display_fallback =
+        configured.empty() ? (pick.found && pick.primary_fallback)
+                           : (pick.found && pick.primary_fallback && configured == pick.device);
+    if (!configured.empty() && (stats.capture_display_fallback || configured != pick.device)) {
+      // Off the choice: the screen actually captured says so, rather than the monitor the settings ask for.
+      for (const DisplayInfo& display : displays) {
+        if (display.device != configured || display.name.empty()) continue;
+        stats.capture_target = display.name;
+        break;
+      }
+    } else if (stats.capture_display_fallback && !pick.name.empty()) {
+      stats.capture_target = pick.name;
+    }
+  }
   stats.buffer_state = buffrx::buffer_state_name(buffer_intent_, buffer_active_, buffer_stopping_);
   if (manual_active_ && manual_started_ms_ != 0) stats.recording_seconds = (GetTickCount() - manual_started_ms_) / 1000.0;
   else if (manual && recording_started_ms_ != 0) stats.recording_seconds = (GetTickCount() - recording_started_ms_) / 1000.0;
@@ -3732,6 +5240,8 @@ EngineStats ObsHost::stats() const {
     stats.ring_deduped_bytes = static_cast<uint64_t>(held.deduped_bytes);
     stats.ring_chunks_linked = static_cast<int>(held.chunks_linked);
     stats.ring_chunks_waiting = static_cast<int>(held.chunks_waiting);
+    stats.ring_epoch = static_cast<int>(held.epoch);
+    stats.ring_swaps = static_cast<int>(held.swaps);
     stats.ring_disk_state = static_cast<int>(held.state);
     stats.ring_stalled = held.stalled != 0;
     stats.ring_held_seconds = static_cast<double>(held.span_ms) / 1000.0;
@@ -3747,7 +5257,7 @@ EngineStats ObsHost::stats() const {
 
 ObsHost::RingInfo ObsHost::ring_info() const {
   RingInfo info;
-  if (!replay_ || !obs_output_active(replay_)) return info;
+  if (!replay_ || (!obs_output_active(replay_) && !ring_kept_for_salvage_)) return info;
   calldata_t call{};
   if (proc_handler_call(obs_output_get_proc_handler(replay_), "ring_info", &call)) {
     long long value = 0;
@@ -3767,6 +5277,8 @@ ObsHost::RingInfo ObsHost::ring_info() const {
     if (calldata_get_int(&call, "deduped_bytes", &value)) info.deduped_bytes = value;
     if (calldata_get_int(&call, "chunks_linked", &value)) info.chunks_linked = value;
     if (calldata_get_int(&call, "chunks_waiting", &value)) info.chunks_waiting = value;
+    if (calldata_get_int(&call, "epoch", &value)) info.epoch = value;
+    if (calldata_get_int(&call, "swaps", &value)) info.swaps = value;
   }
   calldata_free(&call);
   return info;
@@ -3776,21 +5288,15 @@ std::string ObsHost::obs_version() const { return obs_get_version_string() ? obs
 
 // The record of what encoded in real time on this machine, keyed by what changes the encoder work: codec, size, rate and
 // the quality preset. One small JSON file in the data root; nothing else reads it.
-int ObsHost::capacity_remembered_step(const std::string& key) const {
-  return capacity_read_step(capacity_path_, key);
-}
-
-void ObsHost::capacity_remember(const std::string& key, int step) const {
-  capacity_write_step(capacity_path_, key, step);
-}
-
 std::string ObsHost::preferred_codec() const {
-  // Hardware AV1 only: FFmpeg's own AV1 encoder is software and would not keep up with a game at any setting.
+  // Hardware AV1 on NVENC only: FFmpeg's own AV1 encoder is software and would not keep up with a game at any setting.
   for (size_t index = 0;; ++index) {
     const char* id = nullptr;
     if (!obs_enum_encoder_types(index, &id) || !id) break;
     const std::string name = id;
-    if (name.find("av1") != std::string::npos && name.rfind("ffmpeg", 0) != 0) return "av1";
+    // NVENC only (decided with the owner, 2026-11-14): AMD's AV1 texture encoder is the least proven path and ended a user in
+    // driver resets. H.264 is what every vendor's driver has been through; AV1 stays a choice on the Video page.
+    if (name.find("obs_nvenc_av1") == 0) return "av1";
   }
   return "h264";
 }
@@ -3829,17 +5335,13 @@ Json ObsHost::encoder_properties(bool configured) const {
     }
     // What actually runs wins over the first candidate: a vendor that refused to start left the engine on
     // another encoder (x264), and the Advanced page must show that one's knobs, not the absent vendor's.
-    const auto codec_of = [](const std::string& id) {
-      if (id.find("av1") != std::string::npos) return std::string("av1");
-      if (id.find("hevc") != std::string::npos) return std::string("hevc");
-      return std::string("h264");
-    };
-    const bool running_matches = !encoder_id_.empty() && codec_of(encoder_id_) == planned.codec;
+    const bool running_matches = !encoder_id_.empty() && encoder_codec(encoder_id_) == planned.codec;
     property_id = running_matches ? encoder_id_ : candidates.empty() ? std::string() : candidates.front();
   }
   Json out = Json::object();
   out.set("id", Json(property_id));
   out.set("family", Json(encoder_family_name(encoder_family(property_id))));
+  out.set("hardware", hardware_json());
   Json properties_out = Json::array();
   if (property_id.empty()) {
     out.set("properties", properties_out);
@@ -3852,10 +5354,17 @@ Json ObsHost::encoder_properties(bool configured) const {
   }
   obs_data_t* live = configured ? obs_encoder_defaults(property_id.c_str()) :
                      video_encoder_ ? obs_encoder_get_settings(video_encoder_) : nullptr;
+  // `value` is what the encoder runs: its defaults with the settings it accepts written over them, governor relief
+  // included. `base` (configured only) is the person's own choice: the same build from the settings before relief. A
+  // setting the encoder refuses shows the encoder's own default, and a setting nobody set shows its real default.
+  obs_data_t* requested = nullptr;
   if (configured && live) {
-    const auto settings = configured_encoder_settings(encoder_family(property_id), planned, governor_step_);
-    apply_encoder_settings(live, properties, settings);
+    const EncoderFamily family = encoder_family(property_id);
+    apply_encoder_settings(live, properties, configured_encoder_settings(family, planned, governor_step_, encoder_traits()));
+    requested = obs_encoder_defaults(property_id.c_str());
+    if (requested) apply_encoder_settings(requested, properties, configured_encoder_settings(family, planned, 0, encoder_traits()));
   }
+  Json base = Json::object();
   for (obs_property_t* property = obs_properties_first(properties); property; obs_property_next(&property)) {
     const char* name = obs_property_name(property);
     if (!name) continue;
@@ -3903,15 +5412,14 @@ Json ObsHost::encoder_properties(bool configured) const {
       default:
         continue;  // group/colour/font/button/editable-list: not a simple knob
     }
-    if (live) {
-      switch (type) {
-        case OBS_PROPERTY_BOOL: field.set("value", Json(obs_data_get_bool(live, name))); break;
-        case OBS_PROPERTY_INT: field.set("value", Json(static_cast<int64_t>(obs_data_get_int(live, name)))); break;
-        case OBS_PROPERTY_FLOAT: field.set("value", Json(obs_data_get_double(live, name))); break;
-        default: field.set("value", Json(obs_data_get_string(live, name))); break;
-      }
-    }
+    if (live) field.set("value", encoder_value_of(live, name, type));
+    if (requested) base.set(name, encoder_value_of(requested, name, type));
     properties_out.push(std::move(field));
+  }
+  // Only a configured reply carries `base`: a running encoder's reply is its own settings and has no requested side.
+  if (requested) {
+    out.set("base", base);
+    obs_data_release(requested);
   }
   if (live) obs_data_release(live);
   obs_properties_destroy(properties);
@@ -4003,17 +5511,48 @@ bool ObsHost::apply(const Config& config, bool restart_outputs, std::string& err
                                config.capture_cursor != config_.capture_cursor;
   // A different display is very often a different native size. Swapping the source under the old canvas
   // scales the picture to a canvas it does not belong to; a display switch that changes the size re-plans
-  // the canvas once, at the new display's own resolution.
+  // the canvas once, at the new display's own resolution. A switch to another card re-plans it even at the
+  // same size: the running device can only duplicate its own adapter's outputs, so leaving the source to
+  // swap alone would hand the capture to Windows Graphics Capture (display_target.h). A switch into display
+  // capture from a window or a game moves the device the same way when it cannot see the screen.
+  // The mode the device serves, follow layer included: while a game is followed the display is what it has to
+  // reach, so a switch into that display is a display switch like any other.
+  Config before_display = config_;
+  Config after_display = config;
+  if (follow_display_ && before_display.capture_mode == "game") before_display.capture_mode = "display";
+  if (follow_display_ && after_display.capture_mode == "game") after_display.capture_mode = "display";
+  // The size is read from the mode that is actually served: a followed game is the display, and its own native
+  // size is what a reset would plan the canvas at.
   int display_target_width = 0;
   int display_target_height = 0;
-  const bool display_target_known =
-      config.capture_mode == "display" && win32_target_size(config, display_target_width, display_target_height);
+  if (after_display.capture_mode == "display") win32_target_size(after_display, display_target_width, display_target_height);
+  const std::string wanted_display =
+      after_display.capture_mode == "display" ? monitor_device_name(after_display) : std::string();
+  // A person who chose Windows Graphics Capture explicitly needs no card: it crosses cards by itself, so only the
+  // canvas rule below can ask for a rebuild.
+  const bool device_sees_display =
+      !display_capture_needs_card(config.display_method) ||
+      device_can_duplicate(device_outputs_, device_outputs_known_, wanted_display);
+  // Whether the canvas already has the configured output's shape. Then the video output scale is even whatever the
+  // capture's own size, the source is fitted inside the canvas, and a switch of native size must not reset the
+  // video (which would clear the ring and split a recording) for a picture that is already right.
+  const bool output_configured = next.output_width > 0 && next.output_height > 0;
+  const bool canvas_is_output =
+      output_configured && same_picture_shape(canvas_width_, canvas_height_, next.output_width, next.output_height);
+  // The person's own change to a display, never the follow layer's alt-tab swap: that one is a source swap under the
+  // running ring (set_capture_follow) and does not come through here with different modes.
+  const bool explicit_display_switch = config.capture_mode == "display" && config_.capture_mode != "display";
   const bool display_replan =
-      display_target_known &&
-      display_switch_needs_replan(config_, config, display_target_width, display_target_height, canvas_width_,
-                                  canvas_height_,
-                                  performance_active() && next.output_width > 0 && next.output_height > 0);
-  if (display_replan) video_changed = true;
+      display_switch_needs_replan(before_display, after_display, display_target_width, display_target_height, canvas_width_,
+                                  canvas_height_, canvas_is_output, device_sees_display, output_configured,
+                                  explicit_display_switch);
+  if (display_replan) {
+    video_changed = true;
+    if (!device_sees_display) {
+      BX_LOG_INFO("the display %s is not one the running device duplicates; the capture moves to its card",
+                  wanted_display.c_str());
+    }
+  }
   const bool encoder_changed = next.codec != running.codec || next.encoder != running.encoder ||
                                next.quality != running.quality || next.custom_kbps != running.custom_kbps ||
                                next.peak_mode != running.peak_mode ||
@@ -4028,28 +5567,31 @@ bool ObsHost::apply(const Config& config, bool restart_outputs, std::string& err
   // ring is kept (a noise-gate toggle used to empty the buffer).
   const bool audio_changed = next.separate_tracks != running.separate_tracks ||
                              next.audio_tracks != running.audio_tracks ||
-                             next.audio_bitrate_kbps != running.audio_bitrate_kbps;
+                             audio_track_count(next) != audio_track_count(running) ||
+                             next.audio_bitrate_kbps != running.audio_bitrate_kbps ||
+                             next.audio_capture_mode != running.audio_capture_mode ||
+                             !audio_apps_equal(effective_audio_apps(next), effective_audio_apps(running));
   const bool audio_sources_changed = config.desktop_device != config_.desktop_device ||
                                      config.mic_device != config_.mic_device ||
                                      config.desktop_enabled != config_.desktop_enabled ||
                                      config.mic_enabled != config_.mic_enabled ||
                                      config.mic_noise_suppress != config_.mic_noise_suppress ||
-                                     config.mic_noise_gate != config_.mic_noise_gate;
+                                     config.mic_noise_gate != config_.mic_noise_gate ||
+                                     config.audio_app_prefs != config_.audio_app_prefs ||
+                                     config.audio_other_volume != config_.audio_other_volume ||
+                                     config.audio_other_muted != config_.audio_other_muted ||
+                                     // A fader or a mute on a selected program is a live source change, never
+                                     // a rebuild: the channel keeps its capture and only its volume changes.
+                                     !audio_app_controls_equal(effective_audio_apps(config),
+                                                               effective_audio_apps(config_));
 
-  const bool speed_step_changed = config.encoder_speed_step != config_.encoder_speed_step;
-  if (speed_step_changed) governor_step_ = config.encoder_speed_step;
+  // A new capture target or canvas costs pictures that are not the encoder's: the controller waits them out.
+  if (video_changed || capture_changed) controller_grace(GetTickCount());
   const bool clips_moved = config.clips_dir != config_.clips_dir;
   if (config.stretch_mode != config_.stretch_mode) capture_fit_applied_ = false;  // the tick re-fits, live
   // The settings that are running now. A rebuild that does not finish puts them back, so the engine is
   // never left running settings that do not match the encoders it has.
   const Config previous = config_;
-  // The relief ladder's frame-rate rung: a restart is the only place it can land, because libobs forbids a
-  // video reset under live sources. If the step changed the capture rate, the pipeline is rebuilt for it — but never
-  // while a game hook is attached: resetting the video under one detaches the hook, and a hook the game is waiting on
-  // is exactly how a game freezes. There the rung waits for the next buffer start, which builds at the stored rate.
-  const bool relief_fps_changed =
-      buffrx::relief_capture_fps(config.capture_fps, config.encoder_speed_step) != config.capture_fps &&
-      !(capture_mode_now() == "game" && !follow_display_);
   config_ = config;
   // What the user asked for, not what happens to be running this instant: a buffer that was still
   // waiting for its first frame, or one between a stop and a restart, is still wanted.
@@ -4065,8 +5607,7 @@ bool ObsHost::apply(const Config& config, bool restart_outputs, std::string& err
     if (video_changed || capture_changed || encoder_changed) plan_canvas_for(config);
     return true;
   }
-  const bool rebuild_outputs = video_changed || encoder_changed || audio_changed || speed_step_changed || relief_fps_changed ||
-                               force_encoder_rebuild_;
+  const bool rebuild_outputs = video_changed || encoder_changed || audio_changed || force_encoder_rebuild_;
   // The tear-down and the build as one step, so a build that fails can run again with the settings that
   // were working. create_outputs reads config_, so it is only ever called with config_ already the
   // config being built.
@@ -4078,12 +5619,12 @@ bool ObsHost::apply(const Config& config, bool restart_outputs, std::string& err
     stop_recording();
     destroy_outputs();
     if (video_changed) drop_retiring_capture();
-    if ((video_changed || relief_fps_changed) && capture_item_) {
+    if (video_changed && capture_item_) {
       obs_sceneitem_remove(capture_item_);
       capture_item_ = nullptr;
     }
-    if ((video_changed || relief_fps_changed) && !configure_video(wanted, build_error)) return false;
-    if ((video_changed || capture_changed || relief_fps_changed) && !configure_capture(wanted, build_error)) return false;
+    if (video_changed && !configure_video(wanted, build_error)) return false;
+    if ((video_changed || capture_changed) && !configure_capture(wanted, build_error)) return false;
     if (audio_changed) configure_audio(wanted);
     if (!configure_encoders(wanted, build_error)) return false;
     if (!create_outputs(build_error)) return false;
@@ -4093,15 +5634,18 @@ bool ObsHost::apply(const Config& config, bool restart_outputs, std::string& err
     return true;
   };
   // The old session closed with the old settings; a recording that was running carries on in a new one.
-  const auto resume_recording = [&]() {
-    if (!was_recording) return;
+  const auto resume_recording = [&]() -> bool {
+    if (!was_recording) return false;
     std::string recording_error;
     if (!start_recording(recording_error)) {
       BX_LOG_WARN("recording did not resume after the change: %s", recording_error.c_str());
       last_error_ = "the recording stopped when the settings changed: " + recording_error;
       if (on_error) on_error("recording", last_error_);
+      return false;
     }
+    return true;
   };
+  bool recording_resumed = false;
   if (rebuild_outputs) {
     if (!build_pipeline(effective_config(), error)) {
       // The change did not build. The outputs are gone and config_ still names the settings that could
@@ -4110,9 +5654,16 @@ bool ObsHost::apply(const Config& config, bool restart_outputs, std::string& err
       // is off with a reason, not "starting" for ever.
       const std::string failure = error;
       config_ = previous;
-      governor_step_ = previous.encoder_speed_step;
       std::string restore_error;
       const bool restored = build_pipeline(previous, restore_error);
+      bool recording_back = false;
+      if (restored) {
+        recording_back = resume_recording();
+        if (buffer_wanted) {
+          std::string buffer_error;
+          if (!start_buffer(buffer_error)) BX_LOG_INFO("buffer will start when ready: %s", buffer_error.c_str());
+        }
+      }
       last_error_ = "the new settings did not start: " + failure;
       if (!restored) {
         last_error_ += " (the settings that were running did not come back either: " + restore_error + ")";
@@ -4120,26 +5671,31 @@ bool ObsHost::apply(const Config& config, bool restart_outputs, std::string& err
         // same way every tick: it is built again when the settings change or the person starts it.
         buffer_intent_ = false;
       }
-      BX_LOG_ERROR("%s", last_error_.c_str());
-      if (on_error) on_error("settings", last_error_);
-      error = last_error_;
-      if (restored) {
-        resume_recording();
+      // A failed reset still tore the pipeline down: the ring is empty and a recording that was running is a new
+      // file (or gone). The failure card says what it cost, not only that it failed.
+      if (display_replan || display_replan_running_) {
+        if (was_recording) last_error_ += recording_back ? " The recording continued in a new file." : " The recording was stopped.";
         if (buffer_wanted) {
-          std::string buffer_error;
-          if (!start_buffer(buffer_error)) BX_LOG_INFO("buffer will start when ready: %s", buffer_error.c_str());
+          last_error_ += buffer_active_ ? " The buffer was cleared and restarted."
+                          : buffer_intent_ ? " The buffer was cleared and is starting again."
+                                           : " The buffer was stopped.";
         }
       }
+      BX_LOG_ERROR("%s", last_error_.c_str());
+      // rebuild_for_display reports its own failure with the footage it cost; the generic settings card would be a
+      // second card for the same attempt.
+      if (on_error && !display_replan_running_) on_error("settings", last_error_);
+      error = last_error_;
       return false;
     }
-    resume_recording();
+    recording_resumed = resume_recording();
   } else if (capture_changed) {
     // The outputs encode the canvas, not the source, so the source is swapped under a running ring:
     // the footage before the swap stays in the buffer (an alt-tab out of a game used to empty it), and the
     // source being replaced stays under the new one until the new one has a frame, so the ring has no gap.
     if (!configure_capture(config, error, false, true)) return false;
   }
-  if (audio_sources_changed && !audio_changed) configure_audio(config);
+  if (audio_sources_changed && !audio_changed) configure_audio(effective_config());
   // A moved clips folder applies live: the save procedure reads "directory" when it writes, so the ring
   // is kept (verified: frames kept counting, no restart, the next clip landed in the new folder). A
   // rebuild above already created the output with the new path.
@@ -4172,8 +5728,21 @@ bool ObsHost::apply(const Config& config, bool restart_outputs, std::string& err
     obs_source_set_muted(mic_, config.mic_muted);
   }
   if (display_replan && (buffer_wanted || was_recording) && on_notice) {
-    on_notice("Display changed", "The buffer restarts at " + std::to_string(canvas_width_) + " × " +
-                                     std::to_string(canvas_height_));
+    // A video reset ends the ring and, when a manual recording runs, carries it into a new file. Both are said, so
+    // nobody has to guess what happened to the footage. Nothing here claims a frame: the new source has not
+    // delivered one yet.
+    std::string detail;
+    if (was_recording) {
+      detail = recording_resumed ? "The recording continues in a new file."
+                                 : "The recording did not resume (see the error above).";
+    }
+    if (buffer_wanted) {
+      // "Restarted" only while the ring is actually running: a start still waiting for its first frame is not one.
+      detail += std::string(detail.empty() ? "" : " ") +
+                (buffer_active_ ? "The buffer was cleared and restarted at " : "The buffer was cleared and is starting again at ") +
+                std::to_string(canvas_width_) + " x " + std::to_string(canvas_height_) + ".";
+    }
+    on_notice("Display changed", detail);
   }
   return true;
 }
@@ -4215,6 +5784,8 @@ void ObsHost::shutdown() {
   // channel is cleared before the source is released or the device stays open past shutdown.
   obs_set_output_source(kDesktopViewChannel, nullptr);
   obs_set_output_source(kMicViewChannel, nullptr);
+  release_app_audio();
+  release_auto_audio();
   if (desktop_) {
     obs_source_release(desktop_);
     desktop_ = nullptr;
@@ -4259,10 +5830,13 @@ void ObsHost::on_replay_stopped(void* data, calldata* call) {
   // it is caught and named.
   try {
     const char* reason = calldata_string(call, "reason");
+    self->note_output_stop_code(calldata_int(call, "code"));
     // Only a stop nobody asked for is a warning: this used to say "the watchdog will restart it" on every stop the user
     // (or an idle sleep, a settings change, a profile switch) asked for - 28 of them in a 25-cycle stress run, which
     // buried the one that mattered. Read from libobs's thread; a stale flag at worst words one line the other way.
-    if (self->buffer_intent_) {
+    if (self->encoder_swapping_) {
+      BX_LOG_NOTE("replay buffer stopped for an encoder swap");
+    } else if (self->buffer_intent_) {
       BX_LOG_WARN("replay buffer stopped on its own (%s) - the watchdog will restart it", reason ? reason : "no reason given");
     } else {
       BX_LOG_INFO("replay buffer stopped (%s)", reason ? reason : "as asked");
@@ -4312,6 +5886,7 @@ void ObsHost::on_recording_stopped(void* data, calldata* call) {
     if (path && *path) BX_LOG_INFO("recording chunk closed: %s", path);
     const long long code = calldata_int(call, "code");
     self->recording_stop_code_ = code;
+    self->note_output_stop_code(code);
     if (code != 0) BX_LOG_WARN("the recording output stopped with code %lld", code);
     const char* last_error = calldata_string(call, "last_error");
     if (last_error && *last_error) BX_LOG_WARN("recording output last error: %s", last_error);
@@ -4326,6 +5901,7 @@ void ObsHost::on_manual_recording_stopped(void* data, calldata* call) {
   auto* self = static_cast<ObsHost*>(data);
   if (!self) return;
   self->manual_stop_code_ = calldata_int(call, "code");
+  self->note_output_stop_code(self->manual_stop_code_);
   self->manual_active_ = false;
   self->manual_closed_ = true;
 }

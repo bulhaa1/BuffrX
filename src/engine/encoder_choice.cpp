@@ -4,8 +4,16 @@
 
 namespace bx {
 
+std::string encoder_codec(const std::string& identifier) {
+  if (identifier.find("av1") != std::string::npos) return "av1";
+  if (identifier.find("hevc") != std::string::npos || identifier.find("h265") != std::string::npos) return "hevc";
+  return "h264";
+}
+
 std::vector<std::string> encoder_candidates(const std::vector<std::string>& available, const std::string& codec,
                                             const std::string& encoder) {
+  // An id the codec does not name is H.264, as before: the same rule the host uses to read the running encoder.
+  const std::string wanted = codec == "av1" || codec == "hevc" ? codec : std::string("h264");
   struct Candidate {
     std::string id;
     int rank = 100;
@@ -28,13 +36,7 @@ std::vector<std::string> encoder_candidates(const std::vector<std::string>& avai
         identifier.find("vaapi") == std::string::npos && identifier.find("av1") == std::string::npos) {
       continue;
     }
-    const bool wants_av1 = codec == "av1";
-    const bool wants_hevc = codec == "hevc";
-    const bool is_av1 = identifier.find("av1") != std::string::npos;
-    const bool is_hevc = identifier.find("hevc") != std::string::npos;
-    if (wants_av1 && !is_av1) continue;
-    if (wants_hevc && !is_hevc) continue;
-    if (!wants_av1 && !wants_hevc && (is_av1 || is_hevc)) continue;
+    if (encoder_codec(identifier) != wanted) continue;
     std::string vendor = "software";
     if (identifier.find("nvenc") != std::string::npos) vendor = "nvenc";
     else if (identifier.find("amf") != std::string::npos) vendor = "amf";

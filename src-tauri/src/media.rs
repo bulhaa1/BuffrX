@@ -778,7 +778,8 @@ fn is_timeline_cache_name(name: &str) -> bool {
     let Some((stamp, suffix)) = rest.split_once('.') else { return false };
     !pid.is_empty() && !id.is_empty() && !stamp.is_empty() &&
         [pid, id, stamp].iter().all(|part| part.bytes().all(|b| b.is_ascii_digit())) &&
-        ["mp4", "join-spec.json", "mp4.join.json", "export.log", "mp4.part", "mp4.part.mp4"].contains(&suffix)
+        ["mp4", "join-spec.json", "mp4.join.json", "export.log", "mp4.part", "mp4.part.mp4",
+         "mp4.buffrx-audio.json"].contains(&suffix)
 }
 
 /// The editor is single-instance. At startup no older editor can still use these private copies.
@@ -906,7 +907,10 @@ pub fn merge_timeline(data_root: &Path, exports: &Exports, files: Vec<String>) -
     let report = PathBuf::from(format!("{output_text}.join.json"));
     let log = output.with_extension("export.log");
     let mut temps = TimelineTemps { paths: vec![output.clone(), spec.clone(), report.clone(), log.clone()], keep: false };
-    let join = serde_json::json!({"files": files, "output": output_text, "start_in_first": 0, "end_in_last": 1.0e12});
+    // The join child binds the chunks' track labels to the finished copy: it owns the final bytes and the
+    // identity a sidecar must name. A staging join elsewhere leaves the flag off.
+    let join = serde_json::json!({"files": files, "output": output_text, "start_in_first": 0, "end_in_last": 1.0e12,
+        "carry_audio_labels": true});
     std::fs::write(&spec, join.to_string()).map_err(|e| e.to_string())?;
     let child = engine_command().arg("--media-join").arg(&spec)
         .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().map_err(|e| e.to_string())?;
@@ -943,6 +947,8 @@ pub fn merge_timeline(data_root: &Path, exports: &Exports, files: Vec<String>) -
         }
     }
     if !output.is_file() { return Err("The Timeline join produced no video".into()); }
+    // The join child wrote the session's track labels beside the copy; they are the cache's to remove.
+    temps.paths.push(PathBuf::from(format!("{output_text}.buffrx-audio.json")));
     let mut held = exports.timeline_files.lock().unwrap();
     if exports.closing.load(std::sync::atomic::Ordering::Acquire) { return Err("cancelled".into()); }
     held.push(output);
@@ -1207,7 +1213,9 @@ pub fn cancel_all(exports: &Exports) {
     }
     cancel_reads(exports);
     for path in exports.timeline_files.lock().unwrap().drain(..) {
-        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(&path);
+        // The session's track labels went beside the merged copy: they go with it.
+        let _ = std::fs::remove_file(format!("{}.buffrx-audio.json", path.to_string_lossy()));
     }
     if let Some(root) = exports.timeline_root.lock().unwrap().take() { cleanup_timeline_cache(&root); }
 }
@@ -1221,6 +1229,7 @@ mod tests {
         assert!(is_timeline_cache_name("timeline-123-4-567.mp4"));
         assert!(is_timeline_cache_name("timeline-123-4-567.mp4.join.json"));
         assert!(is_timeline_cache_name("timeline-123-4-567.join-spec.json"));
+        assert!(is_timeline_cache_name("timeline-123-4-567.mp4.buffrx-audio.json"));
         assert!(!is_timeline_cache_name("timeline-123-4-567.mp4.backup"));
         assert!(!is_timeline_cache_name("timeline-user-4-567.mp4"));
         assert!(!is_timeline_cache_name("other.mp4"));

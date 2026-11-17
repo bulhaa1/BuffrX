@@ -1,6 +1,6 @@
 # Builds BuffrX-Setup.exe (Inno Setup 6) from dist\BuffrX-<version>, and the portable zip beside it.
 #
-#   powershell -File tools/installer.ps1 -Version 0.5.0
+#   powershell -File tools/installer.ps1 -Version 0.6.0
 #
 # Inno Setup is pinned and staged into work/toolchain like every other build tool. Nothing here touches
 # the machine outside the repository.
@@ -10,9 +10,10 @@
 # sake; trim from package.ps1 instead.
 
 param(
-  [string]$Version = '0.5.0',
+  [string]$Version = '0.6.0',
   [string]$OutDir = 'dist',
-  [switch]$NoZip
+  [switch]$NoZip,
+  [switch]$StageToolsOnly
 )
 
 $ErrorActionPreference = 'Stop'
@@ -77,6 +78,8 @@ $compilerSignature = Get-AuthenticodeSignature -LiteralPath $iscc
 if ($compilerSignature.Status -ne 'Valid' -or $compilerSignature.SignerCertificate.Subject -notlike 'CN=Pyrsys B.V.,*') {
   throw 'the staged Inno compiler does not have a valid Pyrsys signature'
 }
+# CI and the installer tests only need the compiler.
+if ($StageToolsOnly) { return }
 
 $src = Join-Path $root (Join-Path $OutDir ('BuffrX-' + $Version))
 if (-not (Test-Path (Join-Path $src 'BuffrX.exe'))) { throw "no packaged folder at $src - run tools/package.ps1 first" }

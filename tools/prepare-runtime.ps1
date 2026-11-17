@@ -119,6 +119,19 @@ foreach ($name in $modules) {
   }
 }
 
+# OBS 33's win-capture copies its hook to ProgramData\obs-studio-hook from "..\..\core\win-capture\data\", relative to the
+# working directory (bin\64bit), not through obs_module_file (game-capture-file-init.c, update_hook_file). Without these files
+# there the copy fails ("update_hook_file: source graphics-hook64.dll missing"), the Vulkan layer is never registered, and a
+# Vulkan game can never be hooked. The same signed files, unchanged; the copy under data\obs-plugins stays for obs_module_file.
+$hookFrom = Join-Path $runtime 'data\obs-plugins\win-capture'
+$hookTo = Join-Path $runtime 'core\win-capture\data'
+New-Item -ItemType Directory -Force $hookTo | Out-Null
+foreach ($hookFile in @('graphics-hook32.dll', 'graphics-hook64.dll', 'obs-vulkan32.json', 'obs-vulkan64.json')) {
+  $hookSource = Join-Path $hookFrom $hookFile
+  if (-not (Test-Path -LiteralPath $hookSource)) { throw "win-capture hook file missing from the release: $hookFile" }
+  Copy-Item -LiteralPath $hookSource -Destination (Join-Path $hookTo $hookFile) -Force
+}
+
 # core binaries the host needs, plus the encoder probe helpers OBS itself relies on
 $core = @('obs.dll', 'libobs-d3d11.dll', 'libobs-winrt.dll', 'libobs-opengl.dll',
           'obs-nvenc-test.exe', 'obs-qsv-test.exe', 'obs-amf-test.exe', 'obs-ffmpeg-mux.exe')

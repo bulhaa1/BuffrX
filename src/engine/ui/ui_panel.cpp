@@ -266,18 +266,33 @@ void performance_control(ViewEnv& env) {
   ImGui::PopID();
 }
 
+// The length a quick clip really keeps: one of the offered lengths the buffer can keep; 0 when the buffer is shorter
+// than all of them.
+int quick_seconds_now(const ViewEnv& env) {
+  const QuickClipRow row = quick_clip_row(static_cast<int>(env.store.config["quick_clip_seconds"].as_int(20)),
+                                          static_cast<int>(env.store.config["buffer_seconds"].as_int(60)));
+  return row.selected >= 0 ? row.values[static_cast<size_t>(row.selected)] : 0;
+}
+
 void quick_picker(ViewEnv& env, float width = 132.0f, bool strong = false) {
-  const int seconds = static_cast<int>(env.store.config["quick_clip_seconds"].as_int(20));
-  const std::vector<int> values = with_current(quick_clip_choices(), seconds);
+  const int buffer = static_cast<int>(env.store.config["buffer_seconds"].as_int(60));
+  const int configured = static_cast<int>(env.store.config["quick_clip_seconds"].as_int(20));
+  // A quick clip never exceeds the buffer, and is always one of the offered lengths. The row greys the lengths the buffer
+  // cannot keep instead of hiding them, and a length that no longer fits has already fallen to the closest one at or
+  // below the buffer (the engine does that once, so the hotkey and the tray say the same).
+  const QuickClipRow row = quick_clip_row(configured, buffer);
   std::vector<std::string> labels;
-  int selected = 0;
-  for (size_t i = 0; i < values.size(); ++i) {
-    labels.push_back(std::to_string(values[i]) + " seconds");
-    if (values[i] == seconds) selected = static_cast<int>(i);
+  for (int value : row.values) labels.push_back(std::to_string(value) + " seconds");
+  const bool any = std::find(row.unavailable.begin(), row.unavailable.end(), false) != row.unavailable.end();
+  int selected = row.selected;
+  if (select("##quick", labels, selected, width, !any, {}, strong, {}, false, row.unavailable)) {
+    set(env, "quick_clip_seconds", Json(row.values[static_cast<size_t>(selected)]));
   }
-  if (select("##quick", labels, selected, width, false, {}, strong)) set(env, "quick_clip_seconds", Json(values[static_cast<size_t>(selected)]));
   // The length only: the action and its chord live on the row above and in Settings > Hotkeys.
-  tooltip("Saves the last " + std::to_string(seconds) + " seconds of play.");
+  tooltip(row.selected >= 0 ? "Saves the last " + std::to_string(quick_seconds_now(env)) + " seconds of play."
+                            : any ? "Choose how much of the buffer a quick clip keeps."
+                                  : "The buffer must be longer than " +
+                                        std::to_string(row.values.front()) + " seconds for a quick clip.");
 }
 
 void welcome(ViewEnv& env) {
@@ -377,10 +392,11 @@ void buffer_pane(ViewEnv& env, float height) {
   const float tape_w = ImGui::GetContentRegionAvail().x;
   const uint32_t pulse_age = env.store.pulse_at ? env.now_ms - env.store.pulse_at : 100000;
   // The tape takes the pane's whole content: the deck's leftover height lives here, in taller cells.
-  if (timeline("##tape", state, filled, seconds, pulse_age, unpx(tape_w), inner_h)) toggle_buffer(env);
+  const bool waiting_for_game = state == "off" && status["game_wait"].as_bool();
+  if (timeline("##tape", waiting_for_game ? "waiting" : state, filled, seconds, pulse_age, unpx(tape_w), inner_h)) toggle_buffer(env);
   // Start while the buffer is off, Stop while it runs: the one switch, at the tape's top right.
   if (!config.is_null()) {
-    const bool on = state == "on" || state == "starting";
+    const bool on = state == "on" || state == "starting" || status["game_wait"].as_bool();
     const char* word = on ? "stop" : "start";
     const float icon = px(12), chip_h = px(24);
     const float chip_w = px(7) + icon + px(6) + text_width(fonts().strong, word) + px(9);
@@ -441,7 +457,8 @@ void deck(ViewEnv& env, float width, float height) {
   action_row(env, "save", "save", "Save clip", "", "primary",
              env.panel.saving && env.now_ms < env.panel.saving_until, "save_replay", [&] { save_clip(env); },
              env.panel.deck_cursor == 0);
-  action_row(env, "quick", "history", "Quick clip", "last " + format_span(env.store.config["quick_clip_seconds"].as_int(20)),
+  const int quick_now = quick_seconds_now(env);
+  action_row(env, "quick", "history", "Quick clip", quick_now > 0 ? "last " + format_span(quick_now) : "",
              "", false, "quick_clip", [&] { quick_clip(env); }, env.panel.deck_cursor == 1);
   action_row(env, "record", record_icon(recording), record_label(recording),
              recording ? format_duration(status["recording_seconds"].as_double()) : "",
@@ -1496,7 +1513,12 @@ void status_strip(ViewEnv& env) {
   }
   // The buffer pane carries the count; the strip says only the state, and the long line when it is news.
   // It is ellipsised rather than clipped, so a fault never ends mid-word with the cause cut off.
-  const std::string state_text = line.tone == Tone::ok ? "buffering" : line.tone == Tone::idle ? "paused" : line.text;
+  std::string state_text = line.tone == Tone::ok ? "buffering" : line.tone == Tone::idle ? "paused" : line.text;
+  // What the encoder controller is doing, in the person's words ("effort -1", "120 -> 60 fps"): nothing at full speed (plan 008).
+  if (line.tone == Tone::ok) {
+    const std::string running = status["encoder_control"]["label"].as_string("");
+    if (!running.empty()) state_text += " - " + running;
+  }
   const float stripe_start = x + text_width(small, state_text) + px(20);
   if (!status["recording"].as_bool() && stripe_start + px(56) < limit) {
     for (int i = 0; i < 5; ++i) {
@@ -1905,6 +1927,14 @@ Animation animation_reason(const ViewEnv& env) {
   const bool strip_shown = env.panel.settings.empty() && env.now_ms - env.panel.live.drawn_at < 1000;
   if (strip_shown && env.panel.live.saving) return {"timeline_saving", kSpinnerMs};
   if (strip_shown && env.panel.live.tick_ms) return {"timeline_live", env.panel.live.tick_ms};
+  // A speaker on the Audio page is sounding: its waves move at 8 frames a second, and only while one is drawn.
+  if (env.panel.settings == "audio" && env.now_ms < env.panel.audio_meter_until) return {"audio_meter", 125};
+  // The deck's audio pane and its mixer use the same speaker: frames only while the pane drew that speaker.
+  if (env.panel.settings.empty() && env.now_ms - env.panel.live.audio_drawn_at < 1000 &&
+      env.now_ms < env.panel.audio_meter_until)
+    return {"audio_meter", 125};
+  // The app picker's peaks are measured at 4 Hz only while it is open; its rows re-sort on the same beat.
+  if (env.panel.settings == "audio" && env.panel.picking_audio_app) return {"audio_picker", 250};
   if (!env.store.toasts.empty()) return {};  // toasts are static; they expire through the store
   if (env.store.pulse_at && env.now_ms - env.store.pulse_at < 1000) return {"save_pulse", kSmooth};  // the tick flash a save leaves
   if (!env.store.library_loaded) return {"library_loading", kSpinnerMs};

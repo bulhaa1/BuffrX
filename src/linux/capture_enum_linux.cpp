@@ -407,6 +407,12 @@ bool find_window_size(const std::string& wanted_id, int& width, int& height) {
   return width > 0 && height > 0;
 }
 
+bool window_monitor_device(const std::string&, std::string&) {
+  // The card/output check this feeds compares a window's screen against the device's own output list.
+  // That list is DXGI's, so it is empty on Linux and the caller never asks; there is no screen to name.
+  return false;
+}
+
 bool validate_capture_target(Config& config, std::string& reason) {
   if (config.capture_mode != "window" && config.capture_mode != "game") return true;
   if (config.capture_mode == "game" && config.game_title.empty()) return true;
