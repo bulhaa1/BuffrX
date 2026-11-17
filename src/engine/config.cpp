@@ -166,6 +166,16 @@ void seed_audio_apps_prefs(const std::vector<AudioApp>& apps, std::map<std::stri
   }
 }
 
+// Automatic capture routes programs by Windows' audio-session events and captures them by process
+// loopback (audio_watch.h). The Linux port records the desktop and the microphone, so a file that asks
+// for automatic capture records the desktop there rather than silence.
+constexpr bool kAutoAudioSupported =
+#ifdef _WIN32
+    true;
+#else
+    false;
+#endif
+
 }  // namespace
 
 Json auto_audio_prefs_json(const std::map<std::string, AutoAudioPref>& prefs) {
@@ -181,9 +191,17 @@ bool resolve_data_root(std::string& data_root, bool& portable) {
     return ensure_directory(data_root);
   }
   portable = false;
+#ifdef _WIN32
   char local[MAX_PATH] = {0};
   if (GetEnvironmentVariableA("LOCALAPPDATA", local, MAX_PATH) == 0) return false;
   data_root = std::string(local) + "\\BuffrX";
+#else
+  const char* xdg = std::getenv("XDG_DATA_HOME");
+  const char* home = std::getenv("HOME");
+  if (xdg && *xdg) data_root = std::string(xdg) + "/buffrx";
+  else if (home && *home) data_root = std::string(home) + "/.local/share/buffrx";
+  else return false;
+#endif
   return ensure_directory(data_root);
 }
 
@@ -357,6 +375,7 @@ void config_apply_audio(const Json& j, Config& c) {
   if (j.has("audio_capture_mode")) {
     const std::string mode = j["audio_capture_mode"].as_string(c.audio_capture_mode);
     if (mode == "desktop" || mode == "apps" || mode == "auto") c.audio_capture_mode = mode;  // an unknown mode changes nothing
+    if (c.audio_capture_mode == "auto" && !kAutoAudioSupported) c.audio_capture_mode = "desktop";
   }
   if (j.has("audio_app_prefs")) audio_prefs_from_json(j["audio_app_prefs"], c.audio_app_prefs);
   if (j.has("audio_other_volume")) c.audio_other_volume = auto_volume(j["audio_other_volume"].as_double(c.audio_other_volume));
@@ -610,14 +629,16 @@ void config_from_json(const Json& j, Config& c) {
   c.output_height = std::clamp(c.output_height, 0, 7680) & ~1;
   c.share_limit_mib = std::clamp(c.share_limit_mib, 5, 500);
   c.share_upload_kbps = std::clamp(c.share_upload_kbps, 0, 1000000);
+  // A profile or an older file can still carry the mode, and the Linux port has no automatic router.
+  if (c.audio_capture_mode == "auto" && !kAutoAudioSupported) c.audio_capture_mode = "desktop";
 }
 
 bool load_config(const std::string& path, Config& config, std::string& error) {
   FILE* file = std::fopen(path.c_str(), "rb");
   if (!file) {
-    // First run: automatic capture is the normal mode. A directly constructed Config keeps the old
-    // desktop default so callers and tests that mean "legacy desktop" still say so.
-    config.audio_capture_mode = "auto";
+    // First run: automatic capture is the normal mode where it exists. A directly constructed Config
+    // keeps the old desktop default so callers and tests that mean "legacy desktop" still say so.
+    config.audio_capture_mode = kAutoAudioSupported ? "auto" : "desktop";
     return true;
   }  // first run: defaults stand
   std::string text;
@@ -700,7 +721,7 @@ void migrate_config(Config& config, bool mode_stored) {
         config.audio_capture_legacy_mode = config.audio_capture_mode;
       }
     }
-    config.audio_capture_mode = "auto";
+    config.audio_capture_mode = kAutoAudioSupported ? "auto" : "desktop";
     seed_audio_apps_prefs(config.audio_apps, config.audio_app_prefs);
   }
   config.config_version = Config::kConfigVersion;

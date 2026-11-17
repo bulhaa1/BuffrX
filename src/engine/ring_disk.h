@@ -32,7 +32,12 @@ inline std::string spill_folder_problem(const SpillFolderFacts& facts, int64_t n
     std::transform(a.begin(), a.end(), a.begin(), [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
     return a == b;
   };
+#ifdef _WIN32
   if (!same(facts.filesystem, "NTFS") && !same(facts.filesystem, "REFS")) return "the drive is " + (facts.filesystem.empty() ? std::string("not NTFS or ReFS") : facts.filesystem + ", not NTFS or ReFS");
+#else
+  // A local POSIX filesystem needs no NTFS feature for a sparse file. The network and cloud checks
+  // below are the only reasons to refuse a Linux folder.
+#endif
   if (facts.network) return "the folder is on a network drive";
   if (facts.cloud_synced) return "the folder is synced to the cloud";
   if (facts.compressed_or_encrypted) return "the folder is compressed or encrypted";

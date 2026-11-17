@@ -13,6 +13,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
+#include <cstdarg>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -25,6 +26,7 @@
 #include "library.h"
 #include "media.h"
 #include "packet_hash.h"
+#include "platform.h"
 #include "ring_disk.h"
 #include "ring_publish.h"
 #include "ring_save.h"
@@ -289,6 +291,55 @@ int chroma_location(video_format format, int spc) {
   }
 }
 
+// libobs 30 has no os_process_args_t: on POSIX a command line is built here with every argument
+// shell-quoted, because os_process_pipe_create() runs it through popen(). Windows keeps OBS's own
+// argument builder.
+#ifndef _WIN32
+struct MuxArgs {
+  std::string command;
+  void add(const std::string& value) {
+    if (!command.empty()) command += ' ';
+    command += '\'';
+    for (char c : value) {
+      if (c == '\'') command += "'\\''";
+      else command += c;
+    }
+    command += '\'';
+  }
+  void addf(const char* format, ...) {
+    char buffer[512];
+    va_list args;
+    va_start(args, format);
+    std::vsnprintf(buffer, sizeof(buffer), format, args);
+    va_end(args);
+    add(buffer);
+  }
+};
+using MuxArgsType = MuxArgs;
+#else
+using MuxArgsType = os_process_args_t;
+#endif
+
+inline void mux_add_arg(MuxArgsType* args, const std::string& value) {
+#ifndef _WIN32
+  args->add(value);
+#else
+  os_process_args_add_arg(args, value.c_str());
+#endif
+}
+inline void mux_add_argf(MuxArgsType* args, const char* format, ...) {
+  char buffer[512];
+  va_list values;
+  va_start(values, format);
+  std::vsnprintf(buffer, sizeof(buffer), format, values);
+  va_end(values);
+#ifndef _WIN32
+  args->add(buffer);
+#else
+  os_process_args_add_arg(args, buffer);
+#endif
+}
+
 // Reads the live encoders into an epoch record: the same values the muxer's command line took from them at save time, now taken once when the
 // epoch begins. Packet thread, on the epoch's first picture.
 void capture_video_params(EpochInfo& epoch, Ring& ring, obs_encoder_t* encoder) {
@@ -363,7 +414,10 @@ void capture_audio_params(EpochInfo& epoch, Ring& ring) {
     audio.name = obs_encoder_get_name(encoder) ? obs_encoder_get_name(encoder) : "";
     audio.sample_rate = static_cast<int>(obs_encoder_get_sample_rate(encoder));
     audio.frame_size = static_cast<int>(obs_encoder_get_frame_size(encoder));
+#if LIBOBS_API_MAJOR_VER >= 31
+    // OBS 31 added the encoder's priming samples to the muxer's audio arguments. 30 does not read it.
     audio.priming = static_cast<int>(obs_encoder_get_priming_samples(encoder));
+#endif
     audio.channels = static_cast<int>(audio_output_get_channels(obs_get_audio()));
     uint8_t* data = nullptr;
     size_t size = 0;
@@ -423,52 +477,69 @@ void log_epoch_start(Ring& ring, const encoder_packet& packet) {
               static_cast<long long>(join.prev_last_dts_us), static_cast<long long>(join.shift_us), static_cast<long long>(join.gap_us));
 }
 
-void add_video_params(os_process_args_t* args, const EpochInfo& epoch) {
-  os_process_args_add_arg(args, epoch.codec.c_str());
-  os_process_args_add_argf(args, "%d", epoch.bitrate);
-  os_process_args_add_argf(args, "%d", epoch.width);
-  os_process_args_add_argf(args, "%d", epoch.height);
-  os_process_args_add_argf(args, "%d", epoch.pri);
-  os_process_args_add_argf(args, "%d", epoch.trc);
-  os_process_args_add_argf(args, "%d", epoch.spc);
-  os_process_args_add_argf(args, "%d", epoch.range);
-  os_process_args_add_argf(args, "%d", epoch.chroma);
-  os_process_args_add_argf(args, "%d", epoch.max_luminance);
-  os_process_args_add_argf(args, "%d", epoch.fps_num);
-  os_process_args_add_argf(args, "%d", epoch.fps_den);
-  os_process_args_add_argf(args, "%d", epoch.codec_tag);
+void add_video_params(MuxArgsType* args, const EpochInfo& epoch) {
+  mux_add_arg(args, epoch.codec);
+  mux_add_argf(args, "%d", epoch.bitrate);
+  mux_add_argf(args, "%d", epoch.width);
+  mux_add_argf(args, "%d", epoch.height);
+  mux_add_argf(args, "%d", epoch.pri);
+  mux_add_argf(args, "%d", epoch.trc);
+  mux_add_argf(args, "%d", epoch.spc);
+  mux_add_argf(args, "%d", epoch.range);
+  mux_add_argf(args, "%d", epoch.chroma);
+  mux_add_argf(args, "%d", epoch.max_luminance);
+  mux_add_argf(args, "%d", epoch.fps_num);
+  mux_add_argf(args, "%d", epoch.fps_den);
+  mux_add_argf(args, "%d", epoch.codec_tag);
 }
 
-void add_audio_params(os_process_args_t* args, const AudioEpoch& audio) {
-  os_process_args_add_arg(args, audio.name.c_str());
-  os_process_args_add_argf(args, "%d", audio.bitrate);
-  os_process_args_add_argf(args, "%d", audio.sample_rate);
-  os_process_args_add_argf(args, "%d", audio.frame_size);
-  os_process_args_add_argf(args, "%d", audio.priming);
-  os_process_args_add_argf(args, "%d", audio.channels);
+void add_audio_params(MuxArgsType* args, const AudioEpoch& audio) {
+  mux_add_arg(args, audio.name);
+  mux_add_argf(args, "%d", audio.bitrate);
+  mux_add_argf(args, "%d", audio.sample_rate);
+  mux_add_argf(args, "%d", audio.frame_size);
+#if LIBOBS_API_MAJOR_VER >= 31
+  mux_add_argf(args, "%d", audio.priming);
+#endif
+  mux_add_argf(args, "%d", audio.channels);
 }
 
 // The muxer process for one save: its command line is what OBS's own muxer builds (path, which streams, the codec parameters, the
 // muxer settings), and the packets follow on its stdin. The codec parameters are the epoch's own (see EpochInfo).
 os_process_pipe_t* start_muxer(Ring& ring, const std::string& path, const EpochInfo& epoch) {
+#ifdef _WIN32
   char* exe = os_get_executable_path_ptr("obs-ffmpeg-mux.exe");
-  os_process_args_t* args = os_process_args_create(exe);
-  bfree(exe);
-  os_process_args_add_arg(args, path.c_str());
-  os_process_args_add_argf(args, "%d", epoch.ok ? 1 : 0);
-  os_process_args_add_argf(args, "%d", static_cast<int>(epoch.audio.size()));
+  MuxArgsType* args = os_process_args_create(exe ? exe : "obs-ffmpeg-mux.exe");
+  if (exe) bfree(exe);
+#else
+  // The same helper the runtime staging script points obs-ffmpeg at: it runs from a private per-user
+  // folder, never from the read-only AppImage mount or a fixed name in /tmp. The engine staged it
+  // before libobs started, so an empty path means the engine cannot record at all.
+  const std::string muxer = obs_muxer_path();
+  if (muxer.empty()) return nullptr;
+  MuxArgs built;
+  built.add(muxer);
+  MuxArgsType* args = &built;
+#endif
+  mux_add_arg(args, path);
+  mux_add_argf(args, "%d", epoch.ok ? 1 : 0);
+  mux_add_argf(args, "%d", static_cast<int>(epoch.audio.size()));
   if (epoch.ok) add_video_params(args, epoch);
   if (!epoch.audio.empty()) {
-    os_process_args_add_arg(args, epoch.audio_codec.c_str());
+    mux_add_arg(args, epoch.audio_codec);
     for (const AudioEpoch& audio : epoch.audio) add_audio_params(args, audio);
   }
-  os_process_args_add_arg(args, "");  // the stream key: none for a file
+  mux_add_arg(args, "");  // the stream key: none for a file
   obs_data_t* settings = obs_output_get_settings(ring.output);
   const char* muxer_settings = obs_data_get_string(settings, "muxer_settings");
-  os_process_args_add_arg(args, muxer_settings ? muxer_settings : "");
+  mux_add_arg(args, muxer_settings ? muxer_settings : "");
   obs_data_release(settings);
+#ifdef _WIN32
   os_process_pipe_t* pipe = os_process_pipe_create2(args, "w");
   os_process_args_destroy(args);
+#else
+  os_process_pipe_t* pipe = os_process_pipe_create(args->command.c_str(), "w");
+#endif
   return pipe;
 }
 

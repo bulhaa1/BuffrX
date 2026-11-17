@@ -5,7 +5,13 @@
 // must not depend on a window being open.
 #pragma once
 
+#ifndef _WIN32
+#include "platform_linux.h"
+#else
+
 #include <windows.h>
+
+#include "hotkey_rules.h"
 
 #include <functional>
 #include <map>
@@ -28,11 +34,7 @@ struct HotkeyBinding {
 // Parses a chord like "Alt+C", "Ctrl+Shift+F10" or "F8" into modifiers and a virtual key.
 bool parse_chord(const std::string& chord, UINT& modifiers, UINT& virtual_key, std::string& problem);
 // A hotkey with no modifier fires in every app, gaming included. Only keys that are not part of typing may be
-// bound alone: F1-F24, Pause, Scroll Lock, Insert, Home/End/PageUp/PageDown/Delete, the numpad (not its Enter) and . , [ ]. The recorder and the engine share this one rule.
-bool lone_key_allowed(UINT virtual_key);
-// What a lone key costs, for the line under it in the recorder: `none` is a key that may not stand alone.
-enum class LoneKeyKind { none, function, idle, insert, editing, keypad, character };
-LoneKeyKind lone_key_kind(UINT virtual_key);
+// bound alone, and hotkey_rules.h holds that rule for both platforms.
 std::string format_chord(UINT modifiers, UINT virtual_key);
 
 // WTS_SESSION_LOCK and WTS_SESSION_UNLOCK, named here because this header cannot take wtsapi32.h.
@@ -234,3 +236,5 @@ std::string executable_path();
 std::string executable_directory();
 
 }  // namespace bx
+
+#endif  // _WIN32

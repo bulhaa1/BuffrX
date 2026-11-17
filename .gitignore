@@ -1,5 +1,6 @@
 # Build and download caches: recreated by tools/*.ps1, verified by SHA-256 on every run.
 work/
+build-linux/
 build/
 build-*/
 build-share-spike/
@@ -82,6 +83,7 @@ ui/.impeccable/
 site-snapshot-*/
 site-snapshots/
 tools/installer-art/
+src-tauri/icons/icon.png
 
 # wrangler files
 .wrangler

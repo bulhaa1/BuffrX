@@ -29,6 +29,7 @@ std::vector<std::string> list_values(obs_properties_t* properties, const char* k
 }
 
 int windows_build() {
+#ifdef _WIN32
   char text[32] = {0};
   DWORD size = sizeof(text);
   if (RegGetValueA(HKEY_LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion", "CurrentBuildNumber", RRF_RT_REG_SZ, nullptr,
@@ -36,10 +37,14 @@ int windows_build() {
     return 0;
   }
   return std::atoi(text);
+#else
+  return 0;  // not a Windows build: the report says so by leaving the field zero
+#endif
 }
 
 // Hardware-accelerated GPU scheduling: HwSchMode 2 is on, 1 is off. Unreadable is "unknown", never a guess.
 std::string hags_state() {
+#ifdef _WIN32
   DWORD mode = 0;
   DWORD size = sizeof(mode);
   if (RegGetValueA(HKEY_LOCAL_MACHINE, "SYSTEM\\CurrentControlSet\\Control\\GraphicsDrivers", "HwSchMode", RRF_RT_REG_DWORD, nullptr, &mode,
@@ -47,6 +52,9 @@ std::string hags_state() {
     return "unknown";
   }
   return mode == 2 ? "on" : mode == 1 ? "off" : "unknown";
+#else
+  return "unknown";  // the setting does not exist without Windows' scheduler
+#endif
 }
 
 }  // namespace

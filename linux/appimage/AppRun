@@ -1,0 +1,25 @@
+#!/bin/bash
+# BuffrX AppImage entry point. The engine is the product; the editor is its own process.
+HERE="$(dirname "$(readlink -f "$0")")"
+export APPDIR="$HERE"
+export BUFFRX_RUNTIME_ROOT="$HERE/usr/lib/buffrx"
+export BUFFRX_DATA_ROOT="${BUFFRX_DATA_ROOT:-$HOME/.local/share/buffrx}"
+export LD_LIBRARY_PATH="$HERE/usr/lib:$HERE/usr/lib/buffrx/libobs:$HERE/usr/lib/buffrx/obs-plugins${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+# The engine's paths keep Windows separators; the shim teaches libc that '\' is '/'.
+export LD_PRELOAD="$HERE/usr/lib/libbuffrx-pathshim.so${LD_PRELOAD:+:$LD_PRELOAD}"
+
+# Desktop files pass a buffrx:// URL as the first argument.
+if [ "${1#buffrx://}" != "$1" ]; then
+  exec "$HERE/usr/bin/buffrx-engine" --open-link "$1"
+fi
+
+case "${1:-}" in
+  --editor|--preview|--timeline) exec "$HERE/usr/bin/buffrx-ui" "$@" ;;
+  --help|-h)
+    echo "BuffrX: a free game clipper. Run it with no arguments to open the panel."
+    echo "  --show          open the panel"
+    echo "  --editor FILE   open the editor on a clip"
+    exit 0 ;;
+esac
+
+exec "$HERE/usr/bin/buffrx-engine" "${@:---show}"

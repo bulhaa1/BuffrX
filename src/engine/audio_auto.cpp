@@ -33,6 +33,7 @@ std::string file_name_of(const std::string& path) {
   return slash == std::string::npos ? path : path.substr(slash + 1);
 }
 
+#ifdef _WIN32
 std::string narrow(const wchar_t* text) {
   if (!text) return std::string();
   const int size = WideCharToMultiByte(CP_UTF8, 0, text, -1, nullptr, 0, nullptr, nullptr);
@@ -41,6 +42,7 @@ std::string narrow(const wchar_t* text) {
   WideCharToMultiByte(CP_UTF8, 0, text, -1, out.data(), size, nullptr, nullptr);
   return out;
 }
+#endif
 
 // The executables BuffrX itself plays sound through. The sharing helper and the muxer are separate
 // processes that link this product; a clip must never record them.
@@ -179,9 +181,14 @@ std::vector<AutoProcessNode> auto_process_snapshot() {
       AutoProcessNode node;
       node.pid = entry.th32ProcessID;
       node.parent_pid = entry.th32ParentProcessID;
+#ifdef _WIN32
       node.exe = narrow(entry.szExeFile);
+#else
+      node.exe = entry.szExeFile;  // the POSIX snapshot already reports the process name as narrow text
+#endif
       // Creation time is the identity a reused process id cannot fake. It is read only for the snapshot
       // the grouping already takes, never on a timer of its own.
+#ifdef _WIN32
       HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, node.pid);
       if (process) {
         FILETIME creation{}, exit{}, kernel{}, user{};
@@ -193,6 +200,7 @@ std::vector<AutoProcessNode> auto_process_snapshot() {
         }
         CloseHandle(process);
       }
+#endif
       out.push_back(std::move(node));
     } while (Process32Next(snapshot, &entry));
   }

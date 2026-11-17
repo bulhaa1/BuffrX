@@ -3,11 +3,47 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, WriteHalf};
+#[cfg(unix)]
+use tokio::net::UnixStream;
+#[cfg(windows)]
 use tokio::net::windows::named_pipe::ClientOptions;
+
+#[cfg(unix)]
+type EngineStream = UnixStream;
+#[cfg(windows)]
+type EngineStream = tokio::net::windows::named_pipe::NamedPipeClient;
+
+#[cfg(unix)]
+async fn connect_engine() -> std::io::Result<EngineStream> {
+    UnixStream::connect(pipe_name()).await
+}
+#[cfg(windows)]
+async fn connect_engine() -> std::io::Result<EngineStream> {
+    ClientOptions::new().open(pipe_name())
+}
 use tokio::sync::{Mutex, oneshot};
 use tauri::{AppHandle, Emitter, Manager};
 
-/// The engine's pipe: `buffrx`, or `BUFFRX_PIPE` when a test engine runs beside the one in use.
+/// The engine's socket: the same per-user runtime path the engine's POSIX pipe server uses.
+#[cfg(unix)]
+pub(crate) fn pipe_name() -> String {
+    extern "C" {
+        fn getuid() -> u32;
+    }
+    let leaf = match std::env::var("BUFFRX_PIPE") {
+        Ok(name) if !name.is_empty() => name,
+        _ => "buffrx".to_string(),
+    };
+    let leaf: String = leaf
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' })
+        .collect();
+    let base = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
+    let uid = unsafe { getuid() };
+    format!("{base}/buffrx-{uid}-{leaf}.sock")
+}
+
+#[cfg(windows)]
 pub(crate) fn pipe_name() -> String {
     match std::env::var("BUFFRX_PIPE") {
         Ok(name) if !name.is_empty() => format!(r"\\.\pipe\{name}"),
@@ -35,6 +71,7 @@ pub(crate) fn write_log(data_root: &Path, msg: &str) {
 
 /// Local time, second resolution, matching engine.log: SystemTimeToTzSpecificLocalTime does the
 /// timezone work, so no calendar or tz crate is pulled in.
+#[cfg(windows)]
 fn timestamp() -> String {
     #[repr(C)]
     struct SystemTime {
@@ -97,6 +134,39 @@ fn timestamp() -> String {
     )
 }
 
+#[cfg(unix)]
+fn timestamp() -> String {
+    #[repr(C)]
+    struct Tm {
+        sec: i32,
+        min: i32,
+        hour: i32,
+        mday: i32,
+        mon: i32,
+        year: i32,
+        wday: i32,
+        yday: i32,
+        isdst: i32,
+        gmtoff: i64,
+        zone: *const std::os::raw::c_char,
+    }
+    extern "C" {
+        fn localtime_r(timep: *const i64, result: *mut Tm) -> *mut Tm;
+    }
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let mut tm = Tm {
+        sec: 0, min: 0, hour: 0, mday: 0, mon: 0, year: 0, wday: 0, yday: 0, isdst: 0, gmtoff: 0,
+        zone: std::ptr::null(),
+    };
+    if unsafe { localtime_r(&seconds, &mut tm) }.is_null() {
+        return String::new();
+    }
+    format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", tm.year + 1900, tm.mon + 1, tm.mday, tm.hour, tm.min, tm.sec)
+}
+
 pub struct PipeClient {
     app: AppHandle,
     data_root: PathBuf,
@@ -105,7 +175,7 @@ pub struct PipeClient {
     supervisor: Arc<Mutex<Supervisor>>,
     pending: Arc<Mutex<HashMap<i64, Pending>>>,
     next_id: Arc<Mutex<i64>>,
-    writer: Arc<Mutex<Option<WriteHalf<tokio::net::windows::named_pipe::NamedPipeClient>>>>,
+    writer: Arc<Mutex<Option<WriteHalf<EngineStream>>>>,
     connected: Arc<Mutex<bool>>,
 }
 
@@ -205,14 +275,22 @@ impl PipeClient {
         tauri::async_runtime::spawn(async move {
             loop {
                 if !*client.connected.lock().await {
-                    match ClientOptions::new().open(pipe_name()) {
+                    match connect_engine().await {
                         Ok(pipe) => {
                             {
                                 let mut supervisor = client.supervisor.lock().await;
                                 supervisor.attempts = 0;
                                 supervisor.last_attempt = None;
                             }
-                            let (mut reader, writer) = tokio::io::split(pipe);
+                            let (mut reader, mut writer) = tokio::io::split(pipe);
+                            // The engine routes editor.open by the role a client names in hello. Without
+                            // this every Edit click would start a second editor instead of sending the
+                            // files to the one already open.
+                            let hello = serde_json::json!({"id": 0, "cmd": "hello", "args": {"client": "editor"}});
+                            let bytes = hello.to_string().into_bytes();
+                            let _ = writer.write_all(&(bytes.len() as u32).to_le_bytes()).await;
+                            let _ = writer.write_all(&bytes).await;
+                            let _ = writer.flush().await;
                             *client.writer.lock().await = Some(writer);
                             *client.connected.lock().await = true;
                             let _ = client.app.emit("engine_status", "connected");

@@ -20,9 +20,13 @@ constexpr ImU32 rgb(unsigned value) {
 bool file_exists(const std::string& path) { return GetFileAttributesA(path.c_str()) != INVALID_FILE_ATTRIBUTES; }
 
 std::string windows_fonts() {
+#ifdef _WIN32
   char buffer[MAX_PATH] = {0};
   const UINT length = GetWindowsDirectoryA(buffer, MAX_PATH);
   return std::string(buffer, length) + "\\Fonts\\";
+#else
+  return "/usr/share/fonts/truetype/";
+#endif
 }
 
 // A font file's bytes, read once for the life of the process. The atlas used to read every file again
@@ -64,11 +68,18 @@ std::vector<const char*> fallback_faces(const std::set<ImWchar>& extra) {
     else other = true;
   }
   std::vector<const char*> faces;
+#ifdef _WIN32
   if (other) faces.push_back("segoeui.ttf");
   if (kana) faces.push_back("YuGothM.ttc");
   if (hangul) faces.push_back("malgun.ttf");
   if (cjk) faces.push_back("msyh.ttc");
   if (symbols || other) faces.push_back("seguisym.ttf");
+#else
+  if (other) faces.push_back("dejavu/DejaVuSans.ttf");
+  if (kana || cjk) faces.push_back("noto/NotoSansCJK-Regular.ttc");
+  if (hangul) faces.push_back("noto/NotoSansCJK-Regular.ttc");
+  if (symbols || other) faces.push_back("dejavu/DejaVuSans.ttf");
+#endif
   return faces;
 }
 

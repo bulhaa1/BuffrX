@@ -166,28 +166,6 @@ bool parse_chord(const std::string& chord, UINT& modifiers, UINT& virtual_key, s
   return true;
 }
 
-LoneKeyKind lone_key_kind(UINT virtual_key) {
-  if (virtual_key >= VK_F1 && virtual_key <= VK_F24) return LoneKeyKind::function;
-  if (virtual_key == VK_PAUSE || virtual_key == VK_SCROLL) return LoneKeyKind::idle;
-  if (virtual_key == VK_INSERT) return LoneKeyKind::insert;
-  switch (virtual_key) {
-    case VK_HOME: case VK_END: case VK_PRIOR: case VK_NEXT: case VK_DELETE: return LoneKeyKind::editing;
-    case VK_MULTIPLY: case VK_DIVIDE: case VK_ADD: case VK_SUBTRACT: case VK_DECIMAL: return LoneKeyKind::keypad;
-    case VK_OEM_PERIOD: case VK_OEM_COMMA: case VK_OEM_4: case VK_OEM_6: return LoneKeyKind::character;
-    default: break;
-  }
-  if (virtual_key >= VK_NUMPAD0 && virtual_key <= VK_NUMPAD9) return LoneKeyKind::keypad;
-  return LoneKeyKind::none;
-}
-
-bool lone_key_allowed(UINT virtual_key) {
-  // Letters, digits, Space, Tab, Enter, Esc, Backspace and the arrows stay out: they belong to every chat box. What
-  // stands alone is chosen by the owner (2026-11-15): the F-keys, Pause, Scroll Lock, Insert, the editing keys (Home,
-  // End, PageUp, PageDown, Delete), the numpad's digits and operators, and . , [ ]. Numpad Enter is not here:
-  // RegisterHotKey cannot tell it from Enter. `lone_key_kind` says what each one costs.
-  return lone_key_kind(virtual_key) != LoneKeyKind::none;
-}
-
 std::string format_chord(UINT modifiers, UINT virtual_key) {
   std::string out;
   if (modifiers & MOD_CONTROL) out += "Ctrl+";

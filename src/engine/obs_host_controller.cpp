@@ -14,6 +14,7 @@
 #include "encoder_controller.h"
 #include "encoder_settings.h"
 #include "gpu.h"
+#include "libobs_compat.h"
 #include "obs_host.h"
 #include "recording_watch.h"
 
@@ -132,7 +133,7 @@ void ObsHost::controller_tick(uint32_t now_ms) {
   holds.rebuilding = rebuild_gate_.busy() || encoder_swapping_.load();
   buffrx::ControllerWindow totals;
   totals.rendered = obs_get_total_frames() / static_cast<uint64_t>(std::max(1, frame_divisor_));
-  totals.encoded = obs_encoder_get_encoded_frames(video_encoder_);
+  totals.encoded = BX_ENCODER_FRAMES(video_encoder_);
   totals.skipped = video_output_get_skipped_frames(obs_get_video());
   totals.lagged = obs_get_lagged_frames();
   // A probe, not a setting: BUFFRX_TEST_ENCODER_RATIO=@<file> holds the share of the pictures the encoder is read as having finished (a number, 0-1,

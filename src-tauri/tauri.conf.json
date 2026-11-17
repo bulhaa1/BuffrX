@@ -9,7 +9,7 @@
   "app": {
     "windows": [],
     "security": {
-      "csp": "default-src 'self' ipc: http://ipc.localhost; img-src 'self' data: blob: http://thumbnails.localhost http://media.localhost; media-src 'self' blob: http://media.localhost; style-src 'self' 'unsafe-inline'; font-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost http://media.localhost; script-src 'self'"
+      "csp": "default-src 'self' ipc: http://ipc.localhost; img-src 'self' data: blob: http://thumbnails.localhost http://media.localhost thumbnails://localhost media://localhost http://127.0.0.1:*; media-src 'self' blob: http://media.localhost media://localhost http://127.0.0.1:*; style-src 'self' 'unsafe-inline'; font-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost http://media.localhost media://localhost http://127.0.0.1:*; script-src 'self'"
     }
   },
   "bundle": {

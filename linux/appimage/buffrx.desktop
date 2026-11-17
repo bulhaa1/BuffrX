@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=BuffrX
+Comment=Clip it. Cut it. Send it.
+Exec=BuffrX %U
+Icon=buffrx
+Terminal=false
+Categories=AudioVideo;Recorder;Utility;
+MimeType=x-scheme-handler/buffrx;
+Keywords=clip;replay;capture;record;game;
