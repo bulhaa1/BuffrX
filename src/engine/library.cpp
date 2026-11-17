@@ -541,6 +541,9 @@ bool library_trash(const std::string& file) {
     std::fclose(info);
   }
   delete_cached_images(file);
+  // The track labels are a file of their own beside the clip, trashed with it so an undone delete
+  // restores both. A stranger's file at that name is left alone (audio_sidecar_is_ours).
+  if (audio_sidecar_is_ours(file)) library_trash(file + kAudioLayoutSuffix);
   return true;
 #else
 
@@ -593,7 +596,6 @@ bool library_trash(const std::string& file) {
   // a file somebody else put at that name is not this product's and is not moved.
   if (audio_sidecar_is_ours(file)) library_trash(file + kAudioLayoutSuffix);
   return true;
-}
 #endif
 }
 
