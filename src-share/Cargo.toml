@@ -6,7 +6,7 @@ description = "BuffrX's app-to-app clip sharing helper: started by the engine on
 license = "GPL-2.0-or-later"
 
 [dependencies]
-iroh = "=1.4.1"
+iroh = "=1.5.0"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "io-util", "fs", "sync", "time"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
